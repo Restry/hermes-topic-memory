@@ -41,15 +41,19 @@ _CONFIG_KEYS = {
 RECALL_SCHEMA = {
     "name": "topic_memory_recall",
     "description": (
-        "Answer from exactly one named project or topic archive. Use this for archive recall; "
-        "topic may be omitted when the query uniquely names a configured topic."
+        "Answer from exactly one named project or topic archive. Copy the query verbatim from "
+        "the user's current archive question; never invent or rewrite dates. Topic may be "
+        "omitted when the query uniquely names a configured topic."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Archive question; an exact topic name in it can select the topic.",
+                "description": (
+                    "Copy the user's current archive question verbatim; never invent or rewrite "
+                    "dates. An exact topic name in it can select the topic."
+                ),
             },
             "topic": {
                 "type": "string",
@@ -157,6 +161,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._current_session_id = ""
         self._contexts: dict[str, _SessionContext] = {}
         self._session_evidence: dict[str, list[str]] = {}
+        self._raw_turn_questions: dict[str, str] = {}
         self._prefetch_results: dict[tuple[str, str], str] = {}
         self._prefetch_tickets: dict[tuple[str, str], object] = {}
         self._write_futures: list[Future[Any]] = []
@@ -217,6 +222,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._automatic_updates = bool(config.get("automatic_updates", True))
         self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         self._current_session_id = session_id
+        self._raw_turn_questions = {}
         self._contexts = {
             session_id: _SessionContext(
                 chat_id=_chat_id(kwargs),
@@ -236,10 +242,23 @@ class HermesTopicMemoryProvider(MemoryProvider):
             "# Topic Memory\n"
             "Questions about a named project or topic archive must use topic_memory_recall; "
             "an exact unique name in the current query overrides session routing. "
+            "The recall query must copy the user's current archive question verbatim; never "
+            "invent or rewrite dates. "
             "topic_memory_topics is for discovery only when available names are unknown, not "
             "for answering archive questions. Use topic_memory_update only with verified "
             "evidence IDs. Recall is isolated to one topic; never infer cross-topic context."
         )
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
+        del turn_number
+        session_id = _optional_text(kwargs.get("session_id")) or self._current_session_id
+        if not session_id:
+            return
+        with self._lock:
+            if isinstance(message, str) and message.strip():
+                self._raw_turn_questions[session_id] = message
+            else:
+                self._raw_turn_questions.pop(session_id, None)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not query.strip() or not self._initialized or self._prefetch_executor is None:
@@ -327,6 +346,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
         del messages
         if not self._initialized:
             return
+        with self._lock:
+            self._raw_turn_questions.pop(self._current_session_id, None)
         self._flush_writes()
         self._consolidate_session(self._current_session_id)
 
@@ -366,6 +387,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
         )
         with self._lock:
             self._current_session_id = new_session_id
+            self._raw_turn_questions.pop(previous, None)
+            self._raw_turn_questions.pop(new_session_id, None)
             self._contexts[new_session_id] = context
             if reset or rewound:
                 self._prefetch_results = {
@@ -400,7 +423,9 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 raw_query = args.get("query")
                 if not isinstance(raw_query, str) or not raw_query.strip():
                     return _json_result({"error": "query_required"})
-                query = raw_query
+                with self._lock:
+                    canonical_question = self._raw_turn_questions.get(session_id)
+                query = canonical_question or raw_query
             decision = self._route(
                 session_id=session_id,
                 explicit_topic=explicit if isinstance(explicit, str) else None,
@@ -513,6 +538,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
             logger.debug("Topic-memory evidence consolidation failed")
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._raw_turn_questions.clear()
         if not self._initialized:
             return
         self._flush_writes()

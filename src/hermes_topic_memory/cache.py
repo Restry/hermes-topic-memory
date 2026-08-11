@@ -126,7 +126,12 @@ class QuestionCache:
         return record
 
     def lookup(
-        self, question: str, *, topic_id: str, topic_version: int
+        self,
+        question: str,
+        *,
+        topic_id: str,
+        topic_version: int,
+        exact_only: bool = False,
     ) -> CacheHit | None:
         self._validate_topic_id(topic_id)
         normalized = normalize_question(question)
@@ -145,6 +150,8 @@ class QuestionCache:
                 and record.normalized_question == normalized
             ):
                 return CacheHit(record.answer, "exact", 1.0, record)
+        if exact_only:
+            return None
 
         query_tokens = frozenset(normalized.split())
         best_record: CacheRecord | None = None

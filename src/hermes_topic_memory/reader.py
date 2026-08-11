@@ -26,10 +26,20 @@ class ReaderRequest:
     prefix: str
     question: str
     correction_of: str | None = None
+    evidence_capsule: str | None = None
 
     @property
     def prompt(self) -> str:
-        prompt = f"{self.prefix}QUESTION:\n{self.question}"
+        prompt = self.prefix
+        if self.evidence_capsule is not None:
+            prompt += (
+                "EXACT TEMPORAL EVIDENCE CAPSULE (AUTHORITATIVE):\n"
+                f"{self.evidence_capsule}\n"
+                "RULE: Answer the requested time from [EXACT] lines. Neighboring [CONTEXT] "
+                "lines may supply context but must never replace an [EXACT] timestamp record.\n"
+                "END EXACT TEMPORAL EVIDENCE CAPSULE\n\n"
+            )
+        prompt += f"QUESTION:\n{self.question}"
         if self.correction_of is not None:
             prompt += (
                 "\n\nCORRECTION REQUIRED:\nThe previous answer exceeded the "

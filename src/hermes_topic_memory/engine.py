@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .cache import QuestionCache
 from .reader import Reader, ReaderRequest, ReaderUsage, build_stable_prefix
 from .store import FileTopicStore
+from .temporal import build_temporal_evidence_capsule
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,9 +44,13 @@ class RecallEngine:
         if not question.strip():
             raise ValueError("question must not be empty")
         memory = self.store.get_topic(topic_id)
+        evidence_capsule = build_temporal_evidence_capsule(memory.body, question)
         topic_version = memory.metadata.version
         cached = self.cache.lookup(
-            question, topic_id=topic_id, topic_version=topic_version
+            question,
+            topic_id=topic_id,
+            topic_version=topic_version,
+            exact_only=evidence_capsule is not None,
         )
         if cached is not None:
             return RecallResult(
@@ -58,7 +63,9 @@ class RecallEngine:
 
         prefix = build_stable_prefix(memory)
         usages: list[ReaderUsage] = []
-        first_request = ReaderRequest(prefix=prefix, question=question)
+        first_request = ReaderRequest(
+            prefix=prefix, question=question, evidence_capsule=evidence_capsule
+        )
         response = self.reader.read(first_request)
         if response.usage is not None:
             usages.append(response.usage)
@@ -71,6 +78,7 @@ class RecallEngine:
                 prefix=prefix,
                 question=question,
                 correction_of=response.answer,
+                evidence_capsule=evidence_capsule,
             )
             response = self.reader.read(correction)
             attempts = 2

@@ -15,6 +15,7 @@ if HERMES_AGENT_ROOT.is_dir():
 memory_provider = pytest.importorskip("agent.memory_provider")
 
 from hermes_topic_memory.evidence import EvidenceLedger
+from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.importer import import_markdown_directory
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
 from hermes_topic_memory.store import FileTopicStore
@@ -160,12 +161,19 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
     recall_description = schemas["topic_memory_recall"]["description"].casefold()
     topics_description = schemas["topic_memory_topics"]["description"].casefold()
 
+    query_description = schemas["topic_memory_recall"]["parameters"]["properties"]["query"][
+        "description"
+    ].casefold()
     assert "named project or topic archive" in prompt
     assert "must use topic_memory_recall" in prompt
     assert "topic_memory_topics is for discovery only" in prompt
     assert "named project or topic archive" in recall_description
     assert "discovery only" in topics_description
     assert "not for archive recall" in topics_description
+    assert "verbatim" in prompt
+    assert "never invent or rewrite dates" in prompt
+    assert "verbatim" in recall_description
+    assert "never invent or rewrite dates" in query_description
 
 
 def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: Path) -> None:
@@ -317,6 +325,49 @@ def test_recall_query_topic_overrides_session_but_explicit_topic_wins(tmp_path: 
     assert query_switch["answer"] == "answer from beta"
     assert explicit["topic_id"] == "alpha"
     provider.shutdown()
+
+
+def test_turn_start_raw_question_is_canonical_for_reader_and_cache(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    raw = "Alpha 项目6月28日下午4:30做了什么？请基于主题记忆回答。"
+    rewritten = "Alpha 项目2024年6月28日下午4:30完成了哪些工作？"
+
+    provider.on_turn_start(1, raw)
+    first = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": rewritten}, session_id="session-a"
+        )
+    )
+    cached = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": rewritten}, session_id="session-a"
+        )
+    )
+
+    assert first["source"] == "reader"
+    assert cached["source"] == "cache"
+    assert [request.question for request in reader.requests] == [raw]
+    records = QuestionCache(data_root).records("alpha")
+    assert [record.question for record in records] == [raw]
+    assert "2024" not in records[0].normalized_question
+
+    provider.on_session_switch("session-b", chat_id="chat-beta", reset=True)
+    assert provider._raw_turn_questions == {}
+    direct_query = "What is archived for Beta?"
+    direct = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": direct_query}, session_id="session-b"
+        )
+    )
+    assert direct["topic_id"] == "beta"
+    assert reader.requests[-1].question == direct_query
+
+    provider.shutdown()
+    assert provider._raw_turn_questions == {}
 
 def test_recall_query_ambiguous_or_unknown_topic_never_uses_session_fallback(
     tmp_path: Path,
