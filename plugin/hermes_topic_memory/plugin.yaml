@@ -1,0 +1,5 @@
+name: hermes_topic_memory
+version: 0.1.0
+description: "Strict, versioned plain-text topic memory with background recall."
+pip_dependencies: []
+requires_env: []
