@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 import time
@@ -170,6 +171,7 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
     prompt = provider.system_prompt_block().casefold()
     recall_description = schemas["topic_memory_recall"]["description"].casefold()
     topics_description = schemas["topic_memory_topics"]["description"].casefold()
+    update_schema = schemas["topic_memory_update"]
 
     query_description = schemas["topic_memory_recall"]["parameters"]["properties"]["query"][
         "description"
@@ -189,6 +191,8 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
         assert "return only verbatim_answer exactly as received" in instruction
         assert "never add, remove, infer, normalize, or alter" in instruction
         assert "dates, times, or years" in instruction
+    assert "evidence_ids" not in update_schema["parameters"]["required"]
+    assert "current user turn" in update_schema["description"].casefold()
 
 
 def test_successful_recall_exposes_exact_verbatim_relay_contract(tmp_path: Path) -> None:
@@ -350,6 +354,7 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
         provider.handle_tool_call(
             "topic_memory_update",
             {
+                "topic": "alpha",
                 "body": "# Alpha\n\nUpdated verified fact.\n",
                 "evidence_ids": [evidence.evidence_id],
                 "reason": "The completed turn supersedes the old fact.",
@@ -360,20 +365,262 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
     assert update["status"] == "updated"
     assert update["topic_id"] == "alpha"
     assert FileTopicStore(data_root).get_topic("alpha").metadata.version == 2
+    assert update["evidence_ids"] == [evidence.evidence_id]
+    assert update["evidence_source"] == "supplied"
 
     unknown = json.loads(provider.handle_tool_call("unknown", {}))
     assert unknown == {"error": "unknown_tool"}
     provider.shutdown()
 
-def test_recall_query_topic_overrides_session_but_explicit_topic_wins(tmp_path: Path) -> None:
-    provider, hermes_home, _data_root = configured_provider(tmp_path)
-    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
 
-    session_recall = json.loads(
+def test_same_turn_update_without_evidence_ids_persists_raw_user_evidence(
+    tmp_path: Path,
+) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    raw_user_turn = "Please add information technology to Alpha."
+    provider.on_turn_start(1, raw_user_turn, session_id="session-a")
+
+    update = json.loads(
         provider.handle_tool_call(
-            "topic_memory_recall", {"query": "current status"}, session_id="session-a"
+            "topic_memory_update",
+            {
+                "topic": "alpha",
+                "body": "# Alpha\n\nAlpha canonical fact.\n\n- Information technology\n",
+                "reason": "The current user explicitly requested this addition.",
+            },
+            session_id="session-a",
         )
     )
+
+    assert update["status"] == "updated"
+    assert (update["previous_version"], update["current_version"]) == (1, 2)
+    assert update["evidence_source"] == "current_turn"
+    assert len(update["evidence_ids"]) == 1
+    assert "body" not in update and "reason" not in update
+    records = EvidenceLedger(data_root).records("alpha")
+    assert [record.evidence_id for record in records] == update["evidence_ids"]
+    assert [(record.session_id, record.user_text, record.assistant_text) for record in records] == [
+        ("session-a", raw_user_turn, "")
+    ]
+    memory = FileTopicStore(data_root).get_topic("alpha")
+    assert memory.metadata.version == 2
+    assert memory.body.endswith("- Information technology\n")
+    provider.shutdown()
+
+
+def test_update_failures_are_specific_and_leave_no_partial_update(tmp_path: Path) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    replacement = "# Alpha\n\nCandidate replacement.\n"
+
+    no_raw_turn = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {"topic": "alpha", "body": replacement, "reason": "Requested now."},
+            session_id="session-a",
+        )
+    )
+    assert no_raw_turn == {"error": "current_turn_evidence_unavailable"}
+
+    provider.on_turn_start(1, "Keep the current Alpha body.", session_id="session-a")
+    unchanged = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "topic": "alpha",
+                "body": "# Alpha\n\nAlpha canonical fact.\n",
+                "reason": "No actual content change.",
+            },
+            session_id="session-a",
+        )
+    )
+    assert unchanged == {"error": "body_unchanged"}
+
+    missing_evidence = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "topic": "alpha",
+                "body": replacement,
+                "evidence_ids": ["missing-evidence"],
+                "reason": "Claims an unavailable source.",
+            },
+            session_id="session-a",
+        )
+    )
+    assert missing_evidence == {"error": "evidence_not_found"}
+
+    invalid = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {"topic": "alpha", "body": "", "reason": "Invalid empty body."},
+            session_id="session-a",
+        )
+    )
+    assert invalid == {"error": "invalid_update_arguments"}
+    memory = FileTopicStore(data_root).get_topic("alpha")
+    assert memory.metadata.version == 1
+    assert memory.body == "# Alpha\n\nAlpha canonical fact.\n"
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    provider.shutdown()
+
+
+def test_ambiguous_update_topic_fails_before_evidence_or_body_write(tmp_path: Path) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    registry_path = data_root / "topic-registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    for topic in registry["topics"]:
+        if topic["topic_id"] in {"alpha", "beta"}:
+            topic["display_name"] = "Shared Archive"
+    registry_path.write_text(json.dumps(registry) + "\n", encoding="utf-8")
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    provider.on_turn_start(1, "Update the shared archive.", session_id="session-a")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "topic": "Shared Archive",
+                "body": "# Shared\n\nChanged.\n",
+                "reason": "User requested a change.",
+            },
+            session_id="session-a",
+        )
+    )
+
+    assert result == {"error": "topic_ambiguous"}
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    assert EvidenceLedger(data_root).records("beta") == ()
+    assert FileTopicStore(data_root).get_topic("alpha").metadata.version == 1
+    assert FileTopicStore(data_root).get_topic("beta").metadata.version == 1
+    provider.shutdown()
+
+
+def test_update_without_safely_resolved_topic_fails_closed(tmp_path: Path) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    registry_path = data_root / "topic-registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry.pop("default_topic")
+    registry["topics"] = [
+        topic for topic in registry["topics"] if topic["topic_id"] != "global"
+    ]
+    for topic in registry["topics"]:
+        topic["chat_ids"] = []
+    registry_path.write_text(json.dumps(registry) + "\n", encoding="utf-8")
+    provider.save_config(
+        {
+            "data_root": "topic-memory/data",
+            "reader_endpoint": "https://reader.invalid/v1",
+            "reader_model": "fake-reader",
+        },
+        str(hermes_home),
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="unknown-chat")
+    provider.on_turn_start(1, "继续记录这个事实", session_id="session-a")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {"body": "# Unknown\n\nChanged.\n", "reason": "User requested it."},
+            session_id="session-a",
+        )
+    )
+
+    assert result == {"error": "topic_unresolved"}
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    assert EvidenceLedger(data_root).records("beta") == ()
+    provider.shutdown()
+
+
+def test_unexpected_update_failure_logs_redacted_type_and_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider, hermes_home, _data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    private_turn = "private current-turn evidence"
+    private_body = "# Alpha\n\nprivate replacement body\n"
+    provider.on_turn_start(1, private_turn, session_id="session-a")
+
+    def fail_append(*args, **kwargs):
+        raise RuntimeError(f"storage failed for {private_turn} and {private_body}")
+
+    monkeypatch.setattr(provider._ledger, "append_turn", fail_append)
+    with caplog.at_level(logging.WARNING, logger="plugin.hermes_topic_memory"):
+        result = json.loads(
+            provider.handle_tool_call(
+                "topic_memory_update",
+                {
+                    "topic": "alpha",
+                    "body": private_body,
+                    "reason": "private reason",
+                },
+                session_id="session-a",
+            )
+        )
+
+    assert result == {"error": "operation_failed"}
+    log_text = caplog.text
+    assert "RuntimeError" in log_text
+    assert "storage failed for" in log_text
+    assert private_turn not in log_text
+    assert private_body not in log_text
+    provider.shutdown()
+
+
+def test_topic_switch_updates_and_syncs_only_newly_explicit_topic(tmp_path: Path) -> None:
+    updater = RecordingUpdater()
+    provider, hermes_home, data_root = configured_provider(tmp_path, updater=updater)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    switched = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "Switch the active archive.", "topic": "beta"},
+            session_id="session-a",
+        )
+    )
+    assert switched["topic_id"] == "beta"
+    raw_user_turn = "继续加入这个新事实"
+    provider.on_turn_start(2, raw_user_turn, session_id="session-a")
+
+    update = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "body": "# Beta\n\nBeta canonical fact.\n\nNew explicit fact.\n",
+                "reason": "The current user authorized the new fact.",
+            },
+            session_id="session-a",
+        )
+    )
+    provider.sync_turn(raw_user_turn, "Applied.", session_id="session-a")
+    provider.on_pre_compress([])
+
+    assert update["topic_id"] == "beta"
+    assert update["evidence_source"] == "current_turn"
+    alpha = FileTopicStore(data_root).get_topic("alpha")
+    beta = FileTopicStore(data_root).get_topic("beta")
+    assert (alpha.metadata.version, beta.metadata.version) == (1, 2)
+    assert alpha.body == "# Alpha\n\nAlpha canonical fact.\n"
+    assert beta.body.endswith("New explicit fact.\n")
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    assert [record.user_text for record in EvidenceLedger(data_root).records("beta")] == [
+        raw_user_turn,
+        raw_user_turn,
+    ]
+    assert updater.calls[-1][0] == "beta"
+    provider.shutdown()
+
+
+def test_successful_query_and_explicit_recall_bind_follow_up_sync_to_latest_topic(
+    tmp_path: Path,
+) -> None:
+    updater = RecordingUpdater()
+    provider, hermes_home, data_root = configured_provider(tmp_path, updater=updater)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
     query_switch = json.loads(
         provider.handle_tool_call(
             "topic_memory_recall",
@@ -381,18 +628,28 @@ def test_recall_query_topic_overrides_session_but_explicit_topic_wins(tmp_path: 
             session_id="session-a",
         )
     )
-    explicit = json.loads(
+    assert query_switch["topic_id"] == "beta"
+    provider.sync_turn("继续记录这个事实", "ack", session_id="session-a")
+    provider.on_pre_compress([])
+
+    explicit_switch = json.loads(
         provider.handle_tool_call(
             "topic_memory_recall",
-            {"query": "What is archived for Beta?", "topic": "a"},
+            {"query": "current status", "topic": "alpha"},
             session_id="session-a",
         )
     )
+    assert explicit_switch["topic_id"] == "alpha"
+    provider.sync_turn("再记录一个事实", "ack", session_id="session-a")
+    provider.on_pre_compress([])
 
-    assert session_recall["topic_id"] == "alpha"
-    assert query_switch["topic_id"] == "beta"
-    assert query_switch["answer"] == "answer from beta"
-    assert explicit["topic_id"] == "alpha"
+    assert [record.user_text for record in EvidenceLedger(data_root).records("beta")] == [
+        "继续记录这个事实"
+    ]
+    assert [record.user_text for record in EvidenceLedger(data_root).records("alpha")] == [
+        "再记录一个事实"
+    ]
+    assert [topic_id for topic_id, _evidence_ids in updater.calls] == ["beta", "alpha"]
     provider.shutdown()
 
 

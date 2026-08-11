@@ -84,15 +84,15 @@ hermes-topic-memory --data-root /path/to/data rollback global 1
 
 The Provider reads `$HERMES_HOME/topic-memory/config.json`. Copy `config.example.json` there only on the intended isolated target profile, then adjust non-secret paths and Reader settings. Relative paths resolve under the supplied runtime `hermes_home`; absolute paths are treated as explicit external data roots. Credentials belong only in `HERMES_TOPIC_MEMORY_API_KEY`.
 
-`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is an explicit tool topic (ID, alias, or full display name), a unique exact topic name mentioned in the current recall query, configured chat ID, configured default, registry default, then `global`. Unknown or ambiguous named-topic queries fail closed; routing never searches topic bodies or another topic implicitly.
+`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is an explicit tool topic (ID, alias, or full display name), a unique exact topic name mentioned in the current query, the session's current topic, configured chat ID, configured default, registry default, then `global`. A successful explicit/query recall binds its resolved topic only to that session; a later explicit/query mention replaces it. Unknown or ambiguous named-topic queries fail closed; routing never searches topic bodies or another topic implicitly.
 
 The Provider exposes:
 
 - `topic_memory_recall` — synchronous recall from one resolved topic; successful results keep `answer` and expose the identical `verbatim_answer` with `response_policy: "copy_verbatim_answer_exactly"`, which must be relayed without changing any dates, times, or years;
-- `topic_memory_update` — full canonical replacement requiring verified evidence IDs;
+- `topic_memory_update` — full canonical replacement using supplied verified raw evidence IDs, or immediate evidence captured from the stored raw user message when IDs are omitted during an active turn;
 - `topic_memory_topics` — discovery-only topic metadata and current versions, never bodies or config.
 
-`queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater.
+`queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. `sync_turn()` honors a new unique topic mention, otherwise writes to that session's current topic. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater. Successful explicit updates return versions, `evidence_ids`, and `evidence_source` (`supplied` or `current_turn`) without returning bodies. Expected rejections use stable safe codes: `invalid_update_arguments`, `current_turn_evidence_unavailable`, `topic_ambiguous`, `topic_unresolved`, `body_unchanged`, `evidence_not_found`, or `evidence_topic_mismatch`; unexpected failures remain redacted as `operation_failed`.
 
 ## Copy-only installer
 

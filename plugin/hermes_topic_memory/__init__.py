@@ -16,13 +16,23 @@ from urllib.parse import urlsplit
 from agent.memory_provider import MemoryProvider
 from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.engine import RecallEngine, RecallResult
-from hermes_topic_memory.evidence import EvidenceLedger, EvidenceRecord
+from hermes_topic_memory.evidence import EvidenceLedger, EvidenceNotFoundError, EvidenceRecord
 from hermes_topic_memory.models import TopicMemory
 from hermes_topic_memory.operations import apply_evidence_update
 from hermes_topic_memory.reader import OpenAICompatibleReader, Reader, ReaderRequest
-from hermes_topic_memory.router import RouteDecision, TopicRegistry
+from hermes_topic_memory.router import (
+    AmbiguousRegistryError,
+    RouteDecision,
+    TopicRegistry,
+    TopicRoutingError,
+)
 from hermes_topic_memory.store import FileTopicStore
-from hermes_topic_memory.updater import EvidenceUpdatePipeline, TopicUpdater, UpdateProposal
+from hermes_topic_memory.updater import (
+    EvidenceUpdatePipeline,
+    ProposalValidationError,
+    TopicUpdater,
+    UpdateProposal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +47,9 @@ _CONFIG_KEYS = {
     "jaccard_threshold",
     "request_timeout",
 }
+
+_MAX_UPDATE_BODY_CHARS = 200_000
+_MISSING = object()
 
 RECALL_SCHEMA = {
     "name": "topic_memory_recall",
@@ -69,7 +82,10 @@ RECALL_SCHEMA = {
 
 UPDATE_SCHEMA = {
     "name": "topic_memory_update",
-    "description": "Replace one canonical topic using verified raw evidence IDs.",
+    "description": (
+        "Replace one canonical topic using supplied verified raw evidence IDs, or evidence "
+        "captured from the active current user turn when evidence IDs are omitted."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -80,10 +96,13 @@ UPDATE_SCHEMA = {
                 "items": {"type": "string"},
                 "minItems": 1,
                 "uniqueItems": True,
+                "description": (
+                    "Optional verified raw evidence IDs. Omit only during an active user turn."
+                ),
             },
             "reason": {"type": "string", "description": "Why the evidence requires this replacement."},
         },
-        "required": ["body", "evidence_ids", "reason"],
+        "required": ["body", "reason"],
         "additionalProperties": False,
     },
 }
@@ -163,6 +182,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._current_session_id = ""
         self._contexts: dict[str, _SessionContext] = {}
         self._session_evidence: dict[str, list[str]] = {}
+        self._session_topics: dict[str, str] = {}
         self._raw_turn_questions: dict[str, str] = {}
         self._prefetch_results: dict[tuple[str, str], str] = {}
         self._prefetch_tickets: dict[tuple[str, str], object] = {}
@@ -225,6 +245,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         self._current_session_id = session_id
         self._raw_turn_questions = {}
+        self._session_topics = {}
         self._contexts = {
             session_id: _SessionContext(
                 chat_id=_chat_id(kwargs),
@@ -249,7 +270,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
             "exactly as received. Never add, remove, infer, normalize, or alter any content from "
             "it, especially dates, times, or years. topic_memory_topics is for discovery only "
             "when available names are unknown, not for answering archive questions. Use "
-            "topic_memory_update only with verified evidence IDs. Recall is isolated to one "
+            "topic_memory_update with supplied verified evidence IDs or during an active user "
+            "turn so the current turn can be captured as evidence. Recall is isolated to one "
             "topic; never infer cross-topic context."
         )
 
@@ -323,15 +345,29 @@ class HermesTopicMemoryProvider(MemoryProvider):
             return
         sid = session_id or self._current_session_id
         try:
-            topic_id = self._route(session_id=sid).topic_id
-        except Exception:
-            logger.debug("Topic-memory turn routing failed")
-            return
-        future = self._write_executor.submit(
-            self._append_turn, topic_id, sid, user_content, assistant_content
-        )
-        with self._lock:
-            self._write_futures.append(future)
+            try:
+                decision = self._route(session_id=sid, query=user_content)
+            except (TopicRoutingError, ValueError) as error:
+                logger.debug(
+                    "Topic-memory turn routing failed: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+                return
+            if decision.source == "query":
+                self._remember_session_topic(sid, decision.topic_id)
+            future = self._write_executor.submit(
+                self._append_turn,
+                decision.topic_id,
+                sid,
+                user_content,
+                assistant_content,
+            )
+            with self._lock:
+                self._write_futures.append(future)
+        finally:
+            with self._lock:
+                self._raw_turn_questions.pop(sid, None)
 
     def _append_turn(
         self, topic_id: str, session_id: str, user_content: str, assistant_content: str
@@ -406,6 +442,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
                     if key[0] != new_session_id
                 }
                 self._session_evidence.pop(new_session_id, None)
+                self._session_topics.pop(new_session_id, None)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_SCHEMA, UPDATE_SCHEMA, TOPICS_SCHEMA]
@@ -417,60 +454,244 @@ class HermesTopicMemoryProvider(MemoryProvider):
             return _json_result({"error": "unknown_tool"})
         if not self._initialized:
             return _json_result({"error": "provider_not_initialized"})
-        try:
-            if tool_name == "topic_memory_topics":
+        if not isinstance(args, dict):
+            return _json_result({"error": "invalid_request"})
+        if tool_name == "topic_memory_topics":
+            try:
                 return _json_result(self._topics_result())
-            session_id = str(kwargs.get("session_id") or self._current_session_id)
-            explicit = args.get("topic")
-            query: str | None = None
-            if tool_name == "topic_memory_recall":
-                raw_query = args.get("query")
-                if not isinstance(raw_query, str) or not raw_query.strip():
-                    return _json_result({"error": "query_required"})
-                with self._lock:
-                    canonical_question = self._raw_turn_questions.get(session_id)
-                query = canonical_question or raw_query
+            except Exception as error:
+                logger.debug(
+                    "Topic-memory topic listing failed: %s: %s",
+                    type(error).__name__,
+                    error,
+                )
+                return _json_result({"error": "operation_failed"})
+        session_id = str(kwargs.get("session_id") or self._current_session_id)
+        if tool_name == "topic_memory_recall":
+            return self._handle_recall(args, session_id=session_id, kwargs=kwargs)
+        return self._handle_update(args, session_id=session_id, kwargs=kwargs)
+
+    def _handle_recall(
+        self,
+        args: dict[str, Any],
+        *,
+        session_id: str,
+        kwargs: dict[str, Any],
+    ) -> str:
+        raw_query = args.get("query")
+        if not isinstance(raw_query, str) or not raw_query.strip():
+            return _json_result({"error": "query_required"})
+        explicit = args.get("topic")
+        if explicit is not None and (
+            not isinstance(explicit, str) or not explicit.strip()
+        ):
+            return _json_result({"error": "invalid_request"})
+        with self._lock:
+            canonical_question = self._raw_turn_questions.get(session_id)
+        query = canonical_question or raw_query
+        try:
             decision = self._route(
                 session_id=session_id,
-                explicit_topic=explicit if isinstance(explicit, str) else None,
+                explicit_topic=explicit,
                 query=query,
                 chat_id=_optional_text(kwargs.get("chat_id")),
             )
-            if query is not None:
-                return _json_result(
-                    _recall_result(self._require_engine().recall(decision.topic_id, query))
+            result = self._require_engine().recall(decision.topic_id, query)
+        except (KeyError, TypeError, ValueError) as error:
+            logger.debug(
+                "Topic-memory recall rejected: %s: %s",
+                type(error).__name__,
+                error,
+            )
+            return _json_result({"error": "invalid_request"})
+        except Exception as error:
+            logger.debug(
+                "Topic-memory recall failed: %s: %s",
+                type(error).__name__,
+                error,
+            )
+            return _json_result({"error": "operation_failed"})
+        if (
+            result.failure is None
+            and result.answer is not None
+            and decision.source in {"explicit", "query"}
+        ):
+            self._remember_session_topic(session_id, decision.topic_id)
+        return _json_result(_recall_result(result))
+
+    def _handle_update(
+        self,
+        args: dict[str, Any],
+        *,
+        session_id: str,
+        kwargs: dict[str, Any],
+    ) -> str:
+        body = args.get("body")
+        reason = args.get("reason")
+        with self._lock:
+            raw_turn = self._raw_turn_questions.get(session_id)
+        private_values = tuple(
+            value for value in (body, reason, raw_turn) if isinstance(value, str) and value
+        )
+        if (
+            not isinstance(body, str)
+            or not body.strip()
+            or len(body) > _MAX_UPDATE_BODY_CHARS
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            return self._update_failure_result(
+                "invalid_update_arguments",
+                ValueError("body and reason must be non-empty and within limits"),
+                private_values=private_values,
+            )
+
+        raw_topic = args.get("topic", _MISSING)
+        if raw_topic is not _MISSING and (
+            not isinstance(raw_topic, str) or not raw_topic.strip()
+        ):
+            return self._update_failure_result(
+                "invalid_update_arguments",
+                ValueError("topic must be a non-empty string when supplied"),
+                private_values=private_values,
+            )
+        explicit_topic = raw_topic if isinstance(raw_topic, str) else None
+
+        raw_evidence_ids = args.get("evidence_ids", _MISSING)
+        evidence_supplied = raw_evidence_ids is not _MISSING
+        if evidence_supplied and (
+            not isinstance(raw_evidence_ids, list)
+            or not raw_evidence_ids
+            or not all(
+                isinstance(item, str) and bool(item.strip()) for item in raw_evidence_ids
+            )
+            or len(set(raw_evidence_ids)) != len(raw_evidence_ids)
+        ):
+            return self._update_failure_result(
+                "invalid_update_arguments",
+                ValueError("evidence_ids must contain unique non-empty strings"),
+                private_values=private_values,
+            )
+
+        try:
+            decision = self._route(
+                session_id=session_id,
+                explicit_topic=explicit_topic,
+                query=raw_turn,
+                chat_id=_optional_text(kwargs.get("chat_id")),
+            )
+        except AmbiguousRegistryError as error:
+            return self._update_failure_result(
+                "topic_ambiguous", error, private_values=private_values
+            )
+        except TopicRoutingError as error:
+            return self._update_failure_result(
+                "topic_unresolved", error, private_values=private_values
+            )
+
+        try:
+            memory = self._require_store().get_topic(decision.topic_id)
+            if body == memory.body:
+                return self._update_failure_result(
+                    "body_unchanged",
+                    ValueError("replacement body must differ from current body"),
+                    private_values=private_values,
                 )
-            body = args.get("body")
-            evidence_ids = args.get("evidence_ids")
-            reason = args.get("reason")
-            if (
-                not isinstance(body, str)
-                or not isinstance(reason, str)
-                or not isinstance(evidence_ids, list)
-                or not all(isinstance(item, str) for item in evidence_ids)
-            ):
-                return _json_result({"error": "invalid_update_arguments"})
+
+            if evidence_supplied:
+                evidence_ids = tuple(raw_evidence_ids)
+                evidence_source = "supplied"
+            else:
+                if raw_turn is None:
+                    return self._update_failure_result(
+                        "current_turn_evidence_unavailable",
+                        ValueError("active raw user turn is unavailable"),
+                        private_values=private_values,
+                    )
+                record = self._require_ledger().append_turn(
+                    decision.topic_id,
+                    session_id,
+                    raw_turn,
+                    "",
+                )
+                evidence_ids = (record.evidence_id,)
+                evidence_source = "current_turn"
+
             result = apply_evidence_update(
                 store=self._require_store(),
                 ledger=self._require_ledger(),
                 topic_id=decision.topic_id,
                 body=body,
-                evidence_ids=tuple(evidence_ids),
+                evidence_ids=evidence_ids,
                 reason=reason,
             )
-            return _json_result(
-                {
-                    "status": result.status,
-                    "topic_id": result.topic_id,
-                    "previous_version": result.previous_version,
-                    "current_version": result.current_version,
-                }
+        except EvidenceNotFoundError as error:
+            return self._update_failure_result(
+                "evidence_not_found", error, private_values=private_values
             )
-        except (KeyError, TypeError, ValueError):
-            return _json_result({"error": "invalid_request"})
-        except Exception:
-            logger.debug("Topic-memory tool operation failed")
-            return _json_result({"error": "operation_failed"})
+        except ProposalValidationError as error:
+            message = str(error)
+            if "must differ" in message:
+                code = "body_unchanged"
+            elif "topic mismatch" in message:
+                code = "evidence_topic_mismatch"
+            else:
+                code = "invalid_update_arguments"
+            return self._update_failure_result(
+                code, error, private_values=private_values
+            )
+        except ValueError as error:
+            code = "body_unchanged" if "must differ" in str(error) else "invalid_update_arguments"
+            return self._update_failure_result(
+                code, error, private_values=private_values
+            )
+        except Exception as error:
+            return self._update_failure_result(
+                "operation_failed",
+                error,
+                private_values=private_values,
+                unexpected=True,
+            )
+
+        if decision.source in {"explicit", "query"}:
+            self._remember_session_topic(session_id, decision.topic_id)
+        return _json_result(
+            {
+                "status": result.status,
+                "topic_id": result.topic_id,
+                "previous_version": result.previous_version,
+                "current_version": result.current_version,
+                "evidence_ids": list(result.evidence_ids),
+                "evidence_source": evidence_source,
+            }
+        )
+
+    @staticmethod
+    def _update_failure_result(
+        code: str,
+        error: Exception,
+        *,
+        private_values: tuple[str, ...],
+        unexpected: bool = False,
+    ) -> str:
+        message = str(error)
+        for private_value in private_values:
+            message = message.replace(private_value, "<redacted>")
+        message = " ".join(message.splitlines()) or "<empty>"
+        if len(message) > 300:
+            message = f"{message[:297]}..."
+        log = logger.warning if unexpected else logger.debug
+        log(
+            "Topic-memory update failed [%s]: %s: %s",
+            code,
+            type(error).__name__,
+            message,
+        )
+        return _json_result({"error": code})
+
+    def _remember_session_topic(self, session_id: str, topic_id: str) -> None:
+        with self._lock:
+            self._session_topics[session_id] = topic_id
 
     def _topics_result(self) -> dict[str, Any]:
         registry = self._require_registry()
@@ -496,14 +717,22 @@ class HermesTopicMemoryProvider(MemoryProvider):
         query: str | None = None,
         chat_id: str | None = None,
     ) -> RouteDecision:
-        context = self._contexts.get(session_id, _SessionContext(None, None))
+        with self._lock:
+            context = self._contexts.get(session_id, _SessionContext(None, None))
+            current_topic = self._session_topics.get(session_id)
         registry = self._require_registry()
-        if explicit_topic is None and query is not None:
+        if explicit_topic is not None:
+            return registry.route(explicit_topic=explicit_topic)
+        if query is not None:
             mentioned_topic = registry.mentioned_topic(query)
             if mentioned_topic is not None:
                 return RouteDecision(mentioned_topic, "query")
+        if current_topic is not None:
+            return RouteDecision(
+                registry.resolve_name(current_topic, context="session topic"),
+                "session",
+            )
         return registry.route(
-            explicit_topic=explicit_topic,
             chat_id=chat_id or context.chat_id,
             default_topic=context.default_topic,
         )
@@ -544,6 +773,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         with self._lock:
             self._raw_turn_questions.clear()
+            self._session_topics.clear()
         if not self._initialized:
             return
         self._flush_writes()
