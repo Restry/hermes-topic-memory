@@ -143,6 +143,12 @@ class _SessionContext:
     default_topic: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RoutedArchiveQuery:
+    topic_id: str
+    query: str
+
+
 class _ReaderTopicUpdater:
     def __init__(self, reader: Reader) -> None:
         self.reader = reader
@@ -204,6 +210,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._session_evidence: dict[str, list[str]] = {}
         self._session_topics: dict[str, str] = {}
         self._raw_turn_questions: dict[str, str] = {}
+        self._routed_archive_queries: dict[str, _RoutedArchiveQuery] = {}
         self._prefetch_results: dict[tuple[str, str], str] = {}
         self._prefetch_tickets: dict[tuple[str, str], object] = {}
         self._write_futures: list[Future[Any]] = []
@@ -265,6 +272,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._write_enabled = kwargs.get("agent_context", "primary") == "primary"
         self._current_session_id = session_id
         self._raw_turn_questions = {}
+        self._routed_archive_queries = {}
         self._session_topics = {}
         self._contexts = {
             session_id: _SessionContext(
@@ -305,18 +313,31 @@ class HermesTopicMemoryProvider(MemoryProvider):
         session_id = _optional_text(kwargs.get("session_id")) or self._current_session_id
         if not session_id:
             return
+        raw_question = message if isinstance(message, str) and message.strip() else None
         with self._lock:
-            if isinstance(message, str) and message.strip():
-                self._raw_turn_questions[session_id] = message
-            else:
+            if raw_question is None:
                 self._raw_turn_questions.pop(session_id, None)
+                return
+            self._raw_turn_questions[session_id] = raw_question
+            if not self._initialized:
+                return
+            try:
+                decision = self._route(session_id=session_id, query=raw_question)
+            except ValueError:
+                return
+            if decision.source == "query":
+                self._routed_archive_queries[session_id] = _RoutedArchiveQuery(
+                    decision.topic_id, raw_question
+                )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not query.strip() or not self._initialized or self._prefetch_executor is None:
             return
         sid = session_id or self._current_session_id
         try:
-            decision = self._route(session_id=sid)
+            decision = self._route(session_id=sid, query=query)
+            if decision.source == "query":
+                self._remember_routed_archive_query(sid, decision.topic_id, query)
         except Exception:
             logger.debug("Topic-memory prefetch routing failed")
             return
@@ -413,6 +434,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
             return
         with self._lock:
             self._raw_turn_questions.pop(self._current_session_id, None)
+            self._routed_archive_queries.pop(self._current_session_id, None)
         self._flush_writes()
         self._consolidate_session(self._current_session_id)
 
@@ -454,6 +476,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
             self._current_session_id = new_session_id
             self._raw_turn_questions.pop(previous, None)
             self._raw_turn_questions.pop(new_session_id, None)
+            self._routed_archive_queries.pop(previous, None)
+            self._routed_archive_queries.pop(new_session_id, None)
             self._contexts[new_session_id] = context
             if reset or rewound:
                 self._prefetch_results = {
@@ -512,15 +536,34 @@ class HermesTopicMemoryProvider(MemoryProvider):
         ):
             return _json_result({"error": "invalid_request"})
         with self._lock:
-            canonical_question = self._raw_turn_questions.get(session_id)
-        query = canonical_question or raw_query
+            current_question = self._raw_turn_questions.get(session_id)
+            routed_query = self._routed_archive_queries.get(session_id)
+            route_query = (
+                routed_query.query
+                if routed_query is not None and routed_query.query == current_question
+                else raw_query
+            )
         try:
             decision = self._route(
                 session_id=session_id,
                 explicit_topic=explicit,
-                query=query,
+                query=route_query,
                 chat_id=_optional_text(kwargs.get("chat_id")),
             )
+            query = raw_query
+            if (
+                routed_query is not None
+                and routed_query.topic_id == decision.topic_id
+                and (
+                    routed_query.query == current_question
+                    or routed_query.query == raw_query
+                )
+            ):
+                query = routed_query.query
+            if decision.source in {"explicit", "query"}:
+                self._remember_routed_archive_query(
+                    session_id, decision.topic_id, query
+                )
             result = self._require_engine().recall(decision.topic_id, query)
         except (KeyError, TypeError, ValueError) as error:
             logger.debug(
@@ -765,6 +808,12 @@ class HermesTopicMemoryProvider(MemoryProvider):
         with self._lock:
             self._session_topics[session_id] = topic_id
 
+    def _remember_routed_archive_query(
+        self, session_id: str, topic_id: str, query: str
+    ) -> None:
+        with self._lock:
+            self._routed_archive_queries[session_id] = _RoutedArchiveQuery(topic_id, query)
+
     def _topics_result(self) -> dict[str, Any]:
         registry = self._require_registry()
         store = self._require_store()
@@ -846,6 +895,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         with self._lock:
             self._raw_turn_questions.clear()
             self._session_topics.clear()
+            self._routed_archive_queries.clear()
         if not self._initialized:
             return
         self._flush_writes()

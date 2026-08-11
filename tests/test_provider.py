@@ -141,6 +141,46 @@ def configured_provider(
     return provider, hermes_home, data_root
 
 
+def configured_mafu_provider(
+    tmp_path: Path, *, reader=None
+) -> tuple[HermesTopicMemoryProvider, Path, Path]:
+    hermes_home = tmp_path / "mafu-profile"
+    data_root = hermes_home / "topic-memory" / "data"
+    store = FileTopicStore(data_root)
+    store.create_topic(
+        "dm-mafu",
+        "# 马夫\n\nMafu is the user's Feishu assistant.\n",
+        aliases=("马夫", "mafu"),
+    )
+    (data_root / "topic-registry.json").write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        "topic_id": "dm-mafu",
+                        "display_name": "马夫",
+                        "aliases": ["mafu"],
+                        "chat_ids": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    provider = HermesTopicMemoryProvider(reader=reader or TopicReader())
+    provider.save_config(
+        {
+            "data_root": "topic-memory/data",
+            "reader_endpoint": "https://reader.invalid/v1",
+            "reader_model": "fake-reader",
+        },
+        str(hermes_home),
+    )
+    return provider, hermes_home, data_root
+
+
 def wait_for_prefetch(provider, query: str, session_id: str) -> str:
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -286,6 +326,25 @@ def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: 
     assert provider._data_root == data_root
     assert (Path.home() / ".hermes" / "topic-memory" / "data").resolve() != data_root.resolve()
     provider.shutdown()
+
+def test_fresh_session_prefetch_routes_named_topic_without_any_fallback(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+    query = "你跟我讲讲马夫是用来做什么的？"
+
+    assert provider._session_topics == {}
+    provider.queue_prefetch(query, session_id="fresh-session")
+
+    prefetched = wait_for_prefetch(provider, query, "fresh-session")
+    assert "answer from dm-mafu" in prefetched
+    assert [request.question for request in reader.requests] == [query]
+    provider.shutdown()
+
 
 def test_background_prefetch_is_non_blocking_and_session_topic_isolation(tmp_path: Path) -> None:
     reader = BlockingReader()
@@ -888,6 +947,71 @@ def test_successful_query_and_explicit_recall_bind_follow_up_sync_to_latest_topi
     provider.shutdown()
 
 
+def test_meta_follow_up_recall_keeps_the_supplied_archive_question(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_mafu_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+    archive_question = "你跟我讲讲马夫是用来做什么的？"
+
+    provider.on_turn_start(1, archive_question, session_id="session-a")
+    initial = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": archive_question, "topic": "dm-mafu"},
+            session_id="session-a",
+        )
+    )
+    provider.on_turn_start(2, "你为什么不调用记忆插件啊？", session_id="session-a")
+    recalled = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": archive_question, "topic": "dm-mafu"},
+            session_id="session-a",
+        )
+    )
+
+    assert initial["source"] == "reader"
+    assert recalled["source"] == "cache"
+    assert [request.question for request in reader.requests] == [archive_question]
+    assert [record.question for record in QuestionCache(data_root).records("dm-mafu")] == [
+        archive_question
+    ]
+    provider.shutdown()
+
+
+def test_same_turn_named_topic_recall_routes_and_remembers_session_topic(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+    archive_question = "你跟我讲讲马夫是用来做什么的？"
+
+    provider.on_turn_start(1, archive_question, session_id="session-a")
+    first = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": archive_question},
+            session_id="session-a",
+        )
+    )
+    provider.on_turn_start(2, "再说说它目前的职责。", session_id="session-a")
+    follow_up = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "再说说它目前的职责。"},
+            session_id="session-a",
+        )
+    )
+
+    assert [first["topic_id"], follow_up["topic_id"]] == ["dm-mafu", "dm-mafu"]
+    provider.shutdown()
+
+
 def test_turn_start_raw_question_is_canonical_for_reader_and_cache(
     tmp_path: Path,
 ) -> None:
@@ -918,6 +1042,7 @@ def test_turn_start_raw_question_is_canonical_for_reader_and_cache(
 
     provider.on_session_switch("session-b", chat_id="chat-beta", reset=True)
     assert provider._raw_turn_questions == {}
+    assert provider._routed_archive_queries == {}
     direct_query = "What is archived for Beta?"
     direct = json.loads(
         provider.handle_tool_call(
@@ -929,6 +1054,7 @@ def test_turn_start_raw_question_is_canonical_for_reader_and_cache(
 
     provider.shutdown()
     assert provider._raw_turn_questions == {}
+    assert provider._routed_archive_queries == {}
 
 def test_recall_query_ambiguous_or_unknown_topic_never_uses_session_fallback(
     tmp_path: Path,
