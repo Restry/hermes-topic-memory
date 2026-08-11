@@ -6,5 +6,6 @@
 - Reader answers are at most 200 characters; one correction is allowed, then recall fails closed.
 - Provider storage must use runtime `hermes_home` or an explicit configured data root. Never hardcode or mutate the active local Hermes profile.
 - Local work is limited to repository tests, static checks, package builds, temporary package-only venv installs, and installer tests against ordinary temporary directories.
+- The source plugin stays at `plugin/hermes_topic_memory`; user-provider installs target `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, because `plugins/memory/` is only the bundled-provider source hierarchy.
 - Live installation, activation, Gateway restart, and E2E are deferred to Azure China VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2` with backup and rollback.
 - Secrets stay in environment variables and never appear in config readback, tool output, logs, fixtures, or Git.

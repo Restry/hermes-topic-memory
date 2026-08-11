@@ -79,7 +79,7 @@ From a repository checkout, preview the exact source and target:
 ```bash
 hermes-topic-memory-install \
   --source ./plugin/hermes_topic_memory \
-  --target "$TARGET_HERMES_HOME/plugins/memory/hermes_topic_memory" \
+  --target "$TARGET_HERMES_HOME/plugins/hermes_topic_memory" \
   --dry-run
 ```
 
@@ -88,16 +88,16 @@ Install after reviewing the dry-run:
 ```bash
 hermes-topic-memory-install \
   --source ./plugin/hermes_topic_memory \
-  --target "$TARGET_HERMES_HOME/plugins/memory/hermes_topic_memory"
+  --target "$TARGET_HERMES_HOME/plugins/hermes_topic_memory"
 ```
 
-The installer hashes the source and staged/runtime copies, backs up an existing target beside it, rejects symlinks and overlapping source/target trees, and leaves `config.yaml`, `.env`, Provider activation, and Gateway state unchanged.
+Hermes discovers user memory providers only at `$HERMES_HOME/plugins/<provider-name>`. The installer hashes the source and staged/runtime copies, backs up an existing target beside it, rejects symlinks and overlapping source/target trees, and leaves `config.yaml`, `.env`, Provider activation, and Gateway state unchanged.
 
 On the Azure test VM only, the later operator must separately:
 
 1. back up the target Hermes profile and current Provider state;
 2. install this Python package into the target Hermes Python environment;
-3. run installer dry-run, then copy the plugin;
+3. run installer dry-run, then copy `plugin/hermes_topic_memory` to `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`;
 4. save non-secret Provider config in the isolated target `HERMES_HOME` and secrets in its process environment;
 5. explicitly set `memory.provider: hermes_topic_memory`;
 6. restart the test Gateway and run lifecycle/isolation/persistence E2E;

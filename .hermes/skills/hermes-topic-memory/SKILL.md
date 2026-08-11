@@ -16,9 +16,10 @@ Use this skill when changing or operating this repository.
 
 - Run tests with `.venv/bin/python`.
 - Installer tests may target ordinary temporary directories only.
+- Keep the source plugin at `plugin/hermes_topic_memory`; temporary and cloud user-provider installs target `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, never the bundled `plugins/memory/` hierarchy.
 - Package installation may target a plain temporary venv only.
 - Do not install into any local Hermes profile, edit local Hermes config/plugins, start Hermes, or restart a local Gateway.
 
 ## Cloud handoff
 
-Real plugin installation and lifecycle E2E occur later on Azure China VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2`. Before changes, back up that VM's target Hermes profile and Provider state. Use installer dry-run, verify hashes, activate explicitly, verify Gateway health and topic isolation, then restore the previous Provider unless retention is approved.
+Real plugin installation and lifecycle E2E occur later on Azure China VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2`. Before changes, back up that VM's target Hermes profile and Provider state. Copy `plugin/hermes_topic_memory` to `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, use installer dry-run, verify hashes, activate explicitly, verify Gateway health and topic isolation, then restore the previous Provider unless retention is approved.

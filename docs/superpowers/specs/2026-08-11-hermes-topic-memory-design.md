@@ -96,6 +96,8 @@ Standalone plugin implements:
 
 The plugin does not modify Hermes core.
 
+The repository source remains `plugin/hermes_topic_memory`. Hermes user-provider discovery requires installation at `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, not under the bundled-provider-only `plugins/memory/` hierarchy.
+
 ## Fixtures
 
 Four sanitized topics: `gsk-d360`, `mindmemos`, `growlog`, and `global`. Each contains current state, historical state, a superseding update, overlapping terminology, an expected-empty case, and cross-topic distractors. Fixtures include questions and expected topic/answer constraints, not private user memory.
@@ -103,8 +105,8 @@ Four sanitized topics: `gsk-d360`, `mindmemos`, `growlog`, and `global`. Each co
 ## Acceptance
 
 - deterministic tests for routing, isolation, cache matching, per-topic invalidation, atomic updates, rollback, and answer limits;
-- local contract/unit tests may import the Hermes ABC but must not install or activate the provider in local Hermes;
-- plugin install/readback, Provider lifecycle, activation, Gateway restart, and live E2E run on the Azure China test VM only;
+- local contract/unit tests may import the Hermes ABC and exercise real discovery against a temporary `HERMES_HOME`, but must not install or activate the provider in local Hermes;
+- plugin install/readback uses `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`; Provider lifecycle, activation, Gateway restart, and live E2E run on the Azure China test VM only;
 - mock Reader end-to-end tests plus at most four real Reader calls after deterministic gates pass;
 - no secret, private memory, runtime cache, or generated data committed;
 - repository clean and committed with README and project-local `.hermes` context.

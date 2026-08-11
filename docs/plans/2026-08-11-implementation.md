@@ -63,13 +63,13 @@
 
 ### Task 6: Hermes Memory Provider plugin
 
-**Files:** `plugin/hermes_topic_memory/__init__.py`, `plugin/plugin.yaml`, `src/hermes_topic_memory/install.py`, `tests/test_provider.py`, `tests/test_install.py`
+**Files:** `plugin/hermes_topic_memory/__init__.py`, `plugin/hermes_topic_memory/plugin.yaml`, `src/hermes_topic_memory/install.py`, `tests/test_provider.py`, `tests/test_install.py`
 
 1. Write failing tests against the real `agent.memory_provider.MemoryProvider` contract.
 2. Test initialize, static prompt, prefetched capsule, background queue, turn sync, session end, pre-compress, session switch, tool schemas, and profile-safe paths.
 3. Verify RED.
 4. Implement plugin without changing Hermes core.
-5. Unit-test installer path selection and source/runtime hashing without installing into local Hermes. Real installation is deferred to cloud acceptance.
+5. Unit-test copying source `plugin/hermes_topic_memory` to the user-provider target `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, plus source/runtime hashing, without installing into local Hermes. Real installation is deferred to cloud acceptance.
 6. Verify GREEN and full suite.
 7. Commit `feat: add Hermes topic memory provider`.
 
@@ -88,7 +88,7 @@
 **Files:** `src/hermes_topic_memory/cli.py`, `README.md`, `config.example.json`, `.hermes/memory.md`, `.hermes/skills/hermes-topic-memory/SKILL.md`, `.gitignore`
 
 1. Add CLI tests for init, topics, recall, update, rollback, and validate.
-2. Implement minimal CLI and installation instructions.
+2. Implement minimal CLI and installation instructions using the user-provider target `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`.
 3. Document secret handling and isolated-profile activation; do not configure the active profile.
 4. Verify CLI smoke path from a clean temporary directory.
 5. Commit `docs: add operations and Hermes integration guide`.
@@ -98,7 +98,7 @@
 1. Resolve the real project Python executable and run the full suite.
 2. Run package build and install into a fresh venv.
 3. Package the repository and transfer it to Azure China VM `mindmemos-brain2` (`RG-MINDMEMOS-LAB2`). Back up its Hermes config/provider state before changes.
-4. On that VM only: install into an isolated cloud test profile, run Provider lifecycle E2E with mock Reader, activate the Provider, restart the test Gateway, and verify logs/health.
+4. On that VM only: install `plugin/hermes_topic_memory` at `$TARGET_HERMES_HOME/plugins/hermes_topic_memory` in an isolated cloud test profile, run Provider lifecycle E2E with mock Reader, activate the Provider, restart the test Gateway, and verify logs/health.
 5. After deterministic gates pass, run at most four real Reader calls across the four topics; record cached tokens when exposed and check answer/isolation constraints.
 6. Prove topic isolation, version-bound cache invalidation, completed-turn evidence persistence, and restart persistence on the cloud VM. Restore the previous cloud Provider/config after acceptance unless the user explicitly asks to keep it active.
 7. Inspect Git diff/status for secrets, private data, runtime artifacts, and out-of-scope changes.
