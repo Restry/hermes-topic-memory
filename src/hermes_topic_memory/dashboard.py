@@ -8,10 +8,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from .cache import QuestionCache
-from .router import TopicRegistry
-from .store import FileTopicStore
-from .validation import validate_data_root
+from .catalog import TopicCatalog
 
 
 
@@ -25,6 +22,7 @@ class DashboardTopic:
     lines: int
     version: int
     version_count: int
+    question_count: int
     cache_entry_count: int
     updated_at: str
     imported_at: str | None
@@ -43,6 +41,8 @@ class DashboardResult:
     median_chars: int | float
     version_count: int
     cache_entry_count: int
+    total_question_count: int
+    questions_last_30_days: int
     output_bytes: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,42 +58,35 @@ class DashboardResult:
             "median_chars": self.median_chars,
             "version_count": self.version_count,
             "cache_entry_count": self.cache_entry_count,
+            "total_question_count": self.total_question_count,
+            "questions_last_30_days": self.questions_last_30_days,
             "output_bytes": self.output_bytes,
         }
 
 
 def generate_dashboard(data_root: str | Path, output: str | Path) -> DashboardResult:
-    """Render a portable metadata dashboard without embedding complete topic bodies."""
+    """Render a portable metadata dashboard without embedding private content."""
     root = Path(data_root).expanduser().resolve(strict=True)
     output_path = Path(output).expanduser().resolve(strict=False)
-    validate_data_root(root)
-    registry = TopicRegistry.from_file(root / "topic-registry.json")
-    store = FileTopicStore(root)
-    cache = QuestionCache(root)
-    topics: list[DashboardTopic] = []
-    for config in registry.topics:
-        memory = store.get_topic(config.topic_id)
-        body_bytes = memory.body.encode("utf-8")
-        versions = store.list_versions(config.topic_id)
-        cache_entries = cache.records(config.topic_id)
-        topics.append(
-            DashboardTopic(
-                topic_id=config.topic_id,
-                display_name=config.display_name,
-                source_relative_path=config.source_relative_path
-                or memory.metadata.source_relative_path
-                or "未记录",
-                chars=len(memory.body),
-                bytes=len(body_bytes),
-                lines=len(memory.body.splitlines()),
-                version=memory.metadata.version,
-                version_count=len(versions),
-                cache_entry_count=len(cache_entries),
-                updated_at=memory.metadata.updated_at,
-                imported_at=memory.metadata.imported_at,
-                source_sha256=memory.metadata.source_sha256,
-            )
+    snapshot = TopicCatalog(root).snapshot()
+    topics = [
+        DashboardTopic(
+            topic_id=topic.topic_id,
+            display_name=topic.display_name,
+            source_relative_path=topic.source_relative_path,
+            chars=topic.chars,
+            bytes=topic.bytes,
+            lines=topic.lines,
+            version=topic.version,
+            version_count=topic.version_count,
+            question_count=topic.question_count,
+            cache_entry_count=topic.active_cache_count,
+            updated_at=topic.updated_at,
+            imported_at=topic.imported_at,
+            source_sha256=topic.source_sha256,
         )
+        for topic in snapshot.topics
+    ]
     if not topics:
         raise ValueError("dashboard requires at least one registered topic")
 
@@ -101,13 +94,15 @@ def generate_dashboard(data_root: str | Path, output: str | Path) -> DashboardRe
     total_chars = sum(lengths)
     total_bytes = sum(topic.bytes for topic in topics)
     version_count = sum(topic.version_count for topic in topics)
-    cache_entry_count = sum(topic.cache_entry_count for topic in topics)
+    cache_entry_count = snapshot.active_cache_count
     payload = _render_html(
         topics,
         total_chars=total_chars,
         total_bytes=total_bytes,
         version_count=version_count,
         cache_entry_count=cache_entry_count,
+        total_question_count=snapshot.total_question_count,
+        questions_last_30_days=snapshot.questions_last_30_days,
     ).encode("utf-8")
     _atomic_write(output_path, payload)
     return DashboardResult(
@@ -121,6 +116,8 @@ def generate_dashboard(data_root: str | Path, output: str | Path) -> DashboardRe
         median_chars=median(lengths),
         version_count=version_count,
         cache_entry_count=cache_entry_count,
+        total_question_count=snapshot.total_question_count,
+        questions_last_30_days=snapshot.questions_last_30_days,
         output_bytes=len(payload),
     )
 
@@ -132,17 +129,21 @@ def _render_html(
     total_bytes: int,
     version_count: int,
     cache_entry_count: int,
+    total_question_count: int,
+    questions_last_30_days: int,
 ) -> str:
     lengths = [topic.chars for topic in topics]
     metrics = (
         ("主题数", len(topics)),
+        ("历史提问数", total_question_count),
+        ("近 30 天提问数", questions_last_30_days),
+        ("活跃缓存条目数", cache_entry_count),
         ("总字符数", total_chars),
         ("总字节数", total_bytes),
         ("字符数中位数", median(lengths)),
         ("最少字符数", min(lengths)),
         ("最多字符数", max(lengths)),
         ("全库版本数", version_count),
-        ("缓存条目数", cache_entry_count),
     )
     metric_html = "".join(
         f'<div class="metric"><dt>{html.escape(label)}</dt><dd>{_number(value)}</dd></div>'
@@ -281,7 +282,7 @@ def _topic_row(topic: DashboardTopic) -> str:
     source_sha = _source_sha(topic.source_sha256)
     return f"""<tr data-title="{html.escape(topic.display_name.casefold(), quote=True)}" data-search="{html.escape(search, quote=True)}" data-chars="{topic.chars}">
 <td class="topic-title">{escaped_title}</td><td class="topic-id"><code>{escaped_id}</code></td><td class="source-path"><code>{escaped_path}</code></td><td class="number">{_number(topic.chars)}</td><td class="number">{_number(topic.bytes)}</td><td class="number">{_number(topic.lines)}</td><td class="number">{topic.version}</td><td class="updated"><time datetime="{html.escape(topic.updated_at, quote=True)}">{html.escape(topic.updated_at)}</time></td>
-<td class="details-cell"><details><summary>查看元数据</summary><dl class="detail-grid"><dt>版本数</dt><dd>{topic.version_count}</dd><dt>缓存条目数</dt><dd>{topic.cache_entry_count}</dd><dt>导入时间</dt><dd>{imported_at}</dd><dt>源文件 SHA-256</dt><dd>{source_sha}</dd></dl></details></td>
+<td class="details-cell"><details><summary>查看元数据</summary><dl class="detail-grid"><dt>版本数</dt><dd>{topic.version_count}</dd><dt>历史提问数</dt><dd>{topic.question_count}</dd><dt>活跃缓存条目数</dt><dd>{topic.cache_entry_count}</dd><dt>导入时间</dt><dd>{imported_at}</dd><dt>源文件 SHA-256</dt><dd>{source_sha}</dd></dl></details></td>
 </tr>"""
 
 
