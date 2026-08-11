@@ -1,0 +1,1 @@
+"""Standalone topic memory core."""
