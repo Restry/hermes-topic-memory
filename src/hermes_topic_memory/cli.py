@@ -8,12 +8,15 @@ from pathlib import Path
 from typing import Sequence
 
 from .cache import QuestionCache
+from .dashboard import generate_dashboard
 from .engine import RecallEngine
 from .evidence import EvidenceLedger
 from .operations import apply_evidence_update
+from .importer import import_markdown_directory
 from .reader import OpenAICompatibleReader, Reader
 from .router import TopicRegistry
 from .store import FileTopicStore
+from .validation import validate_data_root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +50,18 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("version", type=int)
 
     subparsers.add_parser("validate", help="Validate registry and canonical topic files")
+
+    importer = subparsers.add_parser(
+        "import-markdown", help="Import one topic per Markdown file from a directory"
+    )
+    importer.add_argument("--source-dir", required=True, type=Path)
+    importer.add_argument("--dry-run", action="store_true")
+    importer.add_argument("--replace", action="store_true")
+
+    dashboard = subparsers.add_parser(
+        "dashboard", help="Generate a self-contained metadata dashboard"
+    )
+    dashboard.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -63,6 +78,12 @@ def main(argv: Sequence[str] | None = None, *, reader: Reader | None = None) -> 
         result = _update(data_root, args)
     elif args.command == "rollback":
         result = _rollback(data_root, args)
+    elif args.command == "import-markdown":
+        result = import_markdown_directory(
+            args.source_dir, data_root, dry_run=args.dry_run, replace=args.replace
+        ).to_dict()
+    elif args.command == "dashboard":
+        result = generate_dashboard(data_root, args.output).to_dict()
     else:
         result = _validate(data_root)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -126,6 +147,7 @@ def _topics(data_root: Path) -> dict:
                 "aliases": list(config.aliases),
                 "chat_ids": list(config.chat_ids),
                 "version": memory.metadata.version,
+                "source_relative_path": config.source_relative_path,
             }
         )
     return {"default_topic": value.get("default_topic"), "topics": topics}
@@ -182,19 +204,7 @@ def _rollback(data_root: Path, args: argparse.Namespace) -> dict:
 
 
 def _validate(data_root: Path) -> dict:
-    registry = TopicRegistry.from_file(_registry_path(data_root))
-    store = FileTopicStore(data_root)
-    registered = {topic.topic_id for topic in registry.topics}
-    for topic_id in registered:
-        store.get_topic(topic_id)
-    topic_dirs = {
-        path.name
-        for path in store.topics_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    } if store.topics_dir.is_dir() else set()
-    if topic_dirs != registered:
-        raise ValueError("registry and canonical topic directories differ")
-    return {"status": "valid", "topics": len(registered)}
+    return {"status": "valid", "topics": validate_data_root(data_root)}
 
 
 def _reader_from_environment() -> OpenAICompatibleReader:

@@ -39,6 +39,26 @@ hermes-topic-memory --data-root /path/to/data topics
 hermes-topic-memory --data-root /path/to/data validate
 ```
 
+Import a real Markdown corpus recursively. Each `.md` or `.markdown` file becomes exactly one topic; source text is stored byte-for-byte as UTF-8, and the registry has no implicit default topic:
+
+```bash
+hermes-topic-memory --data-root /path/to/imported-data import-markdown \
+  --source-dir /path/to/markdown-corpus --dry-run
+hermes-topic-memory --data-root /path/to/imported-data import-markdown \
+  --source-dir /path/to/markdown-corpus
+```
+
+The dry-run writes nothing and emits aggregate JSON. Import rejects invalid UTF-8 and symlinks. Activation uses a staged directory rename; an existing target is refused unless `--replace` is supplied, in which case the prior data root is retained beside it as a rollback backup.
+
+Generate a portable, metadata-only HTML inspection page:
+
+```bash
+hermes-topic-memory --data-root /path/to/imported-data dashboard \
+  --output /path/to/topic-memory-dashboard.html
+```
+
+The HTML has inline CSS and JavaScript, remains readable without JavaScript, and includes aggregate sizes, version/cache counts, a size distribution, search, sorting, and native expandable metadata. It never embeds a complete topic body; only longer documents may contribute a short escaped preview. Keep dashboards generated from private corpora outside Git.
+
 Reader-backed recall uses environment configuration; the API key is optional and is never written to the data root:
 
 ```bash
@@ -111,6 +131,8 @@ Allowed local checks are repository-only:
 .venv/bin/python -m pytest
 .venv/bin/python -m build
 ```
+
+The committed example topics are sanitized smoke-test fixtures, not a long-text quality benchmark. Meaningful evaluation requires a representative corpus with realistic document sizes and structure; keep any private evaluation corpus, imported data root, dashboard, and reports in an ignored local directory.
 
 Design: `docs/superpowers/specs/2026-08-11-hermes-topic-memory-design.md`
 

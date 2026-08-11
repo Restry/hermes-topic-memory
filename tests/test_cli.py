@@ -91,3 +91,32 @@ def test_cli_evidence_backed_update_and_rollback(tmp_path: Path, capsys) -> None
     rolled_back = invoke(capsys, base + ["rollback", "alpha", "1"])
     assert rolled_back == {"status": "rolled_back", "topic_id": "alpha", "version": 3}
     assert FileTopicStore(data_root).get_topic("alpha").body == old_body.read_text(encoding="utf-8")
+
+
+def test_cli_import_dry_run_import_and_dashboard(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "one.md").write_text("# One\n\nBody.\n", encoding="utf-8")
+    data_root = tmp_path / "data"
+    base = ["--data-root", str(data_root)]
+
+    dry_run = invoke(
+        capsys,
+        base + ["import-markdown", "--source-dir", str(source), "--dry-run"],
+    )
+    assert dry_run["status"] == "dry-run"
+    assert dry_run["topic_count"] == 1
+    assert not data_root.exists()
+
+    imported = invoke(
+        capsys, base + ["import-markdown", "--source-dir", str(source)]
+    )
+    assert imported["status"] == "imported"
+    assert imported["topic_count"] == 1
+    assert "topic_ids" not in imported
+
+    output = tmp_path / "dashboard.html"
+    dashboard = invoke(capsys, base + ["dashboard", "--output", str(output)])
+    assert dashboard["status"] == "generated"
+    assert dashboard["topic_count"] == 1
+    assert dashboard["output_bytes"] == len(output.read_bytes())

@@ -9,3 +9,8 @@
 - The source plugin stays at `plugin/hermes_topic_memory`; user-provider installs target `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, because `plugins/memory/` is only the bundled-provider source hierarchy.
 - Live installation, activation, Gateway restart, and E2E are deferred to Azure China VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2` with backup and rollback.
 - Secrets stay in environment variables and never appear in config readback, tool output, logs, fixtures, or Git.
+
+- Directory imports map every Markdown file to one isolated topic, preserve valid UTF-8 source bytes, retain source provenance metadata, and activate only after staged validation. Imported registries intentionally omit a default unless an operator configures one later.
+- Use `hermes-topic-memory --data-root DATA import-markdown --source-dir CORPUS --dry-run` before the real import. Existing targets require `--replace`, which preserves a sibling rollback backup.
+- Use `hermes-topic-memory --data-root DATA dashboard --output DASHBOARD.html` for local inspection. The self-contained page is metadata-only and must remain ignored when generated from private data.
+- Committed synthetic examples are smoke fixtures only. Long-text evaluation requires a representative, meaningful corpus kept outside Git.

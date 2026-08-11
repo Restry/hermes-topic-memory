@@ -46,6 +46,12 @@ class FileTopicStore:
         display_name: str | None = None,
         aliases: tuple[str, ...] = (),
         source_policy: str = "verified-evidence-only",
+        source_relative_path: str | None = None,
+        source_sha256: str | None = None,
+        source_bytes: int | None = None,
+        source_chars: int | None = None,
+        source_lines: int | None = None,
+        imported_at: str | None = None,
     ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         self._validate_body(body)
@@ -65,6 +71,12 @@ class FileTopicStore:
                 created_at=now,
                 updated_at=now,
                 source_policy=source_policy,
+                source_relative_path=source_relative_path,
+                source_sha256=source_sha256,
+                source_bytes=source_bytes,
+                source_chars=source_chars,
+                source_lines=source_lines,
+                imported_at=imported_at,
             )
             self._atomic_write(self._memory_path(topic_id), body.encode("utf-8"))
             self._write_metadata(topic_id, metadata)
@@ -107,7 +119,7 @@ class FileTopicStore:
         path = self._version_path(topic_id, version)
         if not path.is_file():
             raise TopicNotFoundError(f"topic version does not exist: {topic_id}@{version}")
-        return path.read_text(encoding="utf-8")
+        return path.read_bytes().decode("utf-8", errors="strict")
 
     def list_versions(self, topic_id: str) -> tuple[int, ...]:
         current = self.get_topic(topic_id)
@@ -128,7 +140,7 @@ class FileTopicStore:
         metadata_path = self._metadata_path(topic_id)
         if not memory_path.is_file() or not metadata_path.is_file():
             raise TopicNotFoundError(f"topic does not exist: {topic_id}")
-        body = memory_path.read_text(encoding="utf-8")
+        body = memory_path.read_bytes().decode("utf-8", errors="strict")
         try:
             raw_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata = TopicMetadata.from_dict(raw_metadata)

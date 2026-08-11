@@ -20,6 +20,7 @@ class TopicConfig:
     display_name: str
     aliases: tuple[str, ...]
     chat_ids: tuple[str, ...]
+    source_relative_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,7 @@ class TopicRegistry:
                     display_name=str(raw.get("display_name", topic_id)),
                     aliases=_string_tuple(raw.get("aliases", ()), "aliases"),
                     chat_ids=_string_tuple(raw.get("chat_ids", ()), "chat_ids"),
+                    source_relative_path=_optional_text(raw.get("source_relative_path")),
                 )
             )
         default = value.get("default_topic")
@@ -157,3 +159,11 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
     ):
         raise ValueError(f"{field} must be a list of strings")
     return tuple(value)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("source_relative_path must be a string")
+    return value

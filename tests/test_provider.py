@@ -15,6 +15,7 @@ if HERMES_AGENT_ROOT.is_dir():
 memory_provider = pytest.importorskip("agent.memory_provider")
 
 from hermes_topic_memory.evidence import EvidenceLedger
+from hermes_topic_memory.importer import import_markdown_directory
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
 from hermes_topic_memory.store import FileTopicStore
 from hermes_topic_memory.updater import UpdateProposal
@@ -271,6 +272,65 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
 
     unknown = json.loads(provider.handle_tool_call("unknown", {}))
     assert unknown == {"error": "unknown_tool"}
+    provider.shutdown()
+
+
+def test_imported_51_topic_provider_has_no_default_or_cross_topic_fallback(
+    tmp_path: Path,
+) -> None:
+    hermes_home = tmp_path / "profile"
+    data_root = hermes_home / "topic-memory" / "data"
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(51):
+        (source / f"document-{index:02d}.md").write_text(
+            f"# Document {index}\n\nIsolated fact {index}.\n", encoding="utf-8"
+        )
+    imported = import_markdown_directory(source, data_root)
+    registry_path = data_root / "topic-registry.json"
+    registry_value = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert "default_topic" not in registry_value
+    for index, item in enumerate(registry_value["topics"]):
+        item["chat_ids"] = [f"chat-{index}"]
+    registry_path.write_text(json.dumps(registry_value) + "\n", encoding="utf-8")
+
+    reader = TopicReader()
+    provider = HermesTopicMemoryProvider(reader=reader)
+    provider.save_config(
+        {
+            "data_root": "topic-memory/data",
+            "reader_endpoint": "https://reader.invalid/v1",
+            "reader_model": "fake-reader",
+        },
+        str(hermes_home),
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-0")
+
+    implicit = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": "status"}, session_id="session-a"
+        )
+    )
+    explicit = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status", "topic": imported.topic_ids[-1]},
+            session_id="session-a",
+        )
+    )
+    missing = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status"},
+            session_id="unknown-session",
+            chat_id="unknown-chat",
+        )
+    )
+
+    assert implicit["topic_id"] == imported.topic_ids[0]
+    assert explicit["topic_id"] == imported.topic_ids[-1]
+    assert implicit["topic_id"] != explicit["topic_id"]
+    assert missing == {"error": "invalid_request"}
     provider.shutdown()
 
 

@@ -14,9 +14,15 @@ class TopicMetadata:
     created_at: str
     updated_at: str
     source_policy: str
+    source_relative_path: str | None = None
+    source_sha256: str | None = None
+    source_bytes: int | None = None
+    source_chars: int | None = None
+    source_lines: int | None = None
+    imported_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "topic_id": self.topic_id,
             "display_name": self.display_name,
             "aliases": list(self.aliases),
@@ -26,6 +32,16 @@ class TopicMetadata:
             "updated_at": self.updated_at,
             "source_policy": self.source_policy,
         }
+        optional = {
+            "source_relative_path": self.source_relative_path,
+            "source_sha256": self.source_sha256,
+            "source_bytes": self.source_bytes,
+            "source_chars": self.source_chars,
+            "source_lines": self.source_lines,
+            "imported_at": self.imported_at,
+        }
+        value.update((key, item) for key, item in optional.items() if item is not None)
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> TopicMetadata:
@@ -38,6 +54,12 @@ class TopicMetadata:
             created_at=str(value["created_at"]),
             updated_at=str(value["updated_at"]),
             source_policy=str(value["source_policy"]),
+            source_relative_path=_optional_str(value.get("source_relative_path")),
+            source_sha256=_optional_str(value.get("source_sha256")),
+            source_bytes=_optional_int(value.get("source_bytes")),
+            source_chars=_optional_int(value.get("source_chars")),
+            source_lines=_optional_int(value.get("source_lines")),
+            imported_at=_optional_str(value.get("imported_at")),
         )
 
 
@@ -45,3 +67,11 @@ class TopicMetadata:
 class TopicMemory:
     metadata: TopicMetadata
     body: str
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)

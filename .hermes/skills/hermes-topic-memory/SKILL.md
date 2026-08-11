@@ -20,6 +20,28 @@ Use this skill when changing or operating this repository.
 - Package installation may target a plain temporary venv only.
 - Do not install into any local Hermes profile, edit local Hermes config/plugins, start Hermes, or restart a local Gateway.
 
+## Corpus import and inspection
+
+Preview and import one isolated topic per Markdown document:
+
+```bash
+hermes-topic-memory --data-root /path/to/data import-markdown \
+  --source-dir /path/to/corpus --dry-run
+hermes-topic-memory --data-root /path/to/data import-markdown \
+  --source-dir /path/to/corpus
+```
+
+Imports reject symlinks and malformed UTF-8, preserve the canonical source verbatim, omit an implicit default topic, stage and validate the complete data root before activation, and require `--replace` to retain a rollback backup when replacing a target.
+
+Generate the metadata-only inspection page without a build system:
+
+```bash
+hermes-topic-memory --data-root /path/to/data dashboard \
+  --output /path/to/topic-memory-dashboard.html
+```
+
+Private corpora, imported roots, dashboards, and reports stay in ignored local storage. Committed synthetic fixtures are smoke checks; realistic long-text evaluation requires a meaningful external corpus.
+
 ## Cloud handoff
 
 Real plugin installation and lifecycle E2E occur later on Azure China VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2`. Before changes, back up that VM's target Hermes profile and Provider state. Copy `plugin/hermes_topic_memory` to `$TARGET_HERMES_HOME/plugins/hermes_topic_memory`, use installer dry-run, verify hashes, activate explicitly, verify Gateway health and topic isolation, then restore the previous Provider unless retention is approved.
