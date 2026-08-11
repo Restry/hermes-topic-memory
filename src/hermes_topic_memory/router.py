@@ -5,6 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+_TOPIC_REFERENCE_MARKERS = (
+    " topic",
+    "topic ",
+    " project",
+    "project ",
+    "话题",
+    "主题",
+    "项目",
+)
+
 
 class TopicRoutingError(ValueError):
     """Raised when routing cannot select one topic."""
@@ -45,11 +55,37 @@ class TopicRegistry:
         self._names: dict[str, str] = {}
         for topic in topics:
             self._bind(self._names, _normalize_name(topic.topic_id), topic.topic_id, "name")
+        display_topics: dict[str, set[str]] = {}
+        for topic in topics:
+            display_name = _normalize_name(topic.display_name)
+            if not display_name:
+                raise ValueError(f"empty display name for topic: {topic.topic_id}")
+            display_topics.setdefault(display_name, set()).add(topic.topic_id)
+        self._ambiguous_names: dict[str, tuple[str, ...]] = {}
+        for display_name, topic_ids in display_topics.items():
+            existing = self._names.get(display_name)
+            if existing is not None and topic_ids != {existing}:
+                other = next(
+                    topic_id for topic_id in sorted(topic_ids) if topic_id != existing
+                )
+                raise AmbiguousRegistryError(
+                    f"ambiguous display name {display_name!r}: {existing!r} and {other!r}"
+                )
+            if existing is not None:
+                continue
+            if len(topic_ids) == 1:
+                self._names[display_name] = next(iter(topic_ids))
+            else:
+                self._ambiguous_names[display_name] = tuple(sorted(topic_ids))
         for topic in topics:
             for alias in topic.aliases:
                 normalized = _normalize_name(alias)
                 if not normalized:
                     raise ValueError(f"empty alias for topic: {topic.topic_id}")
+                if normalized in self._ambiguous_names:
+                    raise AmbiguousRegistryError(
+                        f"ambiguous alias {normalized!r}: conflicts with duplicate display name"
+                    )
                 self._bind(self._names, normalized, topic.topic_id, "alias")
 
         self._chat_ids: dict[str, str] = {}
@@ -105,10 +141,42 @@ class TopicRegistry:
         return tuple(self._topics.values())
 
     def resolve_name(self, name: str, *, context: str = "topic") -> str:
-        topic_id = self._names.get(_normalize_name(name))
+        normalized = _normalize_name(name)
+        ambiguous = self._ambiguous_names.get(normalized)
+        if ambiguous is not None:
+            raise AmbiguousRegistryError(
+                f"ambiguous {context}: {name!r} maps to {', '.join(ambiguous)}"
+            )
+        topic_id = self._names.get(normalized)
         if topic_id is None:
             raise TopicRoutingError(f"unknown {context}: {name!r}")
         return topic_id
+
+    def mentioned_topic(self, query: str) -> str | None:
+        normalized_query = _normalize_name(query)
+        ambiguous_names = tuple(
+            name
+            for name in self._ambiguous_names
+            if _query_contains_name(normalized_query, name)
+        )
+        if ambiguous_names:
+            raise AmbiguousRegistryError(
+                f"query mentions ambiguous topic names: {', '.join(sorted(ambiguous_names))}"
+            )
+        matched_topics = {
+            topic_id
+            for name, topic_id in self._names.items()
+            if _query_contains_name(normalized_query, name)
+        }
+        if len(matched_topics) > 1:
+            raise AmbiguousRegistryError(
+                f"query mentions multiple topics: {', '.join(sorted(matched_topics))}"
+            )
+        if matched_topics:
+            return next(iter(matched_topics))
+        if any(marker in normalized_query for marker in _TOPIC_REFERENCE_MARKERS):
+            raise TopicRoutingError("query mentions an unknown topic")
+        return None
 
     def route(
         self,
@@ -147,6 +215,30 @@ class TopicRegistry:
 
 def _normalize_name(value: str) -> str:
     return value.strip().casefold()
+
+
+def _query_contains_name(query: str, name: str) -> bool:
+    start = 0
+    while True:
+        index = query.find(name, start)
+        if index < 0:
+            return False
+        end = index + len(name)
+        left_bound = index == 0 or not (
+            name[0].isascii()
+            and name[0].isalnum()
+            and query[index - 1].isascii()
+            and query[index - 1].isalnum()
+        )
+        right_bound = end == len(query) or not (
+            name[-1].isascii()
+            and name[-1].isalnum()
+            and query[end].isascii()
+            and query[end].isalnum()
+        )
+        if left_bound and right_bound:
+            return True
+        start = index + 1
 
 
 def _normalize_chat_id(value: str) -> str:

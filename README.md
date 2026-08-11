@@ -50,6 +50,8 @@ hermes-topic-memory --data-root /path/to/imported-data import-markdown \
 
 The dry-run writes nothing and emits aggregate JSON. Import rejects invalid UTF-8 and symlinks. Activation uses a staged directory rename; an existing target is refused unless `--replace` is supplied, in which case the prior data root is retained beside it as a rollback backup.
 
+Import derives exact aliases from the human-facing filename, including a decorated title and parenthetical alternate name. Only aliases unique across the imported registry are retained; collisions remain unresolved rather than selecting a topic.
+
 Generate a portable, metadata-only HTML inspection page:
 
 ```bash
@@ -82,13 +84,13 @@ hermes-topic-memory --data-root /path/to/data rollback global 1
 
 The Provider reads `$HERMES_HOME/topic-memory/config.json`. Copy `config.example.json` there only on the intended isolated target profile, then adjust non-secret paths and Reader settings. Relative paths resolve under the supplied runtime `hermes_home`; absolute paths are treated as explicit external data roots. Credentials belong only in `HERMES_TOPIC_MEMORY_API_KEY`.
 
-`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is explicit tool topic/alias, configured chat ID, configured default, registry default, then `global`. It never searches another topic implicitly.
+`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is an explicit tool topic (ID, alias, or full display name), a unique exact topic name mentioned in the current recall query, configured chat ID, configured default, registry default, then `global`. Unknown or ambiguous named-topic queries fail closed; routing never searches topic bodies or another topic implicitly.
 
 The Provider exposes:
 
-- `topic_memory_recall` — synchronous explicit recall from one resolved topic;
+- `topic_memory_recall` — synchronous recall from one resolved topic; use it for named project or topic archive questions;
 - `topic_memory_update` — full canonical replacement requiring verified evidence IDs;
-- `topic_memory_topics` — topic metadata and current versions, never bodies or config.
+- `topic_memory_topics` — discovery-only topic metadata and current versions, never bodies or config.
 
 `queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater.
 

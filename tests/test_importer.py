@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from hermes_topic_memory.importer import import_markdown_directory
-from hermes_topic_memory.router import TopicRegistry, TopicRoutingError
+from hermes_topic_memory.router import AmbiguousRegistryError, TopicRegistry, TopicRoutingError
 from hermes_topic_memory.store import FileTopicStore
 
 
@@ -36,6 +36,9 @@ def test_recursive_import_is_one_file_per_topic_and_preserves_verbatim_utf8(tmp_
     assert "default_topic" not in registry_value
     assert len(registry_value["topics"]) == len(expected)
     assert {item["source_relative_path"] for item in registry_value["topics"]} == set(expected)
+    registry = TopicRegistry.from_dict(registry_value)
+    with pytest.raises(AmbiguousRegistryError, match="ambiguous topic"):
+        registry.resolve_name("同名")
     store = FileTopicStore(target)
     for item in registry_value["topics"]:
         relative = item["source_relative_path"]
@@ -51,6 +54,54 @@ def test_recursive_import_is_one_file_per_topic_and_preserves_verbatim_utf8(tmp_
         assert memory.metadata.source_chars == len(expected[relative])
         assert memory.metadata.imported_at
 
+
+def test_import_generates_human_aliases_and_routes_exact_names(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    display_name = "🐎 马夫 (mafu) — 话题记忆"
+    write_source(source, f"dm/{display_name}.md", "# 马夫\n\n归档内容。\n")
+    target = tmp_path / "data"
+
+    result = import_markdown_directory(source, target)
+
+    assert result.topic_ids == ("dm-mafu",)
+    registry_value = json.loads((target / "topic-registry.json").read_text(encoding="utf-8"))
+    assert registry_value["topics"][0]["aliases"] == ["马夫", "mafu"]
+    registry = TopicRegistry.from_dict(registry_value)
+    for name in ("马夫", "mafu", display_name, "dm-mafu"):
+        assert registry.resolve_name(name) == "dm-mafu"
+    assert FileTopicStore(target).get_topic("dm-mafu").metadata.aliases == ("马夫", "mafu")
+
+
+def test_import_omits_colliding_generated_aliases_deterministically(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    write_source(source, "one/📁 Shared (one) — Topic Memory.md", "one\n")
+    write_source(source, "two/📁 Shared (two) — Topic Memory.md", "two\n")
+
+    first_target = tmp_path / "first"
+    second_target = tmp_path / "second"
+    import_markdown_directory(source, first_target)
+    import_markdown_directory(source, second_target)
+    first_value = json.loads(
+        (first_target / "topic-registry.json").read_text(encoding="utf-8")
+    )
+    second_value = json.loads(
+        (second_target / "topic-registry.json").read_text(encoding="utf-8")
+    )
+
+    first_aliases = {
+        item["source_relative_path"]: item["aliases"] for item in first_value["topics"]
+    }
+    second_aliases = {
+        item["source_relative_path"]: item["aliases"] for item in second_value["topics"]
+    }
+    assert first_aliases == second_aliases == {
+        "one/📁 Shared (one) — Topic Memory.md": ["one"],
+        "two/📁 Shared (two) — Topic Memory.md": ["two"],
+    }
+    registry = TopicRegistry.from_dict(first_value)
+    assert registry.resolve_name("one") != registry.resolve_name("two")
+    with pytest.raises(TopicRoutingError, match="unknown topic"):
+        registry.resolve_name("Shared")
 
 def test_topic_ids_are_stable_url_safe_and_suffix_only_slug_collisions(tmp_path: Path) -> None:
     source = tmp_path / "source"

@@ -35,6 +35,23 @@ def registry() -> TopicRegistry:
         }
     )
 
+def test_full_display_name_is_an_exact_lookup_name() -> None:
+    topics = TopicRegistry.from_dict(
+        {
+            "topics": [
+                {
+                    "topic_id": "project-alpha",
+                    "display_name": "Alpha Project Archive",
+                    "aliases": [],
+                    "chat_ids": [],
+                }
+            ]
+        }
+    )
+
+    assert topics.resolve_name("Alpha Project Archive") == "project-alpha"
+    assert topics.route(explicit_topic="alpha project archive").topic_id == "project-alpha"
+
 
 def test_explicit_topic_or_alias_has_highest_priority() -> None:
     topics = registry()

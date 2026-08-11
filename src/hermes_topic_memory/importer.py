@@ -19,6 +19,9 @@ from .validation import validate_data_root
 
 _MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_ALIAS_DESCRIPTOR_SEPARATOR = re.compile(r"\s*(?:—|–|\||｜)\s*")
+_ALIAS_PARENTHESES = re.compile(r"[\(\[（【]([^\)\]）】]+)[\)\]）】]")
+_ALIAS_WHITESPACE = re.compile(r"\s+")
 _MAX_SLUG_LENGTH = 96
 
 
@@ -27,6 +30,7 @@ class SourceDocument:
     path: Path
     relative_path: str
     display_name: str
+    aliases: tuple[str, ...]
     body: str
     payload: bytes
     sha256: str
@@ -109,6 +113,7 @@ def import_markdown_directory(
                 document.topic_id,
                 document.body,
                 display_name=document.display_name,
+                aliases=document.aliases,
                 source_policy="imported-markdown-verbatim",
                 source_relative_path=document.relative_path,
                 source_sha256=document.sha256,
@@ -121,7 +126,7 @@ def import_markdown_directory(
                 {
                     "topic_id": document.topic_id,
                     "display_name": document.display_name,
-                    "aliases": [],
+                    "aliases": list(document.aliases),
                     "chat_ids": [],
                     "source_relative_path": document.relative_path,
                 }
@@ -227,11 +232,17 @@ def _read_documents(source: Path) -> tuple[tuple[SourceDocument, ...], int]:
         raise ValueError(f"source directory contains no Markdown files: {source}")
 
     topic_ids, collision_count = _assign_topic_ids(raw_documents)
+    display_names = tuple(
+        PurePosixPath(relative_path).stem
+        for _path, relative_path, _body, _payload, _base in raw_documents
+    )
+    aliases = _assign_aliases(display_names, topic_ids)
     documents = tuple(
         SourceDocument(
             path=path,
             relative_path=relative_path,
-            display_name=PurePosixPath(relative_path).stem,
+            display_name=display_name,
+            aliases=document_aliases,
             body=body,
             payload=payload,
             sha256=hashlib.sha256(payload).hexdigest(),
@@ -239,11 +250,75 @@ def _read_documents(source: Path) -> tuple[tuple[SourceDocument, ...], int]:
             lines=len(body.splitlines()),
             topic_id=topic_id,
         )
-        for (path, relative_path, body, payload, _base), topic_id in zip(
-            raw_documents, topic_ids, strict=True
-        )
+        for (
+            (path, relative_path, body, payload, _base),
+            display_name,
+            document_aliases,
+            topic_id,
+        ) in zip(raw_documents, display_names, aliases, topic_ids, strict=True)
     )
     return documents, collision_count
+
+
+def _assign_aliases(
+    display_names: tuple[str, ...], topic_ids: tuple[str, ...]
+) -> tuple[tuple[str, ...], ...]:
+    candidates = tuple(_human_alias_candidates(name) for name in display_names)
+    candidate_owners: dict[str, set[int]] = {}
+    protected_owners: dict[str, set[int]] = {}
+    for index, (display_name, topic_id, document_candidates) in enumerate(
+        zip(display_names, topic_ids, candidates, strict=True)
+    ):
+        for protected_name in (display_name, topic_id):
+            protected_owners.setdefault(_normalize_alias(protected_name), set()).add(index)
+        for alias in document_candidates:
+            candidate_owners.setdefault(_normalize_alias(alias), set()).add(index)
+
+    assigned: list[tuple[str, ...]] = []
+    for index, (display_name, topic_id, document_candidates) in enumerate(
+        zip(display_names, topic_ids, candidates, strict=True)
+    ):
+        own_names = {_normalize_alias(display_name), _normalize_alias(topic_id)}
+        aliases = tuple(
+            alias
+            for alias in document_candidates
+            if _normalize_alias(alias) not in own_names
+            and candidate_owners[_normalize_alias(alias)] == {index}
+            and not (protected_owners.get(_normalize_alias(alias), set()) - {index})
+        )
+        assigned.append(aliases)
+    return tuple(assigned)
+
+
+def _human_alias_candidates(display_name: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", display_name)
+    primary = _ALIAS_DESCRIPTOR_SEPARATOR.split(normalized, maxsplit=1)[0]
+    parenthetical = _ALIAS_PARENTHESES.findall(primary)
+    base = _ALIAS_PARENTHESES.sub(" ", primary)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for value in (base, *parenthetical):
+        alias = _clean_alias(value)
+        key = _normalize_alias(alias)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(alias)
+    return tuple(candidates)
+
+
+def _clean_alias(value: str) -> str:
+    collapsed = _ALIAS_WHITESPACE.sub(" ", value).strip()
+    start = 0
+    while start < len(collapsed) and not collapsed[start].isalnum():
+        start += 1
+    end = len(collapsed)
+    while end > start and not collapsed[end - 1].isalnum():
+        end -= 1
+    return collapsed[start:end]
+
+
+def _normalize_alias(value: str) -> str:
+    return value.strip().casefold()
 
 
 def _slug_base(relative_path: str) -> str:

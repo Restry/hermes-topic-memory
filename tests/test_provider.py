@@ -153,6 +153,20 @@ def test_real_contract_registration_and_metadata() -> None:
     assert (plugin_dir / "plugin.yaml").is_file()
     assert (plugin_dir / "README.md").is_file()
 
+def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
+    provider = HermesTopicMemoryProvider(reader=TopicReader())
+    schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
+    prompt = provider.system_prompt_block().casefold()
+    recall_description = schemas["topic_memory_recall"]["description"].casefold()
+    topics_description = schemas["topic_memory_topics"]["description"].casefold()
+
+    assert "named project or topic archive" in prompt
+    assert "must use topic_memory_recall" in prompt
+    assert "topic_memory_topics is for discovery only" in prompt
+    assert "named project or topic archive" in recall_description
+    assert "discovery only" in topics_description
+    assert "not for archive recall" in topics_description
+
 
 def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: Path) -> None:
     provider, hermes_home, data_root = configured_provider(tmp_path)
@@ -272,6 +286,126 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
 
     unknown = json.loads(provider.handle_tool_call("unknown", {}))
     assert unknown == {"error": "unknown_tool"}
+    provider.shutdown()
+
+def test_recall_query_topic_overrides_session_but_explicit_topic_wins(tmp_path: Path) -> None:
+    provider, hermes_home, _data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    session_recall = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": "current status"}, session_id="session-a"
+        )
+    )
+    query_switch = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is archived for Beta?"},
+            session_id="session-a",
+        )
+    )
+    explicit = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is archived for Beta?", "topic": "a"},
+            session_id="session-a",
+        )
+    )
+
+    assert session_recall["topic_id"] == "alpha"
+    assert query_switch["topic_id"] == "beta"
+    assert query_switch["answer"] == "answer from beta"
+    assert explicit["topic_id"] == "alpha"
+    provider.shutdown()
+
+def test_recall_query_ambiguous_or_unknown_topic_never_uses_session_fallback(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    ambiguous = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "Compare the Alpha and Beta project archives."},
+            session_id="session-a",
+        )
+    )
+    unknown = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is archived for the Missing Project?"},
+            session_id="session-a",
+        )
+    )
+
+    assert ambiguous == {"error": "invalid_request"}
+    assert unknown == {"error": "invalid_request"}
+    assert reader.requests == []
+    provider.shutdown()
+
+def test_imported_aliases_switch_topics_within_one_provider_session(tmp_path: Path) -> None:
+    hermes_home = tmp_path / "profile"
+    data_root = hermes_home / "topic-memory" / "data"
+    source = tmp_path / "source"
+    alpha_source = source / "alpha" / "🧭 北斗 (beidou) — 话题记忆.md"
+    beta_source = source / "dm" / "🐎 马夫 (mafu) — 话题记忆.md"
+    alpha_source.parent.mkdir(parents=True)
+    beta_source.parent.mkdir(parents=True)
+    alpha_source.write_text("# 北斗\n\nAlpha-only archive.\n", encoding="utf-8")
+    beta_source.write_text("# 马夫\n\nBeta-only archive.\n", encoding="utf-8")
+    imported = import_markdown_directory(source, data_root)
+    assert set(imported.topic_ids) == {"alpha-beidou", "dm-mafu"}
+
+    registry_path = data_root / "topic-registry.json"
+    registry_value = json.loads(registry_path.read_text(encoding="utf-8"))
+    for item in registry_value["topics"]:
+        item["chat_ids"] = ["chat-alpha"] if item["topic_id"] == "alpha-beidou" else []
+    registry_path.write_text(
+        json.dumps(registry_value, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    reader = TopicReader()
+    provider = HermesTopicMemoryProvider(reader=reader)
+    provider.save_config(
+        {
+            "data_root": "topic-memory/data",
+            "reader_endpoint": "https://reader.invalid/v1",
+            "reader_model": "fake-reader",
+        },
+        str(hermes_home),
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    first = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall", {"query": "current status"}, session_id="session-a"
+        )
+    )
+    switched = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "你帮我查一下马夫这个项目6月28号下午4:30做了什么"},
+            session_id="session-a",
+        )
+    )
+    switched_back = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is in the beidou project archive?"},
+            session_id="session-a",
+        )
+    )
+
+    assert [first["topic_id"], switched["topic_id"], switched_back["topic_id"]] == [
+        "alpha-beidou",
+        "dm-mafu",
+        "alpha-beidou",
+    ]
+    assert first["answer"] == "answer from alpha-beidou"
+    assert switched["answer"] == "answer from dm-mafu"
+    assert switched_back["answer"] == "answer from alpha-beidou"
     provider.shutdown()
 
 

@@ -40,12 +40,21 @@ _CONFIG_KEYS = {
 
 RECALL_SCHEMA = {
     "name": "topic_memory_recall",
-    "description": "Recall from exactly one topic selected by explicit topic or session context.",
+    "description": (
+        "Answer from exactly one named project or topic archive. Use this for archive recall; "
+        "topic may be omitted when the query uniquely names a configured topic."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Question to answer from canonical memory."},
-            "topic": {"type": "string", "description": "Optional topic ID or alias."},
+            "query": {
+                "type": "string",
+                "description": "Archive question; an exact topic name in it can select the topic.",
+            },
+            "topic": {
+                "type": "string",
+                "description": "Optional exact topic ID, alias, or full display name.",
+            },
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -75,7 +84,10 @@ UPDATE_SCHEMA = {
 
 TOPICS_SCHEMA = {
     "name": "topic_memory_topics",
-    "description": "List configured topics and their canonical versions without reading topic bodies.",
+    "description": (
+        "Discovery only: list configured topic names and versions; not for archive recall and "
+        "never reads topic bodies."
+    ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
@@ -222,9 +234,11 @@ class HermesTopicMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return (
             "# Topic Memory\n"
-            "Recall is isolated to one configured topic. Use topic_memory_recall for explicit "
-            "deep recall, topic_memory_update only with verified evidence IDs, and "
-            "topic_memory_topics to inspect available topic names. Never infer cross-topic context."
+            "Questions about a named project or topic archive must use topic_memory_recall; "
+            "an exact unique name in the current query overrides session routing. "
+            "topic_memory_topics is for discovery only when available names are unknown, not "
+            "for answering archive questions. Use topic_memory_update only with verified "
+            "evidence IDs. Recall is isolated to one topic; never infer cross-topic context."
         )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -381,16 +395,22 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 return _json_result(self._topics_result())
             session_id = str(kwargs.get("session_id") or self._current_session_id)
             explicit = args.get("topic")
+            query: str | None = None
+            if tool_name == "topic_memory_recall":
+                raw_query = args.get("query")
+                if not isinstance(raw_query, str) or not raw_query.strip():
+                    return _json_result({"error": "query_required"})
+                query = raw_query
             decision = self._route(
                 session_id=session_id,
                 explicit_topic=explicit if isinstance(explicit, str) else None,
+                query=query,
                 chat_id=_optional_text(kwargs.get("chat_id")),
             )
-            if tool_name == "topic_memory_recall":
-                query = args.get("query")
-                if not isinstance(query, str) or not query.strip():
-                    return _json_result({"error": "query_required"})
-                return _json_result(_recall_result(self._require_engine().recall(decision.topic_id, query)))
+            if query is not None:
+                return _json_result(
+                    _recall_result(self._require_engine().recall(decision.topic_id, query))
+                )
             body = args.get("body")
             evidence_ids = args.get("evidence_ids")
             reason = args.get("reason")
@@ -444,10 +464,16 @@ class HermesTopicMemoryProvider(MemoryProvider):
         *,
         session_id: str,
         explicit_topic: str | None = None,
+        query: str | None = None,
         chat_id: str | None = None,
     ) -> RouteDecision:
         context = self._contexts.get(session_id, _SessionContext(None, None))
-        return self._require_registry().route(
+        registry = self._require_registry()
+        if explicit_topic is None and query is not None:
+            mentioned_topic = registry.mentioned_topic(query)
+            if mentioned_topic is not None:
+                return RouteDecision(mentioned_topic, "query")
+        return registry.route(
             explicit_topic=explicit_topic,
             chat_id=chat_id or context.chat_id,
             default_topic=context.default_topic,
