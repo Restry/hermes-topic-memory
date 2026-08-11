@@ -1,0 +1,11 @@
+{
+  "automatic_updates": true,
+  "batch_size": 8,
+  "data_root": "topic-memory/data",
+  "default_topic": "global",
+  "jaccard_threshold": 0.8,
+  "reader_endpoint": "https://reader.example.invalid/v1",
+  "reader_model": "reader-model",
+  "registry_path": "topic-memory/data/topic-registry.json",
+  "request_timeout": 60
+}

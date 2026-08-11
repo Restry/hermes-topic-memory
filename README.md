@@ -1,9 +1,117 @@
 # Hermes Topic Memory
 
-Standalone, versioned plain-text topic memory with a provider-internal long-context Reader and Hermes Memory Provider integration.
+Standalone, versioned plain-text topic memory with strict topic isolation, a provider-internal OpenAI-compatible Reader, evidence-backed canonical updates, and an installable Hermes `MemoryProvider` plugin.
+
+## Safety boundary
+
+Repository commands never install, activate, configure, or restart local Hermes. The installer only copies an explicitly selected plugin source directory to an explicitly selected target directory. Live Provider installation, activation, Gateway restart, and E2E belong only on the Azure China test VM `mindmemos-brain2` in `RG-MINDMEMOS-LAB2` after backing up that VM's Hermes profile.
+
+## Install the Python package
+
+```bash
+python -m venv /tmp/hermes-topic-memory-venv
+/tmp/hermes-topic-memory-venv/bin/python -m pip install .
+```
+
+This installs the data CLI and pure filesystem installer. It does not touch a Hermes profile.
+
+## Data layout and CLI
+
+Every command requires an explicit data root:
+
+```text
+data/
+  topic-registry.json
+  topics/<topic_id>/memory.md
+  topics/<topic_id>/metadata.json
+  topics/<topic_id>/evidence.jsonl
+  topics/<topic_id>/versions/<version>-memory.md
+  qa-cache/<topic_id>.jsonl
+  update-proposals/<topic_id>.jsonl
+```
+
+Create and inspect a topic:
+
+```bash
+hermes-topic-memory --data-root /path/to/data init global \
+  --display-name Global --body-file /path/to/global.md --default
+hermes-topic-memory --data-root /path/to/data topics
+hermes-topic-memory --data-root /path/to/data validate
+```
+
+Reader-backed recall uses environment configuration; the API key is optional and is never written to the data root:
+
+```bash
+export HERMES_TOPIC_MEMORY_READER_ENDPOINT=https://reader.example.invalid/v1
+export HERMES_TOPIC_MEMORY_READER_MODEL=reader-model
+export HERMES_TOPIC_MEMORY_API_KEY='set-outside-git'
+hermes-topic-memory --data-root /path/to/data recall 'What is current?' --topic global
+```
+
+Canonical replacements require completed-turn evidence IDs:
+
+```bash
+hermes-topic-memory --data-root /path/to/data update global \
+  --body-file /path/to/replacement.md \
+  --evidence-id EVIDENCE_ID \
+  --reason 'Verified completed turn supersedes the old fact.'
+hermes-topic-memory --data-root /path/to/data rollback global 1
+```
+
+## Provider configuration
+
+The Provider reads `$HERMES_HOME/topic-memory/config.json`. Copy `config.example.json` there only on the intended isolated target profile, then adjust non-secret paths and Reader settings. Relative paths resolve under the supplied runtime `hermes_home`; absolute paths are treated as explicit external data roots. Credentials belong only in `HERMES_TOPIC_MEMORY_API_KEY`.
+
+`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is explicit tool topic/alias, configured chat ID, configured default, registry default, then `global`. It never searches another topic implicitly.
+
+The Provider exposes:
+
+- `topic_memory_recall` — synchronous explicit recall from one resolved topic;
+- `topic_memory_update` — full canonical replacement requiring verified evidence IDs;
+- `topic_memory_topics` — topic metadata and current versions, never bodies or config.
+
+`queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater.
+
+## Copy-only installer
+
+From a repository checkout, preview the exact source and target:
+
+```bash
+hermes-topic-memory-install \
+  --source ./plugin/hermes_topic_memory \
+  --target "$TARGET_HERMES_HOME/plugins/memory/hermes_topic_memory" \
+  --dry-run
+```
+
+Install after reviewing the dry-run:
+
+```bash
+hermes-topic-memory-install \
+  --source ./plugin/hermes_topic_memory \
+  --target "$TARGET_HERMES_HOME/plugins/memory/hermes_topic_memory"
+```
+
+The installer hashes the source and staged/runtime copies, backs up an existing target beside it, rejects symlinks and overlapping source/target trees, and leaves `config.yaml`, `.env`, Provider activation, and Gateway state unchanged.
+
+On the Azure test VM only, the later operator must separately:
+
+1. back up the target Hermes profile and current Provider state;
+2. install this Python package into the target Hermes Python environment;
+3. run installer dry-run, then copy the plugin;
+4. save non-secret Provider config in the isolated target `HERMES_HOME` and secrets in its process environment;
+5. explicitly set `memory.provider: hermes_topic_memory`;
+6. restart the test Gateway and run lifecycle/isolation/persistence E2E;
+7. restore the prior Provider/config unless retention is explicitly approved.
+
+## Local verification
+
+Allowed local checks are repository-only:
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/python -m build
+```
 
 Design: `docs/superpowers/specs/2026-08-11-hermes-topic-memory-design.md`
 
 Implementation plan: `docs/plans/2026-08-11-implementation.md`
-
-Implementation is in progress.
