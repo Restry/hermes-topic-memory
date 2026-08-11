@@ -4,6 +4,7 @@ import pytest
 
 from hermes_topic_memory.router import (
     AmbiguousRegistryError,
+    MultiTopicRequiredError,
     TopicRegistry,
     TopicRoutingError,
 )
@@ -110,3 +111,85 @@ def test_missing_global_and_other_context_fails_closed() -> None:
 
     with pytest.raises(TopicRoutingError, match="no topic context"):
         topics.route(chat_id="unregistered")
+
+
+def mention_registry() -> TopicRegistry:
+    return TopicRegistry.from_dict(
+        {
+            "topics": [
+                {
+                    "topic_id": "dm-mafu",
+                    "display_name": "Mafu Project",
+                    "aliases": ["Mafu", "马夫"],
+                    "chat_ids": [],
+                },
+                {
+                    "topic_id": "ai",
+                    "display_name": "AI Tools",
+                    "aliases": ["AI"],
+                    "chat_ids": [],
+                },
+                {
+                    "topic_id": "tools",
+                    "display_name": "Tools Archive",
+                    "aliases": ["Tools"],
+                    "chat_ids": [],
+                },
+            ]
+        }
+    )
+
+
+def test_several_valid_mentions_are_ordered_and_require_multi_topic() -> None:
+    topics = mention_registry()
+
+    assert topics.mentioned_topics("compare Mafu and AI") == ("dm-mafu", "ai")
+    assert topics.mentioned_topics("AI then Mafu") == ("ai", "dm-mafu")
+    with pytest.raises(MultiTopicRequiredError) as captured:
+        topics.mentioned_topic("compare Mafu and AI")
+
+    assert captured.value.topic_ids == ("dm-mafu", "ai")
+
+
+def test_mentions_use_longest_name_and_collapse_duplicate_aliases() -> None:
+    topics = mention_registry()
+
+    assert topics.mentioned_topics("AI Tools and Mafu") == ("ai", "dm-mafu")
+    assert topics.mentioned_topics("Mafu, dm-mafu, 马夫, then AI") == (
+        "dm-mafu",
+        "ai",
+    )
+
+
+def test_mentioned_topics_omit_unknown_text_without_implicit_all_topic() -> None:
+    topics = mention_registry()
+
+    assert topics.mentioned_topics("Mafu and an unknown archive") == ("dm-mafu",)
+    assert topics.mentioned_topics("an unknown archive") == ()
+    assert topics.mentioned_topics("status") == ()
+
+
+def test_one_conflicting_name_remains_registry_ambiguity_not_multi_topic() -> None:
+    topics = TopicRegistry.from_dict(
+        {
+            "topics": [
+                {
+                    "topic_id": "alpha",
+                    "display_name": "Shared",
+                    "aliases": [],
+                    "chat_ids": [],
+                },
+                {
+                    "topic_id": "beta",
+                    "display_name": "Shared",
+                    "aliases": [],
+                    "chat_ids": [],
+                },
+            ]
+        }
+    )
+
+    with pytest.raises(AmbiguousRegistryError, match="ambiguous"):
+        topics.mentioned_topics("what does Shared say?")
+    with pytest.raises(AmbiguousRegistryError, match="ambiguous"):
+        topics.mentioned_topic("what does Shared say?")

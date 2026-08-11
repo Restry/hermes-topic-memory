@@ -7,6 +7,16 @@ from .reader import Reader, ReaderRequest, ReaderUsage, build_stable_prefix
 from .store import FileTopicStore
 from .temporal import build_temporal_evidence_capsule
 
+_NO_FACT_ANSWERS = frozenset(
+    {
+        "no stored fact answers the question",
+        "no stored fact answers this question",
+        "the memory does not contain the answer",
+        "没有已存储事实能回答这个问题",
+        "没有已存储的事实能回答这个问题",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RecallFailure:
@@ -21,7 +31,10 @@ class RecallResult:
     topic_version: int
     answer: str | None
     source: str
+    status: str = "answered"
     similarity: float | None = None
+    match_kind: str | None = None
+    latency_ms: int = 0
     usages: tuple[ReaderUsage, ...] = ()
     failure: RecallFailure | None = None
 
@@ -59,6 +72,7 @@ class RecallEngine:
                 answer=cached.answer,
                 source="cache",
                 similarity=cached.similarity,
+                match_kind=cached.match_kind,
             )
 
         prefix = build_stable_prefix(memory)
@@ -98,8 +112,19 @@ class RecallEngine:
                 topic_version=topic_version,
                 answer=None,
                 source="failure",
+                status="error",
                 usages=tuple(usages),
                 failure=RecallFailure(failure_code, message, attempts),
+            )
+
+        if _is_no_fact_answer(answer):
+            return RecallResult(
+                topic_id=topic_id,
+                topic_version=topic_version,
+                answer=None,
+                source="reader",
+                status="no_fact",
+                usages=tuple(usages),
             )
 
         self.cache.put(
@@ -125,3 +150,8 @@ def _invalid_answer_code(answer: str) -> str | None:
     if len(answer) > 200:
         return "answer_too_long"
     return None
+
+
+def _is_no_fact_answer(answer: str) -> bool:
+    normalized = " ".join(answer.casefold().strip().rstrip(".!?。！？").split())
+    return normalized in _NO_FACT_ANSWERS

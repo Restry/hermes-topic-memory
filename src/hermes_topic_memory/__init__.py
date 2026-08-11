@@ -1,5 +1,13 @@
 """Standalone topic memory core."""
 
+from .multi_recall import (
+    CapsuleSynthesizer,
+    MultiRecallEngine,
+    MultiRecallResult,
+    ReaderCapsuleSynthesizer,
+    TopicSelection,
+)
+
 from .query_history import (
     QueryHistoryCorruptionError,
     QueryHistoryStore,
@@ -8,6 +16,11 @@ from .query_history import (
 )
 
 __all__ = [
+    "CapsuleSynthesizer",
+    "MultiRecallEngine",
+    "MultiRecallResult",
+    "ReaderCapsuleSynthesizer",
+    "TopicSelection",
     "QueryHistoryCorruptionError",
     "QueryHistoryStore",
     "QueryRecord",

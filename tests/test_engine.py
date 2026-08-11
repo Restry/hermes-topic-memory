@@ -185,3 +185,17 @@ def test_temporal_recall_bypasses_fuzzy_cache_entry_for_rewritten_date(
     assert result.source == "reader"
     assert len(reader.requests) == 1
     assert cache.records("alpha")[-1].question == raw
+
+
+def test_reader_no_fact_marker_returns_status_without_caching(tmp_path: Path) -> None:
+    reader = SequenceReader(["No stored fact answers the question."])
+    engine, _store = make_engine(tmp_path, reader)
+
+    result = engine.recall("alpha", "unknown fact")
+
+    assert result.status == "no_fact"
+    assert result.answer is None
+    assert result.source == "reader"
+    assert result.failure is None
+    assert engine.cache.lookup("unknown fact", topic_id="alpha", topic_version=1) is None
+    assert len(reader.requests) == 1

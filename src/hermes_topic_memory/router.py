@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,15 @@ class AmbiguousRegistryError(TopicRoutingError):
     """Raised when registry keys map to multiple topics."""
 
 
+class MultiTopicRequiredError(TopicRoutingError):
+    """Raised when one query names several independently valid topics."""
+
+    def __init__(self, topic_ids: tuple[str, ...]) -> None:
+        if len(topic_ids) < 2:
+            raise ValueError("multi-topic routing requires at least two topic ids")
+        self.topic_ids = topic_ids
+        super().__init__(f"query requires multiple topics: {', '.join(topic_ids)}")
+
 @dataclass(frozen=True, slots=True)
 class TopicConfig:
     topic_id: str
@@ -38,6 +48,13 @@ class RouteDecision:
     topic_id: str
     source: str
 
+
+@dataclass(frozen=True, slots=True)
+class _NameMatch:
+    start: int
+    end: int
+    name: str
+    topic_ids: tuple[str, ...]
 
 class TopicRegistry:
     def __init__(
@@ -152,28 +169,57 @@ class TopicRegistry:
             raise TopicRoutingError(f"unknown {context}: {name!r}")
         return topic_id
 
-    def mentioned_topic(self, query: str) -> str | None:
+    def mentioned_topics(self, query: str) -> tuple[str, ...]:
         normalized_query = _normalize_name(query)
-        ambiguous_names = tuple(
-            name
-            for name in self._ambiguous_names
-            if _query_contains_name(normalized_query, name)
-        )
-        if ambiguous_names:
-            raise AmbiguousRegistryError(
-                f"query mentions ambiguous topic names: {', '.join(sorted(ambiguous_names))}"
-            )
-        matched_topics = {
-            topic_id
+        candidates = [
+            _NameMatch(start, end, name, (topic_id,))
             for name, topic_id in self._names.items()
-            if _query_contains_name(normalized_query, name)
-        }
-        if len(matched_topics) > 1:
-            raise AmbiguousRegistryError(
-                f"query mentions multiple topics: {', '.join(sorted(matched_topics))}"
+            for start, end in _query_name_spans(normalized_query, name)
+        ]
+        candidates.extend(
+            _NameMatch(start, end, name, topic_ids)
+            for name, topic_ids in self._ambiguous_names.items()
+            for start, end in _query_name_spans(normalized_query, name)
+        )
+        candidates.sort(
+            key=lambda match: (
+                match.start,
+                -(match.end - match.start),
+                match.name,
             )
+        )
+
+        selected: list[_NameMatch] = []
+        occupied_until = -1
+        for candidate in candidates:
+            if candidate.start < occupied_until:
+                continue
+            selected.append(candidate)
+            occupied_until = candidate.end
+
+        ambiguous = tuple(match.name for match in selected if len(match.topic_ids) > 1)
+        if ambiguous:
+            raise AmbiguousRegistryError(
+                f"query mentions ambiguous topic names: {', '.join(ambiguous)}"
+            )
+
+        topic_ids: list[str] = []
+        seen: set[str] = set()
+        for match in selected:
+            topic_id = match.topic_ids[0]
+            if topic_id in seen:
+                continue
+            seen.add(topic_id)
+            topic_ids.append(topic_id)
+        return tuple(topic_ids)
+
+    def mentioned_topic(self, query: str) -> str | None:
+        matched_topics = self.mentioned_topics(query)
+        if len(matched_topics) > 1:
+            raise MultiTopicRequiredError(matched_topics)
         if matched_topics:
-            return next(iter(matched_topics))
+            return matched_topics[0]
+        normalized_query = _normalize_name(query)
         if any(marker in normalized_query for marker in _TOPIC_REFERENCE_MARKERS):
             raise TopicRoutingError("query mentions an unknown topic")
         return None
@@ -217,12 +263,12 @@ def _normalize_name(value: str) -> str:
     return value.strip().casefold()
 
 
-def _query_contains_name(query: str, name: str) -> bool:
+def _query_name_spans(query: str, name: str) -> Iterator[tuple[int, int]]:
     start = 0
     while True:
         index = query.find(name, start)
         if index < 0:
-            return False
+            return
         end = index + len(name)
         left_bound = index == 0 or not (
             name[0].isascii()
@@ -237,7 +283,7 @@ def _query_contains_name(query: str, name: str) -> bool:
             and query[end].isalnum()
         )
         if left_bound and right_bound:
-            return True
+            yield index, end
         start = index + 1
 
 
