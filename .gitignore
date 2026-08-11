@@ -9,5 +9,6 @@ build/
 .env
 config.json
 runtime-data/
+*.lock
 .coverage
 .DS_Store
