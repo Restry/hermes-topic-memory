@@ -327,7 +327,7 @@ def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: 
     assert (Path.home() / ".hermes" / "topic-memory" / "data").resolve() != data_root.resolve()
     provider.shutdown()
 
-def test_fresh_session_prefetch_routes_named_topic_without_any_fallback(
+def test_current_turn_prefetch_synchronously_recalls_named_topic_without_queue(
     tmp_path: Path,
 ) -> None:
     reader = TopicReader()
@@ -338,10 +338,136 @@ def test_fresh_session_prefetch_routes_named_topic_without_any_fallback(
     query = "你跟我讲讲马夫是用来做什么的？"
 
     assert provider._session_topics == {}
-    provider.queue_prefetch(query, session_id="fresh-session")
+    provider.on_turn_start(1, query, session_id="fresh-session")
+    prefetched = provider.prefetch(query, session_id="fresh-session")
 
-    prefetched = wait_for_prefetch(provider, query, "fresh-session")
-    assert "answer from dm-mafu" in prefetched
+    assert prefetched == "[Topic Memory: dm-mafu v1]\nanswer from dm-mafu"
+    assert [request.question for request in reader.requests] == [query]
+    provider.shutdown()
+
+
+def test_current_turn_prefetch_uses_existing_topic_cache_without_reader(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    query = "你跟我讲讲马夫是用来做什么的？"
+    QuestionCache(data_root).put(
+        question=query,
+        answer="cached mafu answer",
+        topic_id="dm-mafu",
+        topic_version=1,
+        model="fake-reader",
+        prompt_version="v1",
+    )
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+
+    provider.on_turn_start(1, query, session_id="fresh-session")
+    prefetched = provider.prefetch(query, session_id="fresh-session")
+
+    assert prefetched == "[Topic Memory: dm-mafu v1]\ncached mafu answer"
+    assert reader.requests == []
+    provider.shutdown()
+
+
+def test_current_turn_prefetch_rejects_unmentioned_unknown_and_ambiguous_topics(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+    queries = (
+        "今天天气怎么样？",
+        "What is archived for the Missing Project?",
+        "Compare the Alpha and Beta project archives.",
+    )
+
+    for turn_number, query in enumerate(queries, start=1):
+        provider.on_turn_start(turn_number, query, session_id="session-a")
+        assert provider.prefetch(query, session_id="session-a") == ""
+
+    assert reader.requests == []
+    provider.shutdown()
+
+
+def test_successful_current_turn_prefetch_binds_follow_up_without_cross_session_leak(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+    alpha_query = "What is archived for Alpha?"
+    beta_query = "What is archived for Beta?"
+    follow_up = "继续说说它的职责。"
+
+    provider.on_turn_start(1, alpha_query, session_id="session-a")
+    assert "answer from alpha" in provider.prefetch(
+        alpha_query, session_id="session-a"
+    )
+    provider.on_turn_start(2, beta_query, session_id="session-a")
+    assert "answer from beta" in provider.prefetch(beta_query, session_id="session-a")
+    provider.on_turn_start(3, follow_up, session_id="session-a")
+    assert "answer from beta" in provider.prefetch(follow_up, session_id="session-a")
+
+    assert provider._session_topics == {"session-a": "beta"}
+    assert [request.question for request in reader.requests] == [
+        alpha_query,
+        beta_query,
+        follow_up,
+    ]
+
+    provider.on_turn_start(1, follow_up, session_id="session-b")
+    assert provider.prefetch(follow_up, session_id="session-b") == ""
+    assert len(reader.requests) == 3
+    provider.shutdown()
+
+
+def test_current_turn_prefetch_failure_is_logged_and_fails_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    provider, hermes_home, _data_root = configured_mafu_provider(tmp_path)
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+    query = "你跟我讲讲马夫是用来做什么的？"
+
+    def fail_recall(topic_id: str, question: str) -> None:
+        raise RuntimeError(f"reader unavailable for {topic_id}: {question}")
+
+    monkeypatch.setattr(provider._engine, "recall", fail_recall)
+    provider.on_turn_start(1, query, session_id="fresh-session")
+    with caplog.at_level(logging.DEBUG, logger="plugin.hermes_topic_memory"):
+        assert provider.prefetch(query, session_id="fresh-session") == ""
+
+    assert "Topic-memory current-turn prefetch failed" in caplog.text
+    provider.shutdown()
+
+
+def test_ready_background_prefetch_is_consumed_without_duplicate_sync_recall(
+    tmp_path: Path,
+) -> None:
+    reader = BlockingReader()
+    provider, hermes_home, _data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+    query = "你跟我讲讲马夫是用来做什么的？"
+    key = ("fresh-session", query)
+
+    provider.queue_prefetch(query, session_id="fresh-session")
+    assert reader.started.wait(timeout=1)
+    reader.release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with provider._lock:
+            if key in provider._prefetch_results:
+                break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("background prefetch did not become ready")
+
+    prefetched = provider.prefetch(query, session_id="fresh-session")
+    assert prefetched == "[Topic Memory: dm-mafu v1]\nanswer from dm-mafu"
     assert [request.question for request in reader.requests] == [query]
     provider.shutdown()
 

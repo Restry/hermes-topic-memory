@@ -369,9 +369,43 @@ class HermesTopicMemoryProvider(MemoryProvider):
                     self._prefetch_results[key] = block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        if not query.strip() or not self._initialized:
+            return ""
         sid = session_id or self._current_session_id
+        key = (sid, query)
         with self._lock:
-            return self._prefetch_results.pop((sid, query), "")
+            ready = self._prefetch_results.pop(key, "")
+            in_flight = key in self._prefetch_tickets
+        if ready:
+            try:
+                mentioned_topic = self._require_registry().mentioned_topic(query)
+            except (TopicRoutingError, ValueError):
+                mentioned_topic = None
+            if mentioned_topic is not None:
+                self._remember_session_topic(sid, mentioned_topic)
+            return ready
+        if in_flight:
+            return ""
+
+        try:
+            registry = self._require_registry()
+            topic_id = registry.mentioned_topic(query)
+            named_topic = topic_id is not None
+            if topic_id is None:
+                with self._lock:
+                    session_topic = self._session_topics.get(sid)
+                if session_topic is None:
+                    return ""
+                topic_id = registry.resolve_name(session_topic, context="session topic")
+            result = self._require_engine().recall(topic_id, query)
+            block = _format_prefetch(result)
+        except Exception:
+            logger.debug("Topic-memory current-turn prefetch failed")
+            return ""
+        if block and named_topic:
+            self._remember_routed_archive_query(sid, topic_id, query)
+            self._remember_session_topic(sid, topic_id)
+        return block
 
     def sync_turn(
         self,
