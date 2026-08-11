@@ -69,7 +69,7 @@
 2. Test initialize, static prompt, prefetched capsule, background queue, turn sync, session end, pre-compress, session switch, tool schemas, and profile-safe paths.
 3. Verify RED.
 4. Implement plugin without changing Hermes core.
-5. Install into a temporary `HERMES_HOME`, import it, and verify source/runtime hashes.
+5. Unit-test installer path selection and source/runtime hashing without installing into local Hermes. Real installation is deferred to cloud acceptance.
 6. Verify GREEN and full suite.
 7. Commit `feat: add Hermes topic memory provider`.
 
@@ -97,7 +97,9 @@
 
 1. Resolve the real project Python executable and run the full suite.
 2. Run package build and install into a fresh venv.
-3. Run provider lifecycle E2E with temporary `HERMES_HOME` and mock Reader.
-4. After deterministic gates pass, run at most four real Reader calls across the four topics; record cached tokens when exposed and check answer/isolation constraints.
-5. Inspect Git diff/status for secrets, private data, runtime artifacts, and out-of-scope changes.
-6. Commit any bounded fixes, tag `v0.1.0`, and leave the working tree clean.
+3. Package the repository and transfer it to Azure China VM `mindmemos-brain2` (`RG-MINDMEMOS-LAB2`). Back up its Hermes config/provider state before changes.
+4. On that VM only: install into an isolated cloud test profile, run Provider lifecycle E2E with mock Reader, activate the Provider, restart the test Gateway, and verify logs/health.
+5. After deterministic gates pass, run at most four real Reader calls across the four topics; record cached tokens when exposed and check answer/isolation constraints.
+6. Prove topic isolation, version-bound cache invalidation, completed-turn evidence persistence, and restart persistence on the cloud VM. Restore the previous cloud Provider/config after acceptance unless the user explicitly asks to keep it active.
+7. Inspect Git diff/status for secrets, private data, runtime artifacts, and out-of-scope changes.
+8. Commit any bounded fixes, tag `v0.1.0`, and leave the working tree clean.

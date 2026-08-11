@@ -23,7 +23,7 @@ Completed turns are persisted first as raw evidence. At session end or a bounded
 
 New repository: `/Users/leway/Projects/hermes-topic-memory`
 
-The existing `topic-memory-lab`, Mem0, and MindMemOS projects are read-only references and are not modified. The active Hermes provider is not switched during development; installation and E2E use an isolated `HERMES_HOME`.
+The existing `topic-memory-lab`, Mem0, and MindMemOS projects are read-only references and are not modified. The local active Hermes provider is never installed, switched, restarted, or used for live E2E. Local work is limited to repository unit/static tests. Provider installation, activation, Gateway restart, and live E2E run only on the Azure China MindMemOS test VM `mindmemos-brain2` in resource group `RG-MINDMEMOS-LAB2`.
 
 ## Data model
 
@@ -103,8 +103,8 @@ Four sanitized topics: `gsk-d360`, `mindmemos`, `growlog`, and `global`. Each co
 ## Acceptance
 
 - deterministic tests for routing, isolation, cache matching, per-topic invalidation, atomic updates, rollback, and answer limits;
-- Provider lifecycle test against real Hermes imports and an isolated temporary `HERMES_HOME`;
-- plugin install/readback test without touching the active profile;
+- local contract/unit tests may import the Hermes ABC but must not install or activate the provider in local Hermes;
+- plugin install/readback, Provider lifecycle, activation, Gateway restart, and live E2E run on the Azure China test VM only;
 - mock Reader end-to-end tests plus at most four real Reader calls after deterministic gates pass;
 - no secret, private memory, runtime cache, or generated data committed;
 - repository clean and committed with README and project-local `.hermes` context.
