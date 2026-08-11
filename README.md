@@ -57,7 +57,7 @@ hermes-topic-memory --data-root /path/to/imported-data dashboard \
   --output /path/to/topic-memory-dashboard.html
 ```
 
-The HTML has inline CSS and JavaScript, remains readable without JavaScript, and includes aggregate sizes, version/cache counts, a size distribution, search, sorting, and native expandable metadata. It never embeds a complete topic body; only longer documents may contribute a short escaped preview. Keep dashboards generated from private corpora outside Git.
+The HTML has inline CSS and JavaScript, remains readable without JavaScript, and includes aggregate sizes, version/cache counts, a size distribution, search, sorting, and native expandable metadata. It never embeds topic body content or previews. Keep dashboards generated from private corpora outside Git.
 
 Reader-backed recall uses environment configuration; the API key is optional and is never written to the data root:
 

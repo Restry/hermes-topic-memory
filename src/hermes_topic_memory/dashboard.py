@@ -13,7 +13,6 @@ from .router import TopicRegistry
 from .store import FileTopicStore
 from .validation import validate_data_root
 
-_PREVIEW_CHARS = 160
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +29,6 @@ class DashboardTopic:
     updated_at: str
     imported_at: str | None
     source_sha256: str | None
-    preview: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +82,7 @@ def generate_dashboard(data_root: str | Path, output: str | Path) -> DashboardRe
                 display_name=config.display_name,
                 source_relative_path=config.source_relative_path
                 or memory.metadata.source_relative_path
-                or "Not recorded",
+                or "未记录",
                 chars=len(memory.body),
                 bytes=len(body_bytes),
                 lines=len(memory.body.splitlines()),
@@ -94,9 +92,6 @@ def generate_dashboard(data_root: str | Path, output: str | Path) -> DashboardRe
                 updated_at=memory.metadata.updated_at,
                 imported_at=memory.metadata.imported_at,
                 source_sha256=memory.metadata.source_sha256,
-                preview=memory.body[:_PREVIEW_CHARS]
-                if len(memory.body) > _PREVIEW_CHARS
-                else None,
             )
         )
     if not topics:
@@ -140,14 +135,14 @@ def _render_html(
 ) -> str:
     lengths = [topic.chars for topic in topics]
     metrics = (
-        ("Topics", len(topics)),
-        ("Total characters", total_chars),
-        ("Total bytes", total_bytes),
-        ("Median characters", median(lengths)),
-        ("Minimum characters", min(lengths)),
-        ("Maximum characters", max(lengths)),
-        ("Versions across library", version_count),
-        ("Cache entries", cache_entry_count),
+        ("主题数", len(topics)),
+        ("总字符数", total_chars),
+        ("总字节数", total_bytes),
+        ("字符数中位数", median(lengths)),
+        ("最少字符数", min(lengths)),
+        ("最多字符数", max(lengths)),
+        ("全库版本数", version_count),
+        ("缓存条目数", cache_entry_count),
     )
     metric_html = "".join(
         f'<div class="metric"><dt>{html.escape(label)}</dt><dd>{_number(value)}</dd></div>'
@@ -156,23 +151,23 @@ def _render_html(
     row_html = "".join(_topic_row(topic) for topic in topics)
     distribution_html = _distribution(lengths)
     return f"""<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Topic Memory Library</title>
+<title>主题记忆库</title>
 <style>
 :root {{ color-scheme: light; --cream: #f7f0e3; --paper: #fffaf0; --ink: #3c2c25; --muted: #725e53; --terracotta: #ad563c; --clay: #d98a68; --line: #d9c6b5; --focus: #6e3526; }}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; background: var(--cream); color: var(--ink); font: 16px/1.5 ui-serif, Georgia, serif; }}
-main {{ width: min(1180px, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }}
+body {{ margin: 0; background: var(--cream); color: var(--ink); font: 16px/1.5 ui-serif, "Songti SC", "Noto Serif CJK SC", Georgia, serif; }}
+main {{ width: min(1600px, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }}
 h1, h2 {{ line-height: 1.15; }}
 h1 {{ margin-bottom: .5rem; font-size: clamp(2rem, 5vw, 3.5rem); }}
 .subtitle {{ color: var(--muted); max-width: 70ch; }}
 .banner {{ margin: 1.5rem 0; padding: 1rem 1.1rem; border: 2px solid var(--terracotta); background: var(--paper); font-weight: 700; }}
 .metrics {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; margin: 0 0 2rem; }}
 .metric {{ min-height: 7rem; padding: 1rem; border: 1px solid var(--line); background: var(--paper); }}
-.metric dt {{ color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .06em; }}
+.metric dt {{ color: var(--muted); font-size: .9rem; font-weight: 700; }}
 .metric dd {{ margin: .4rem 0 0; color: var(--terracotta); font-size: clamp(1.4rem, 3vw, 2rem); font-weight: 800; }}
 .distribution {{ margin: 0 0 2rem; padding: 1.25rem; border: 1px solid var(--line); background: var(--paper); }}
 .distribution ul {{ margin: 0; padding: 0; list-style: none; }}
@@ -184,50 +179,61 @@ h1 {{ margin-bottom: .5rem; font-size: clamp(2rem, 5vw, 3.5rem); }}
 input, select {{ min-height: 2.75rem; padding: .55rem .7rem; border: 2px solid var(--line); border-radius: 0; background: var(--paper); color: var(--ink); font: inherit; }}
 input {{ width: min(32rem, 80vw); }}
 :focus-visible {{ outline: 3px solid var(--focus); outline-offset: 3px; }}
-.table-wrap {{ overflow-x: auto; border: 1px solid var(--line); background: var(--paper); }}
-table {{ width: 100%; border-collapse: collapse; }}
+.table-wrap {{ overflow-x: auto; border: 1px solid var(--line); background: var(--paper); scrollbar-gutter: stable; }}
+table {{ width: 100%; min-width: 96rem; border-collapse: collapse; }}
 th, td {{ padding: .8rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
 th {{ position: sticky; top: 0; background: #ecd9c5; white-space: nowrap; }}
 tbody tr:last-child td {{ border-bottom: 0; }}
-.topic-title {{ font-weight: 800; }}
-code {{ color: #6e3526; overflow-wrap: anywhere; }}
-details {{ min-width: 13rem; }}
+.topic-title {{ min-width: 15rem; font-weight: 800; overflow-wrap: break-word; word-break: normal; }}
+.topic-id {{ min-width: 11rem; }}
+.source-path {{ min-width: 18rem; }}
+.topic-id code, .source-path code {{ white-space: normal; overflow-wrap: normal; word-break: normal; }}
+.number {{ min-width: 5.5rem; white-space: nowrap; }}
+.updated {{ min-width: 13rem; white-space: nowrap; }}
+.details-cell {{ min-width: 20rem; }}
+code {{ color: #6e3526; }}
+details {{ min-width: 18rem; }}
 summary {{ color: var(--terracotta); cursor: pointer; font-weight: 800; }}
-dl.detail-grid {{ display: grid; grid-template-columns: max-content 1fr; gap: .25rem .75rem; margin: .75rem 0; }}
+dl.detail-grid {{ display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .3rem .75rem; margin: .75rem 0 0; }}
 .detail-grid dt {{ color: var(--muted); }}
-.detail-grid dd {{ margin: 0; overflow-wrap: anywhere; }}
-.preview {{ max-width: 34rem; padding: .65rem; border-left: 4px solid var(--clay); background: var(--cream); white-space: pre-wrap; overflow-wrap: anywhere; }}
+.detail-grid dd {{ min-width: 0; margin: 0; }}
+.sha {{ display: inline-block; max-width: 100%; white-space: nowrap; }}
 [hidden] {{ display: none !important; }}
 .result-count {{ align-self: end; padding: .65rem 0; color: var(--muted); }}
+.empty-state, .noscript {{ margin: 1rem 0 0; padding: .8rem; border: 1px solid var(--line); background: var(--paper); color: var(--muted); }}
+.sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }}
 @media (max-width: 780px) {{ .metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .distribution li {{ grid-template-columns: 7rem 1fr 2.5rem; }} th, td {{ padding: .65rem; }} }}
-@media (max-width: 480px) {{ main {{ width: min(100% - 1rem, 1180px); padding-top: 1rem; }} .metrics {{ grid-template-columns: 1fr; }} .controls {{ display: grid; }} input {{ width: 100%; }} }}
+@media (max-width: 480px) {{ main {{ width: min(100% - 1rem, 1600px); padding-top: 1rem; }} .metrics {{ grid-template-columns: 1fr; }} .controls {{ display: grid; }} input {{ width: 100%; }} }}
 </style>
 </head>
 <body>
 <main>
 <header>
-<h1>Topic Memory Library</h1>
-<p class="subtitle">A direct view of the canonical topic store: real sizes, versions, source paths, and cache counts.</p>
-<div class="banner">This dashboard is metadata-only. Source texts remain in the private memory store; only a short excerpt from longer documents may appear below.</div>
+<h1>主题记忆库</h1>
+<p class="subtitle">查看规范主题存储中的实际大小、版本、源路径和缓存条目。</p>
+<div class="banner">此页面只包含元数据。源文档正文保留在私有记忆库中，不会写入此 HTML。</div>
 </header>
-<dl class="metrics" aria-label="Library totals">{metric_html}</dl>
+<dl class="metrics" aria-label="记忆库汇总">{metric_html}</dl>
 <section class="distribution" aria-labelledby="distribution-title">
-<h2 id="distribution-title">Size distribution</h2>
+<h2 id="distribution-title">大小分布</h2>
 {distribution_html}
 </section>
 <section aria-labelledby="topics-title">
-<h2 id="topics-title">Topics</h2>
+<h2 id="topics-title">主题</h2>
 <div class="controls">
-<label for="topic-filter">Search topics<input id="topic-filter" type="search" placeholder="Title, topic ID, or source path" autocomplete="off"></label>
-<label for="topic-sort">Sort topics<select id="topic-sort"><option value="title">Title A–Z</option><option value="largest">Largest first</option><option value="smallest">Smallest first</option></select></label>
-<div class="result-count" id="result-count" aria-live="polite">{len(topics)} topics</div>
+<label for="topic-filter">搜索主题<input id="topic-filter" type="search" placeholder="标题、主题 ID 或源路径" autocomplete="off"></label>
+<label for="topic-sort">主题排序<select id="topic-sort"><option value="title">标题 A–Z</option><option value="largest">字符数从多到少</option><option value="smallest">字符数从少到多</option></select></label>
+<div class="result-count" id="result-count" aria-live="polite">{len(topics)} 个主题</div>
 </div>
+<noscript><p class="noscript">未启用 JavaScript：以下为完整主题清单；搜索和排序不可用。</p></noscript>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Display title</th><th>Topic ID</th><th>Source path</th><th>Characters</th><th>Bytes</th><th>Lines</th><th>Version</th><th>Updated</th><th>Details</th></tr></thead>
+<caption class="sr-only">主题元数据</caption>
+<thead><tr><th>显示标题</th><th>主题 ID</th><th>源路径</th><th>字符数</th><th>字节数</th><th>行数</th><th>版本</th><th>更新时间</th><th>详情</th></tr></thead>
 <tbody id="topic-rows">{row_html}</tbody>
 </table>
 </div>
+<p class="empty-state" id="empty-state" hidden>没有匹配的主题。</p>
 </section>
 </main>
 <script>
@@ -236,6 +242,7 @@ dl.detail-grid {{ display: grid; grid-template-columns: max-content 1fr; gap: .2
   const sort = document.getElementById('topic-sort');
   const body = document.getElementById('topic-rows');
   const count = document.getElementById('result-count');
+  const empty = document.getElementById('empty-state');
   const rows = Array.from(body.querySelectorAll('tr'));
   function apply() {{
     const query = filter.value.trim().toLocaleLowerCase();
@@ -251,7 +258,8 @@ dl.detail-grid {{ display: grid; grid-template-columns: max-content 1fr; gap: .2
       if (matches) visible += 1;
       body.appendChild(row);
     }}
-    count.textContent = `${{visible}} ${{visible === 1 ? 'topic' : 'topics'}}`;
+    count.textContent = `${{visible}} 个主题`;
+    empty.hidden = visible !== 0;
   }}
   filter.addEventListener('input', apply);
   sort.addEventListener('change', apply);
@@ -264,31 +272,44 @@ dl.detail-grid {{ display: grid; grid-template-columns: max-content 1fr; gap: .2
 
 def _topic_row(topic: DashboardTopic) -> str:
     escaped_title = html.escape(topic.display_name)
-    escaped_id = html.escape(topic.topic_id)
-    escaped_path = html.escape(topic.source_relative_path)
+    escaped_id = _soft_break(topic.topic_id, frozenset("-_"))
+    escaped_path = _soft_break(topic.source_relative_path, frozenset("/\\-_."))
     search = " ".join(
         (topic.display_name, topic.topic_id, topic.source_relative_path)
     ).casefold()
-    preview = (
-        f'<p class="preview">{html.escape(topic.preview)}…</p>'
-        if topic.preview is not None
-        else '<p class="preview">Preview omitted to avoid embedding the complete short source.</p>'
-    )
-    source_sha = html.escape(topic.source_sha256 or "Not recorded")
-    imported_at = html.escape(topic.imported_at or "Not recorded")
+    imported_at = html.escape(topic.imported_at or "未记录")
+    source_sha = _source_sha(topic.source_sha256)
     return f"""<tr data-title="{html.escape(topic.display_name.casefold(), quote=True)}" data-search="{html.escape(search, quote=True)}" data-chars="{topic.chars}">
-<td class="topic-title">{escaped_title}</td><td><code>{escaped_id}</code></td><td><code>{escaped_path}</code></td><td>{_number(topic.chars)}</td><td>{_number(topic.bytes)}</td><td>{_number(topic.lines)}</td><td>{topic.version}</td><td><time datetime="{html.escape(topic.updated_at, quote=True)}">{html.escape(topic.updated_at)}</time></td>
-<td><details><summary>View metadata</summary><dl class="detail-grid"><dt>Versions</dt><dd>{topic.version_count}</dd><dt>Cache entries</dt><dd>{topic.cache_entry_count}</dd><dt>Imported</dt><dd>{imported_at}</dd><dt>Source SHA-256</dt><dd><code>{source_sha}</code></dd></dl>{preview}</details></td>
+<td class="topic-title">{escaped_title}</td><td class="topic-id"><code>{escaped_id}</code></td><td class="source-path"><code>{escaped_path}</code></td><td class="number">{_number(topic.chars)}</td><td class="number">{_number(topic.bytes)}</td><td class="number">{_number(topic.lines)}</td><td class="number">{topic.version}</td><td class="updated"><time datetime="{html.escape(topic.updated_at, quote=True)}">{html.escape(topic.updated_at)}</time></td>
+<td class="details-cell"><details><summary>查看元数据</summary><dl class="detail-grid"><dt>版本数</dt><dd>{topic.version_count}</dd><dt>缓存条目数</dt><dd>{topic.cache_entry_count}</dd><dt>导入时间</dt><dd>{imported_at}</dd><dt>源文件 SHA-256</dt><dd>{source_sha}</dd></dl></details></td>
 </tr>"""
+
+
+def _soft_break(value: str, separators: frozenset[str]) -> str:
+    return "".join(
+        f"{html.escape(character)}{'<wbr>' if character in separators else ''}"
+        for character in value
+    )
+
+
+def _source_sha(value: str | None) -> str:
+    if value is None:
+        return '<code class="sha">未记录</code>'
+    escaped = html.escape(value, quote=True)
+    compact = html.escape(f"{value[:12]}…" if len(value) > 12 else value)
+    return (
+        f'<code class="sha" title="完整 SHA-256：{escaped}" '
+        f'aria-label="完整 SHA-256：{escaped}">{compact}</code>'
+    )
 
 
 def _distribution(lengths: list[int]) -> str:
     buckets = (
-        ("0–999 chars", 0, 1_000),
-        ("1,000–4,999", 1_000, 5_000),
-        ("5,000–9,999", 5_000, 10_000),
-        ("10,000–24,999", 10_000, 25_000),
-        ("25,000+", 25_000, None),
+        ("0–999 字符", 0, 1_000),
+        ("1,000–4,999 字符", 1_000, 5_000),
+        ("5,000–9,999 字符", 5_000, 10_000),
+        ("10,000–24,999 字符", 10_000, 25_000),
+        ("25,000 字符以上", 25_000, None),
     )
     counts = [
         sum(1 for length in lengths if length >= lower and (upper is None or length < upper))
@@ -299,7 +320,7 @@ def _distribution(lengths: list[int]) -> str:
         f'<li><span>{html.escape(label)}</span><span class="bar-track"><span class="bar" style="width: {count / maximum * 100:.2f}%"></span></span><strong>{count}</strong></li>'
         for (label, _lower, _upper), count in zip(buckets, counts, strict=True)
     )
-    return f'<ul aria-label="Topic character count buckets">{items}</ul>'
+    return f'<ul aria-label="按主题字符数分组">{items}</ul>'
 
 
 def _number(value: int | float) -> str:
