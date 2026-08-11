@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from hermes_topic_memory.cache import QuestionCache
-from hermes_topic_memory.engine import RecallEngine
+from hermes_topic_memory.engine import RecallEngine, RecallResult
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse, ReaderUsage
 from hermes_topic_memory.store import FileTopicStore
 
@@ -74,6 +74,29 @@ def test_recall_uses_byte_stable_prefix_and_caches_success(tmp_path: Path) -> No
     assert reader.requests[0].prefix.encode() == reader.requests[1].prefix.encode()
     assert reader.requests[0].prompt.startswith(reader.requests[0].prefix)
     assert first.usages == (ReaderUsage(10, 2, 8),)
+
+
+def test_lookup_cache_returns_typed_hit_or_none_without_reader(tmp_path: Path) -> None:
+    reader = SequenceReader(["must not be read"])
+    engine, _store = make_engine(tmp_path, reader)
+    engine.cache.put(
+        question="What is Alpha?",
+        answer="Cached Alpha answer.",
+        topic_id="alpha",
+        topic_version=1,
+        model="old-reader",
+        prompt_version="v1",
+    )
+
+    hit = engine.lookup_cache("alpha", " WHAT is alpha!!! ")
+    miss = engine.lookup_cache("alpha", "unrelated question")
+
+    assert isinstance(hit, RecallResult)
+    assert hit.answer == "Cached Alpha answer."
+    assert hit.source == "cache"
+    assert hit.match_kind == "exact"
+    assert miss is None
+    assert reader.requests == []
 
 
 def test_overlength_answer_gets_one_correction_then_succeeds(tmp_path: Path) -> None:
@@ -178,6 +201,11 @@ def test_temporal_recall_bypasses_fuzzy_cache_entry_for_rewritten_date(
         prompt_version="v1",
     )
     assert cache.lookup(raw, topic_id="alpha", topic_version=1) is not None
+
+    cached = engine.lookup_cache("alpha", raw)
+
+    assert cached is None
+    assert reader.requests == []
 
     result = engine.recall("alpha", raw)
 

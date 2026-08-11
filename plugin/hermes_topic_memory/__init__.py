@@ -399,8 +399,11 @@ class HermesTopicMemoryProvider(MemoryProvider):
             decision = self._route(session_id=sid, query=query)
             if decision.source == "query":
                 self._remember_routed_archive_query(sid, decision.topic_id, query)
-        except Exception:
-            logger.debug("Topic-memory prefetch routing failed")
+        except Exception as error:
+            logger.debug(
+                "Topic-memory background prefetch status=route_rejected reason=%s",
+                type(error).__name__,
+            )
             return
         key = (sid, query)
         ticket = object()
@@ -420,8 +423,12 @@ class HermesTopicMemoryProvider(MemoryProvider):
         try:
             result = self._require_engine().recall(topic_id, query)
             block = _format_prefetch(result)
-        except Exception:
-            logger.debug("Topic-memory background prefetch failed")
+        except Exception as error:
+            logger.debug(
+                "Topic-memory background prefetch status=failed topic_id=%s reason=%s",
+                topic_id,
+                type(error).__name__,
+            )
             block = ""
         with self._lock:
             if self._prefetch_tickets.get(key) is ticket:
@@ -436,7 +443,6 @@ class HermesTopicMemoryProvider(MemoryProvider):
         key = (sid, query)
         with self._lock:
             ready = self._prefetch_results.pop(key, "")
-            in_flight = key in self._prefetch_tickets
         if ready:
             try:
                 mentioned_topic = self._require_registry().mentioned_topic(query)
@@ -444,28 +450,69 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 mentioned_topic = None
             if mentioned_topic is not None:
                 self._remember_session_topic(sid, mentioned_topic)
+            logger.debug(
+                "Topic-memory current-turn prefetch status=background_ready topic_id=%s",
+                mentioned_topic or "session",
+            )
             return ready
-        if in_flight:
-            return ""
 
         try:
             registry = self._require_registry()
             topic_id = registry.mentioned_topic(query)
-            named_topic = topic_id is not None
-            if topic_id is None:
-                with self._lock:
-                    session_topic = self._session_topics.get(sid)
-                if session_topic is None:
-                    return ""
-                topic_id = registry.resolve_name(session_topic, context="session topic")
-            result = self._require_engine().recall(topic_id, query)
-            block = _format_prefetch(result)
-        except Exception:
-            logger.debug("Topic-memory current-turn prefetch failed")
+        except MultiTopicRequiredError as error:
+            logger.debug(
+                "Topic-memory current-turn prefetch status=tool_required_multi topic_ids=%s",
+                ",".join(error.topic_ids),
+            )
+            return _format_multi_recall_directive(error.topic_ids, query)
+        except (TopicRoutingError, ValueError) as error:
+            logger.debug(
+                "Topic-memory current-turn prefetch status=route_rejected reason=%s",
+                type(error).__name__,
+            )
             return ""
-        if block and named_topic:
+
+        named_topic = topic_id is not None
+        if topic_id is None:
+            with self._lock:
+                session_topic = self._session_topics.get(sid)
+            if session_topic is None:
+                logger.debug("Topic-memory current-turn prefetch status=no_safe_topic")
+                return ""
+            try:
+                topic_id = registry.resolve_name(session_topic, context="session topic")
+            except (TopicRoutingError, ValueError) as error:
+                logger.debug(
+                    "Topic-memory current-turn prefetch status=route_rejected reason=%s",
+                    type(error).__name__,
+                )
+                return ""
+
+        try:
+            cached = self._require_engine().lookup_cache(topic_id, query)
+        except Exception as error:
+            logger.debug(
+                "Topic-memory current-turn prefetch "
+                "status=cache_lookup_failed topic_id=%s reason=%s",
+                topic_id,
+                type(error).__name__,
+            )
+            return ""
+
+        if cached is None:
+            block = _format_single_recall_directive(topic_id, query)
+            status = "tool_required"
+        else:
+            block = _format_prefetch(cached)
+            status = "cache_hit"
+        if named_topic:
             self._remember_routed_archive_query(sid, topic_id, query)
             self._remember_session_topic(sid, topic_id)
+        logger.debug(
+            "Topic-memory current-turn prefetch status=%s topic_id=%s",
+            status,
+            topic_id,
+        )
         return block
 
     def sync_turn(
@@ -1239,6 +1286,35 @@ def _format_prefetch(result: RecallResult) -> str:
     if result.answer is None:
         return ""
     return f"[Topic Memory: {result.topic_id} v{result.topic_version}]\n{result.answer}"
+
+
+def _format_single_recall_directive(topic_id: str, query: str) -> str:
+    arguments = _json_result({"query": query, "topic": topic_id})
+    return (
+        "[Topic Memory Tool Required]\n"
+        f"Before answering, you MUST call topic_memory_recall with exactly these arguments: {arguments}\n"
+        "Answer only with the tool's verbatim_answer; do not answer from general knowledge or "
+        "from this instruction, which contains no topic facts."
+    )
+
+
+def _format_multi_recall_directive(topic_ids: tuple[str, ...], query: str) -> str:
+    arguments = _json_result(
+        {
+            "query": query,
+            "topics": [
+                {"topic": topic_id, "reason": "named in the current query"}
+                for topic_id in topic_ids
+            ],
+        }
+    )
+    return (
+        "[Topic Memory Tool Required]\n"
+        f"Before answering, you MUST call topic_memory_recall_multi with exactly these arguments: {arguments}\n"
+        "Use every candidate in the listed order; do not select one arbitrarily. Answer only with "
+        "the tool's verbatim_answer; do not answer from general knowledge or from this instruction, "
+        "which contains no topic facts."
+    )
 
 
 def _recall_result(result: RecallResult) -> dict[str, Any]:

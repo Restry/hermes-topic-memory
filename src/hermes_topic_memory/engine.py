@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .cache import QuestionCache
+from .models import TopicMemory
 from .reader import Reader, ReaderRequest, ReaderUsage, build_stable_prefix
 from .store import FileTopicStore
 from .temporal import build_temporal_evidence_capsule
@@ -53,27 +54,21 @@ class RecallEngine:
         self.reader = reader
         self.prompt_version = prompt_version
 
+    def lookup_cache(self, topic_id: str, question: str) -> RecallResult | None:
+        if not question.strip():
+            raise ValueError("question must not be empty")
+        memory = self.store.get_topic(topic_id)
+        cached, _evidence_capsule = self._lookup_cache_for_memory(memory, question)
+        return cached
+
     def recall(self, topic_id: str, question: str) -> RecallResult:
         if not question.strip():
             raise ValueError("question must not be empty")
         memory = self.store.get_topic(topic_id)
-        evidence_capsule = build_temporal_evidence_capsule(memory.body, question)
+        cached, evidence_capsule = self._lookup_cache_for_memory(memory, question)
         topic_version = memory.metadata.version
-        cached = self.cache.lookup(
-            question,
-            topic_id=topic_id,
-            topic_version=topic_version,
-            exact_only=evidence_capsule is not None,
-        )
         if cached is not None:
-            return RecallResult(
-                topic_id=topic_id,
-                topic_version=topic_version,
-                answer=cached.answer,
-                source="cache",
-                similarity=cached.similarity,
-                match_kind=cached.match_kind,
-            )
+            return cached
 
         prefix = build_stable_prefix(memory)
         usages: list[ReaderUsage] = []
@@ -141,6 +136,32 @@ class RecallEngine:
             answer=answer,
             source="reader",
             usages=tuple(usages),
+        )
+
+    def _lookup_cache_for_memory(
+        self, memory: TopicMemory, question: str
+    ) -> tuple[RecallResult | None, str | None]:
+        evidence_capsule = build_temporal_evidence_capsule(memory.body, question)
+        topic_id = memory.metadata.topic_id
+        topic_version = memory.metadata.version
+        cached = self.cache.lookup(
+            question,
+            topic_id=topic_id,
+            topic_version=topic_version,
+            exact_only=evidence_capsule is not None,
+        )
+        if cached is None:
+            return None, evidence_capsule
+        return (
+            RecallResult(
+                topic_id=topic_id,
+                topic_version=topic_version,
+                answer=cached.answer,
+                source="cache",
+                similarity=cached.similarity,
+                match_kind=cached.match_kind,
+            ),
+            evidence_capsule,
         )
 
 

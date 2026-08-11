@@ -83,6 +83,17 @@ class BlockingReader(TopicReader):
         return super().read(request)
 
 
+class SlowReader(TopicReader):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+
+    def read(self, request: ReaderRequest) -> ReaderResponse:
+        self.started.set()
+        time.sleep(0.75)
+        return super().read(request)
+
+
 class RecordingUpdater:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
@@ -178,7 +189,7 @@ def configured_mafu_provider(
     store = FileTopicStore(data_root)
     store.create_topic(
         "dm-mafu",
-        "# 马夫\n\nMafu is the user's Feishu assistant.\n",
+        "# 马夫\n\nMAFU_CANONICAL_SENTINEL\n",
         aliases=("马夫", "mafu"),
     )
     (data_root / "topic-registry.json").write_text(
@@ -218,6 +229,43 @@ def wait_for_prefetch(provider, query: str, session_id: str) -> str:
             return value
         time.sleep(0.01)
     raise AssertionError("background prefetch did not complete")
+
+
+def expected_single_tool_directive(topic_id: str, query: str) -> str:
+    arguments = json.dumps(
+        {"query": query, "topic": topic_id},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "[Topic Memory Tool Required]\n"
+        f"Before answering, you MUST call topic_memory_recall with exactly these arguments: {arguments}\n"
+        "Answer only with the tool's verbatim_answer; do not answer from general knowledge or "
+        "from this instruction, which contains no topic facts."
+    )
+
+
+def expected_multi_tool_directive(topic_ids: tuple[str, ...], query: str) -> str:
+    arguments = json.dumps(
+        {
+            "query": query,
+            "topics": [
+                {"topic": topic_id, "reason": "named in the current query"}
+                for topic_id in topic_ids
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "[Topic Memory Tool Required]\n"
+        f"Before answering, you MUST call topic_memory_recall_multi with exactly these arguments: {arguments}\n"
+        "Use every candidate in the listed order; do not select one arbitrarily. Answer only with "
+        "the tool's verbatim_answer; do not answer from general knowledge or from this instruction, "
+        "which contains no topic facts."
+    )
 
 
 def test_real_contract_registration_and_metadata() -> None:
@@ -356,21 +404,59 @@ def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: 
     assert (Path.home() / ".hermes" / "topic-memory" / "data").resolve() != data_root.resolve()
     provider.shutdown()
 
-def test_current_turn_prefetch_synchronously_recalls_named_topic_without_queue(
+def test_current_turn_prefetch_cache_miss_never_calls_slow_reader(
     tmp_path: Path,
 ) -> None:
-    reader = TopicReader()
+    reader = SlowReader()
     provider, hermes_home, _data_root = configured_mafu_provider(
         tmp_path, reader=reader
     )
     provider.initialize("fresh-session", hermes_home=str(hermes_home))
-    query = "你跟我讲讲马夫是用来做什么的？"
+    query = "马夫这个项目是用来做什么的？"
 
-    assert provider._session_topics == {}
     provider.on_turn_start(1, query, session_id="fresh-session")
+    started = time.monotonic()
     prefetched = provider.prefetch(query, session_id="fresh-session")
+    elapsed = time.monotonic() - started
 
-    assert prefetched == "[Topic Memory: dm-mafu v1]\nanswer from dm-mafu"
+    assert elapsed < 0.5, (
+        f"prefetch took {elapsed:.3f}s; reader_started={reader.started.is_set()}"
+    )
+    assert not reader.started.is_set()
+    assert reader.requests == []
+    assert prefetched == expected_single_tool_directive("dm-mafu", query)
+    assert "MAFU_CANONICAL_SENTINEL" not in prefetched
+    provider.shutdown()
+
+
+def test_cache_miss_directive_then_tool_calls_reader_once_and_returns_verbatim(
+    tmp_path: Path,
+) -> None:
+    grounded_answer = "马夫是来自主题档案的精确答案。"
+    reader = ExactAnswerReader(grounded_answer)
+    provider, hermes_home, _data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+    query = "马夫这个项目是用来做什么的？"
+
+    provider.on_turn_start(1, query, session_id="fresh-session")
+    directive = provider.prefetch(query, session_id="fresh-session")
+
+    assert directive == expected_single_tool_directive("dm-mafu", query)
+    assert "MAFU_CANONICAL_SENTINEL" not in directive
+    assert reader.requests == []
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": query, "topic": "dm-mafu"},
+            session_id="fresh-session",
+        )
+    )
+
+    assert result["verbatim_answer"] == grounded_answer
+    assert result["source"] == "reader"
     assert [request.question for request in reader.requests] == [query]
     provider.shutdown()
 
@@ -401,16 +487,60 @@ def test_current_turn_prefetch_uses_existing_topic_cache_without_reader(
     provider.shutdown()
 
 
+def test_exact_temporal_prefetch_ignores_fuzzy_cache_and_requires_tool(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    temporal_body = """# Alpha
+
+## 2026年6月28日
+
+- **16:14** TEMPORAL_CANONICAL_SENTINEL nearby setup.
+- **16:30** Exact archived completion.
+"""
+    memory = FileTopicStore(data_root).update_topic("alpha", temporal_body)
+    rewritten = "Alpha 项目2024年6月28日下午4:30做了什么"
+    query = "Alpha 项目6月28日下午4:30做了什么"
+    cache = QuestionCache(data_root, jaccard_threshold=0.8)
+    cache.put(
+        question=rewritten,
+        answer="Wrong fuzzy temporal answer.",
+        topic_id="alpha",
+        topic_version=memory.metadata.version,
+        model="old-reader",
+        prompt_version="v1",
+    )
+    assert cache.lookup(
+        query, topic_id="alpha", topic_version=memory.metadata.version
+    ) is not None
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+
+    provider.on_turn_start(1, query, session_id="session-a")
+    prefetched = provider.prefetch(query, session_id="session-a")
+
+    assert prefetched == expected_single_tool_directive("alpha", query)
+    assert "Wrong fuzzy temporal answer." not in prefetched
+    assert "TEMPORAL_CANONICAL_SENTINEL" not in prefetched
+    assert reader.requests == []
+    provider.shutdown()
+
+
 def test_current_turn_prefetch_rejects_unmentioned_unknown_and_ambiguous_topics(
     tmp_path: Path,
 ) -> None:
     reader = TopicReader()
-    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    registry_path = data_root / "topic-registry.json"
+    registry_value = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry_value["topics"][0]["display_name"] = "Shared"
+    registry_value["topics"][1]["display_name"] = "Shared"
+    registry_path.write_text(json.dumps(registry_value) + "\n", encoding="utf-8")
     provider.initialize("session-a", hermes_home=str(hermes_home))
     queries = (
         "今天天气怎么样？",
         "What is archived for the Missing Project?",
-        "Compare the Alpha and Beta project archives.",
+        "What is archived for the Shared project?",
     )
 
     for turn_number, query in enumerate(queries, start=1):
@@ -421,7 +551,7 @@ def test_current_turn_prefetch_rejects_unmentioned_unknown_and_ambiguous_topics(
     provider.shutdown()
 
 
-def test_successful_current_turn_prefetch_binds_follow_up_without_cross_session_leak(
+def test_proven_session_follow_up_miss_requires_tool_without_cross_session_leak(
     tmp_path: Path,
 ) -> None:
     reader = TopicReader()
@@ -432,43 +562,65 @@ def test_successful_current_turn_prefetch_binds_follow_up_without_cross_session_
     follow_up = "继续说说它的职责。"
 
     provider.on_turn_start(1, alpha_query, session_id="session-a")
-    assert "answer from alpha" in provider.prefetch(
+    assert provider.prefetch(
         alpha_query, session_id="session-a"
+    ) == expected_single_tool_directive("alpha", alpha_query)
+    alpha = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": alpha_query, "topic": "alpha"},
+            session_id="session-a",
+        )
     )
+    assert alpha["verbatim_answer"] == "answer from alpha"
+
     provider.on_turn_start(2, beta_query, session_id="session-a")
-    assert "answer from beta" in provider.prefetch(beta_query, session_id="session-a")
+    assert provider.prefetch(
+        beta_query, session_id="session-a"
+    ) == expected_single_tool_directive("beta", beta_query)
+    beta = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": beta_query, "topic": "beta"},
+            session_id="session-a",
+        )
+    )
+    assert beta["verbatim_answer"] == "answer from beta"
+
     provider.on_turn_start(3, follow_up, session_id="session-a")
-    assert "answer from beta" in provider.prefetch(follow_up, session_id="session-a")
+    assert provider.prefetch(
+        follow_up, session_id="session-a"
+    ) == expected_single_tool_directive("beta", follow_up)
 
     assert provider._session_topics == {"session-a": "beta"}
     assert [request.question for request in reader.requests] == [
         alpha_query,
         beta_query,
-        follow_up,
     ]
 
     provider.on_turn_start(1, follow_up, session_id="session-b")
     assert provider.prefetch(follow_up, session_id="session-b") == ""
-    assert len(reader.requests) == 3
+    assert len(reader.requests) == 2
     provider.shutdown()
 
 
-def test_current_turn_prefetch_failure_is_logged_and_fails_open(
+def test_current_turn_cache_lookup_failure_is_safely_logged_and_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     provider, hermes_home, _data_root = configured_mafu_provider(tmp_path)
     provider.initialize("fresh-session", hermes_home=str(hermes_home))
-    query = "你跟我讲讲马夫是用来做什么的？"
+    query = "马夫这个项目是用来做什么的？"
 
-    def fail_recall(topic_id: str, question: str) -> None:
+    def fail_lookup_cache(topic_id: str, question: str) -> None:
         raise RuntimeError(f"reader unavailable for {topic_id}: {question}")
 
-    monkeypatch.setattr(provider._engine, "recall", fail_recall)
+    monkeypatch.setattr(provider._engine, "lookup_cache", fail_lookup_cache)
     provider.on_turn_start(1, query, session_id="fresh-session")
     with caplog.at_level(logging.DEBUG, logger="plugin.hermes_topic_memory"):
         assert provider.prefetch(query, session_id="fresh-session") == ""
 
-    assert "Topic-memory current-turn prefetch failed" in caplog.text
+    assert "status=cache_lookup_failed topic_id=dm-mafu reason=RuntimeError" in caplog.text
+    assert query not in caplog.text
     provider.shutdown()
 
 
@@ -499,6 +651,30 @@ def test_ready_background_prefetch_is_consumed_without_duplicate_sync_recall(
     assert prefetched == "[Topic Memory: dm-mafu v1]\nanswer from dm-mafu"
     assert [request.question for request in reader.requests] == [query]
     provider.shutdown()
+
+
+def test_in_flight_background_prefetch_does_not_suppress_named_tool_directive(
+    tmp_path: Path,
+) -> None:
+    reader = BlockingReader()
+    provider, hermes_home, _data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    provider.initialize("fresh-session", hermes_home=str(hermes_home))
+    query = "马夫这个项目是用来做什么的？"
+
+    provider.queue_prefetch(query, session_id="fresh-session")
+    assert reader.started.wait(timeout=1)
+    started = time.monotonic()
+    prefetched = provider.prefetch(query, session_id="fresh-session")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert prefetched == expected_single_tool_directive("dm-mafu", query)
+
+    reader.release.set()
+    provider.shutdown()
+    assert [request.question for request in reader.requests] == [query]
 
 
 def test_background_prefetch_is_non_blocking_and_session_topic_isolation(tmp_path: Path) -> None:
@@ -1549,18 +1725,21 @@ def test_single_tool_reports_multi_topic_required_even_with_explicit_topic(
     provider.shutdown()
 
 
-def test_multi_topic_prefetch_fails_open_without_arbitrary_session_topic(
+def test_multi_topic_prefetch_requires_ordered_multi_tool_without_reader(
     tmp_path: Path,
 ) -> None:
     reader = TopicReader()
     provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
     provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
-    query = "Compare Alpha and Beta project archives."
+    query = "Compare Beta and Alpha project archives."
 
     provider.on_turn_start(1, query, session_id="session-a")
     provider.queue_prefetch(query, session_id="session-a")
+    prefetched = provider.prefetch(query, session_id="session-a")
 
-    assert provider.prefetch(query, session_id="session-a") == ""
+    assert prefetched == expected_multi_tool_directive(("beta", "alpha"), query)
+    assert "Beta canonical fact" not in prefetched
+    assert "Alpha canonical fact" not in prefetched
     assert provider._session_topics == {}
     assert provider._routed_archive_queries == {}
     assert reader.requests == []
