@@ -88,7 +88,7 @@ The Provider reads `$HERMES_HOME/topic-memory/config.json`. Copy `config.example
 
 The Provider exposes:
 
-- `topic_memory_recall` — synchronous recall from one resolved topic; use it for named project or topic archive questions;
+- `topic_memory_recall` — synchronous recall from one resolved topic; successful results keep `answer` and expose the identical `verbatim_answer` with `response_policy: "copy_verbatim_answer_exactly"`, which must be relayed without changing any dates, times, or years;
 - `topic_memory_update` — full canonical replacement requiring verified evidence IDs;
 - `topic_memory_topics` — discovery-only topic metadata and current versions, never bodies or config.
 

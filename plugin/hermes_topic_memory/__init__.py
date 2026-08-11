@@ -42,8 +42,10 @@ RECALL_SCHEMA = {
     "name": "topic_memory_recall",
     "description": (
         "Answer from exactly one named project or topic archive. Copy the query verbatim from "
-        "the user's current archive question; never invent or rewrite dates. Topic may be "
-        "omitted when the query uniquely names a configured topic."
+        "the user's current archive question; never invent or rewrite dates. After a successful "
+        "recall, return only verbatim_answer exactly as received; never add, remove, infer, "
+        "normalize, or alter its dates, times, or years. Topic may be omitted when the query "
+        "uniquely names a configured topic."
     ),
     "parameters": {
         "type": "object",
@@ -243,10 +245,12 @@ class HermesTopicMemoryProvider(MemoryProvider):
             "Questions about a named project or topic archive must use topic_memory_recall; "
             "an exact unique name in the current query overrides session routing. "
             "The recall query must copy the user's current archive question verbatim; never "
-            "invent or rewrite dates. "
-            "topic_memory_topics is for discovery only when available names are unknown, not "
-            "for answering archive questions. Use topic_memory_update only with verified "
-            "evidence IDs. Recall is isolated to one topic; never infer cross-topic context."
+            "invent or rewrite dates. After a successful recall, return only verbatim_answer "
+            "exactly as received. Never add, remove, infer, normalize, or alter any content from "
+            "it, especially dates, times, or years. topic_memory_topics is for discovery only "
+            "when available names are unknown, not for answering archive questions. Use "
+            "topic_memory_update only with verified evidence IDs. Recall is isolated to one "
+            "topic; never infer cross-topic context."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
@@ -697,6 +701,9 @@ def _recall_result(result: RecallResult) -> dict[str, Any]:
         "answer": result.answer,
         "source": result.source,
     }
+    if result.failure is None and result.answer is not None:
+        value["verbatim_answer"] = result.answer
+        value["response_policy"] = "copy_verbatim_answer_exactly"
     if result.failure is not None:
         value["failure"] = {
             "code": result.failure.code,

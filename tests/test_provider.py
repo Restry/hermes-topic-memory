@@ -34,6 +34,16 @@ class TopicReader:
         return ReaderResponse(answer=f"answer from {topic_id}", model="fake-reader")
 
 
+class ExactAnswerReader(TopicReader):
+    def __init__(self, answer: str) -> None:
+        super().__init__()
+        self.answer = answer
+
+    def read(self, request: ReaderRequest) -> ReaderResponse:
+        self.requests.append(request)
+        return ReaderResponse(answer=self.answer, model="fake-reader")
+
+
 class BlockingReader(TopicReader):
     def __init__(self) -> None:
         super().__init__()
@@ -174,6 +184,65 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
     assert "never invent or rewrite dates" in prompt
     assert "verbatim" in recall_description
     assert "never invent or rewrite dates" in query_description
+    for instruction in (prompt, recall_description):
+        assert "successful recall" in instruction
+        assert "return only verbatim_answer exactly as received" in instruction
+        assert "never add, remove, infer, normalize, or alter" in instruction
+        assert "dates, times, or years" in instruction
+
+
+def test_successful_recall_exposes_exact_verbatim_relay_contract(tmp_path: Path) -> None:
+    expected = "2031-07-08 09:45，Phase 3 archived (commit abc1234)."
+    provider, hermes_home, _data_root = configured_provider(
+        tmp_path, reader=ExactAnswerReader(expected)
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    results = [
+        json.loads(
+            provider.handle_tool_call(
+                "topic_memory_recall",
+                {"query": "What happened on 2031-07-08 at 09:45?", "topic": "alpha"},
+                session_id="session-a",
+            )
+        )
+        for _ in range(2)
+    ]
+
+    assert [result["source"] for result in results] == ["reader", "cache"]
+    for result in results:
+        assert result["answer"] == expected
+        assert result["verbatim_answer"] == expected
+        assert result["response_policy"] == "copy_verbatim_answer_exactly"
+    provider.shutdown()
+
+
+def test_failed_recall_result_keeps_existing_shape(tmp_path: Path) -> None:
+    provider, hermes_home, _data_root = configured_provider(
+        tmp_path, reader=ExactAnswerReader("")
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is archived for Alpha?", "topic": "alpha"},
+            session_id="session-a",
+        )
+    )
+
+    assert result == {
+        "answer": None,
+        "failure": {
+            "attempts": 2,
+            "code": "answer_empty",
+            "message": "Reader returned an empty answer after one correction",
+        },
+        "source": "failure",
+        "topic_id": "alpha",
+        "topic_version": 1,
+    }
+    provider.shutdown()
 
 
 def test_profile_safe_initialize_static_prompt_and_secret_safe_config(tmp_path: Path) -> None:
