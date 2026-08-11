@@ -18,10 +18,19 @@ from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.engine import RecallEngine, RecallResult
 from hermes_topic_memory.evidence import EvidenceLedger, EvidenceNotFoundError, EvidenceRecord
 from hermes_topic_memory.models import TopicMemory
+from hermes_topic_memory.multi_recall import (
+    CapsuleSynthesizer,
+    MultiRecallEngine,
+    MultiRecallResult,
+    ReaderCapsuleSynthesizer,
+    TopicSelection,
+)
 from hermes_topic_memory.operations import apply_evidence_update
 from hermes_topic_memory.reader import OpenAICompatibleReader, Reader, ReaderRequest
+from hermes_topic_memory.query_history import QueryHistoryStore
 from hermes_topic_memory.router import (
     AmbiguousRegistryError,
+    MultiTopicRequiredError,
     RouteDecision,
     TopicRegistry,
     TopicRoutingError,
@@ -77,6 +86,46 @@ RECALL_SCHEMA = {
             },
         },
         "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+MULTI_RECALL_SCHEMA = {
+    "name": "topic_memory_recall_multi",
+    "description": (
+        "Recall one to eight Agent-selected topics independently, then synthesize only labeled "
+        "per-topic capsules. Copy the user's query verbatim. After success, return only "
+        "verbatim_answer exactly as received and preserve all dates, times, and source labels."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Copy the user's original question verbatim.",
+            },
+            "topics": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Exact topic ID, alias, or full display name.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Why this topic is required for the question.",
+                        },
+                    },
+                    "required": ["topic", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["query", "topics"],
         "additionalProperties": False,
     },
 }
@@ -195,20 +244,25 @@ class HermesTopicMemoryProvider(MemoryProvider):
         *,
         reader: Reader | None = None,
         updater: TopicUpdater | None = None,
+        synthesizer: CapsuleSynthesizer | None = None,
     ) -> None:
         self._injected_reader = reader
         self._injected_updater = updater
+        self._injected_synthesizer = synthesizer
         self._reader: Reader | None = None
         self._updater: TopicUpdater | None = None
         self._store: FileTopicStore | None = None
         self._ledger: EvidenceLedger | None = None
         self._registry: TopicRegistry | None = None
         self._engine: RecallEngine | None = None
+        self._multi_engine: MultiRecallEngine | None = None
+        self._query_history: QueryHistoryStore | None = None
         self._data_root: Path | None = None
         self._current_session_id = ""
         self._contexts: dict[str, _SessionContext] = {}
         self._session_evidence: dict[str, list[str]] = {}
         self._session_topics: dict[str, str] = {}
+        self._session_multi_scopes: dict[str, tuple[str, ...]] = {}
         self._raw_turn_questions: dict[str, str] = {}
         self._routed_archive_queries: dict[str, _RoutedArchiveQuery] = {}
         self._prefetch_results: dict[tuple[str, str], str] = {}
@@ -258,13 +312,17 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._store = store
         self._ledger = EvidenceLedger(data_root)
         self._registry = registry
-        self._engine = RecallEngine(
-            store=store,
-            cache=QuestionCache(
-                data_root,
-                jaccard_threshold=float(config.get("jaccard_threshold", 0.8)),
-            ),
-            reader=reader,
+        cache = QuestionCache(
+            data_root,
+            jaccard_threshold=float(config.get("jaccard_threshold", 0.8)),
+        )
+        self._engine = RecallEngine(store=store, cache=cache, reader=reader)
+        self._query_history = QueryHistoryStore(data_root)
+        self._multi_engine = MultiRecallEngine(
+            recall_engine=self._engine,
+            registry=registry,
+            synthesizer=self._injected_synthesizer or ReaderCapsuleSynthesizer(reader),
+            query_history=self._query_history,
         )
         self._data_root = data_root
         self._batch_size = _positive_int(config.get("batch_size", 8), "batch_size")
@@ -274,6 +332,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         self._raw_turn_questions = {}
         self._routed_archive_queries = {}
         self._session_topics = {}
+        self._session_multi_scopes = {}
         self._contexts = {
             session_id: _SessionContext(
                 chat_id=_chat_id(kwargs),
@@ -292,20 +351,22 @@ class HermesTopicMemoryProvider(MemoryProvider):
         return (
             "# Topic Memory\n"
             "Questions about a named project or topic archive must use topic_memory_recall; "
-            "an exact unique name in the current query overrides session routing. "
-            "The recall query must copy the user's current archive question verbatim; never "
-            "invent or rewrite dates. After a successful recall, return only verbatim_answer "
-            "exactly as received. Never add, remove, infer, normalize, or alter any content from "
-            "it, especially dates, times, or years. topic_memory_topics is for discovery only "
-            "when available names are unknown, not for answering archive questions. Use "
-            "topic_memory_update with supplied verified evidence IDs or during an active user "
-            "turn so the current turn can be captured as evidence. For a user request to add or "
-            "append a subject, item, or note without deleting existing content, you must use "
-            "append_text and must not use topic_memory_recall to obtain the canonical body. Never "
-            "request, expose, summarize, or reconstruct the full canonical document. append_text "
-            "must contain only the minimal user-requested Markdown addition and no invented facts; "
-            "use body only for an intentional complete replacement. Recall and updates are isolated "
-            "to one topic; never infer cross-topic context."
+            "an exact unique name in the current query overrides session routing. Choose the "
+            "minimum sufficient topic set for every question. When several topics are required, "
+            "use topic_memory_recall_multi with a reason for each selection; never automatically "
+            "include general. The recall query must copy the user's current archive question "
+            "verbatim; never invent or rewrite dates. After a successful recall, return only "
+            "verbatim_answer exactly as received. Never add, remove, infer, normalize, or alter "
+            "any content from it, especially dates, times, or years; preserve source labels. "
+            "topic_memory_topics is for discovery only when available names are unknown, not for "
+            "answering archive questions. Use topic_memory_update with supplied verified evidence "
+            "IDs or during an active user turn so the current turn can be captured as evidence. "
+            "For a user request to add or append a subject, item, or note without deleting existing "
+            "content, you must use append_text and must not use topic_memory_recall to obtain the "
+            "canonical body. Never request, expose, summarize, or reconstruct the full canonical "
+            "document. append_text must contain only the minimal user-requested Markdown addition "
+            "and no invented facts; use body only for an intentional complete replacement. Every "
+            "Reader call is isolated to one topic; never infer cross-topic context."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
@@ -526,9 +587,10 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 }
                 self._session_evidence.pop(new_session_id, None)
                 self._session_topics.pop(new_session_id, None)
+                self._session_multi_scopes.pop(new_session_id, None)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [RECALL_SCHEMA, UPDATE_SCHEMA, TOPICS_SCHEMA]
+        return [RECALL_SCHEMA, MULTI_RECALL_SCHEMA, UPDATE_SCHEMA, TOPICS_SCHEMA]
 
     def handle_tool_call(
         self, tool_name: str, args: Dict[str, Any], **kwargs: Any
@@ -552,6 +614,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
         session_id = str(kwargs.get("session_id") or self._current_session_id)
         if tool_name == "topic_memory_recall":
             return self._handle_recall(args, session_id=session_id, kwargs=kwargs)
+        if tool_name == "topic_memory_recall_multi":
+            return self._handle_recall_multi(args, session_id=session_id)
         return self._handle_update(args, session_id=session_id, kwargs=kwargs)
 
     def _handle_recall(
@@ -578,6 +642,9 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 else raw_query
             )
         try:
+            mentioned_topics = self._require_registry().mentioned_topics(route_query)
+            if len(mentioned_topics) > 1:
+                raise MultiTopicRequiredError(mentioned_topics)
             decision = self._route(
                 session_id=session_id,
                 explicit_topic=explicit,
@@ -599,6 +666,13 @@ class HermesTopicMemoryProvider(MemoryProvider):
                     session_id, decision.topic_id, query
                 )
             result = self._require_engine().recall(decision.topic_id, query)
+        except MultiTopicRequiredError as error:
+            return _json_result(
+                {
+                    "error": "multi_topic_required",
+                    "candidate_topic_ids": list(error.topic_ids),
+                }
+            )
         except (KeyError, TypeError, ValueError) as error:
             logger.debug(
                 "Topic-memory recall rejected: %s: %s",
@@ -620,6 +694,73 @@ class HermesTopicMemoryProvider(MemoryProvider):
         ):
             self._remember_session_topic(session_id, decision.topic_id)
         return _json_result(_recall_result(result))
+
+    def _handle_recall_multi(
+        self,
+        args: dict[str, Any],
+        *,
+        session_id: str,
+    ) -> str:
+        raw_query = args.get("query")
+        raw_topics = args.get("topics")
+        if not isinstance(raw_query, str) or not raw_query.strip():
+            return _json_result({"error": "query_required"})
+        if set(args) != {"query", "topics"}:
+            return _json_result({"error": "invalid_request"})
+        if not isinstance(raw_topics, list) or not 1 <= len(raw_topics) <= 8:
+            return _json_result({"error": "invalid_request"})
+
+        selections: list[TopicSelection] = []
+        try:
+            for item in raw_topics:
+                if not isinstance(item, dict) or set(item) != {"topic", "reason"}:
+                    raise ValueError("each selection requires only topic and reason")
+                selections.append(TopicSelection(item["topic"], item["reason"]))
+        except (KeyError, TypeError, ValueError):
+            return _json_result({"error": "invalid_request"})
+
+        registry = self._require_registry()
+        reason_by_topic: dict[str, str] = {}
+        try:
+            for selection in selections:
+                topic_id = registry.resolve_name(
+                    selection.topic_id, context="selected topic"
+                )
+                reason_by_topic.setdefault(topic_id, selection.reason)
+            result = self._require_multi_engine().recall_multi(
+                question=raw_query,
+                selections=tuple(selections),
+                source="hermes",
+                session_ref=session_id,
+            )
+        except AmbiguousRegistryError:
+            return _json_result({"error": "topic_ambiguous"})
+        except TopicRoutingError:
+            return _json_result({"error": "topic_unresolved"})
+        except (KeyError, TypeError, ValueError) as error:
+            logger.debug(
+                "Topic-memory multi recall rejected: %s", type(error).__name__
+            )
+            return _json_result({"error": "invalid_request"})
+        except Exception as error:
+            logger.debug(
+                "Topic-memory multi recall failed: %s", type(error).__name__
+            )
+            return _json_result({"error": "operation_failed"})
+
+        topic_ids = tuple(item.topic_id for item in result.topic_results)
+        if result.query_id is not None:
+            if len(topic_ids) == 1:
+                self._remember_session_topic(session_id, topic_ids[0])
+            else:
+                self._remember_session_multi_scope(session_id, topic_ids)
+        return _json_result(
+            _multi_recall_result(
+                result,
+                registry=self._require_registry(),
+                reasons=reason_by_topic,
+            )
+        )
 
     def _handle_update(
         self,
@@ -841,6 +982,17 @@ class HermesTopicMemoryProvider(MemoryProvider):
     def _remember_session_topic(self, session_id: str, topic_id: str) -> None:
         with self._lock:
             self._session_topics[session_id] = topic_id
+            self._session_multi_scopes.pop(session_id, None)
+
+    def _remember_session_multi_scope(
+        self, session_id: str, topic_ids: tuple[str, ...]
+    ) -> None:
+        if len(topic_ids) < 2:
+            raise ValueError("multi-topic session scope requires at least two topics")
+        with self._lock:
+            self._session_topics.pop(session_id, None)
+            self._session_multi_scopes[session_id] = topic_ids
+            self._routed_archive_queries.pop(session_id, None)
 
     def _remember_routed_archive_query(
         self, session_id: str, topic_id: str, query: str
@@ -875,6 +1027,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         with self._lock:
             context = self._contexts.get(session_id, _SessionContext(None, None))
             current_topic = self._session_topics.get(session_id)
+            multi_scope = self._session_multi_scopes.get(session_id)
         registry = self._require_registry()
         if explicit_topic is not None:
             return registry.route(explicit_topic=explicit_topic)
@@ -882,6 +1035,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
             mentioned_topic = registry.mentioned_topic(query)
             if mentioned_topic is not None:
                 return RouteDecision(mentioned_topic, "query")
+        if multi_scope is not None:
+            raise MultiTopicRequiredError(multi_scope)
         if current_topic is not None:
             return RouteDecision(
                 registry.resolve_name(current_topic, context="session topic"),
@@ -929,6 +1084,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
         with self._lock:
             self._raw_turn_questions.clear()
             self._session_topics.clear()
+            self._session_multi_scopes.clear()
             self._routed_archive_queries.clear()
         if not self._initialized:
             return
@@ -1003,6 +1159,11 @@ class HermesTopicMemoryProvider(MemoryProvider):
         if self._engine is None:
             raise RuntimeError("provider is not initialized")
         return self._engine
+
+    def _require_multi_engine(self) -> MultiRecallEngine:
+        if self._multi_engine is None:
+            raise RuntimeError("provider is not initialized")
+        return self._multi_engine
 
     def _require_store(self) -> FileTopicStore:
         if self._store is None:
@@ -1097,6 +1258,52 @@ def _recall_result(result: RecallResult) -> dict[str, Any]:
             "attempts": result.failure.attempts,
         }
     return value
+
+
+def _multi_recall_result(
+    result: MultiRecallResult,
+    *,
+    registry: TopicRegistry,
+    reasons: dict[str, str],
+) -> dict[str, Any]:
+    configs = {topic.topic_id: topic for topic in registry.topics}
+    topic_results = []
+    for item in result.topic_results:
+        value: dict[str, Any] = {
+            "topic_id": item.topic_id,
+            "display_name": configs[item.topic_id].display_name,
+            "topic_version": item.topic_version,
+            "status": item.status,
+            "source": item.source,
+            "answer": item.answer,
+            "match_kind": item.match_kind,
+            "latency_ms": item.latency_ms,
+            "reason": reasons[item.topic_id],
+        }
+        if item.failure is not None:
+            value["failure"] = {
+                "code": item.failure.code,
+                "message": item.failure.message,
+                "attempts": item.failure.attempts,
+            }
+        topic_results.append(value)
+    response: dict[str, Any] = {
+        "query_id": result.query_id,
+        "verbatim_answer": result.final_answer,
+        "response_policy": (
+            "copy_verbatim_answer_exactly_preserving_dates_times_and_source_labels"
+        ),
+        "topic_results": topic_results,
+        "synthesis_source": result.synthesis_source,
+        "scope_fingerprint": result.scope_fingerprint,
+    }
+    if result.failure is not None:
+        response["failure"] = {
+            "code": result.failure.code,
+            "message": result.failure.message,
+            "attempts": result.failure.attempts,
+        }
+    return response
 
 
 def _normalize_append_text(value: str) -> str:

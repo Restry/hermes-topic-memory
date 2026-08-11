@@ -68,7 +68,13 @@ export HERMES_TOPIC_MEMORY_READER_ENDPOINT=https://reader.example.invalid/v1
 export HERMES_TOPIC_MEMORY_READER_MODEL=reader-model
 export HERMES_TOPIC_MEMORY_API_KEY='set-outside-git'
 hermes-topic-memory --data-root /path/to/data recall 'What is current?' --topic global
+hermes-topic-memory --data-root /path/to/data recall-multi \
+  'Compare the general policy with Project Alpha.' \
+  --topic general --reason 'Policy context is required' \
+  --topic project-alpha --reason 'The project is named'
 ```
+
+`recall-multi` requires one to eight ordered `--topic`/`--reason` pairs. It resolves every ID, alias, or full display name before reading, recalls each resolved topic/version independently, synthesizes only labeled capsules, and emits structured JSON with the `query_id`, scope fingerprint, per-topic statuses/sources, and final answer. No general topic or all-topic search is added implicitly.
 
 Canonical replacements require completed-turn evidence IDs:
 
@@ -84,13 +90,16 @@ hermes-topic-memory --data-root /path/to/data rollback global 1
 
 The Provider reads `$HERMES_HOME/topic-memory/config.json`. Copy `config.example.json` there only on the intended isolated target profile, then adjust non-secret paths and Reader settings. Relative paths resolve under the supplied runtime `hermes_home`; absolute paths are treated as explicit external data roots. Credentials belong only in `HERMES_TOPIC_MEMORY_API_KEY`.
 
-`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Routing priority is an explicit tool topic (ID, alias, or full display name), a unique exact topic name mentioned in the current query, the session's current topic, configured chat ID, configured default, registry default, then `global`. A successful explicit/query recall binds its resolved topic only to that session; a later explicit/query mention replaces it. Unknown or ambiguous named-topic queries fail closed; routing never searches topic bodies or another topic implicitly.
+`initialize()` records the runtime chat ID (`chat_id`, then `user_id`/`user_id_alt`) for that session. Single-topic routing priority is an explicit tool topic (ID, alias, or full display name), a unique exact topic name mentioned in the current query, the session's current topic, configured chat ID, configured default, registry default, then `global`. A successful explicit/query single recall binds its resolved topic only to that session; a later explicit/query mention replaces it. Several valid names return `multi_topic_required` with ordered candidate IDs instead of selecting one. Unknown or conflicting names fail closed; routing never searches topic bodies or another topic implicitly.
 
 The Provider exposes:
 
 - `topic_memory_recall` — synchronous recall from one resolved topic; successful results keep `answer` and expose the identical `verbatim_answer` with `response_policy: "copy_verbatim_answer_exactly"`, which must be relayed without changing any dates, times, or years;
+- `topic_memory_recall_multi` — ordered Agent-selected `{topic, reason}` entries for one to eight topics; each topic is recalled independently, then only labeled capsules are synthesized. Results expose `query_id`, versions/statuses/sources, and a verbatim answer whose dates, times, and source labels must not be changed. Choose the minimum sufficient set and never auto-include `general`;
 - `topic_memory_update` — bounded `append_text` for additive changes without exposing or reconstructing the canonical body, or `body` for intentional full replacement; both modes use supplied verified raw evidence IDs or immediate evidence captured from the active stored user turn;
 - `topic_memory_topics` — discovery-only topic metadata and current versions, never bodies or config.
+
+A current query naming several valid topics is not prefetched as one arbitrary topic. Prefetch returns empty so the Agent can call `topic_memory_recall_multi`; multi-topic session scope is retained separately and never overwrites the single current-topic binding with an arbitrary member.
 
 `queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. `sync_turn()` honors a new unique topic mention, otherwise writes to that session's current topic. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater. `topic_memory_update` requires exactly one of `body` or `append_text`; append mode preserves the complete current body as a byte-identical prefix and normalizes only the new Markdown boundary. Successful explicit updates return `update_mode` (`append` or `replace`), versions, `evidence_ids`, and `evidence_source` (`supplied` or `current_turn`) without returning bodies. Expected rejections use stable safe codes: `invalid_update_arguments`, `current_turn_evidence_unavailable`, `topic_ambiguous`, `topic_unresolved`, `body_unchanged`, `append_duplicate`, `evidence_not_found`, or `evidence_topic_mismatch`; unexpected failures remain redacted as `operation_failed`.
 

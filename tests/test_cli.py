@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_topic_memory.cli import main
 from hermes_topic_memory.evidence import EvidenceLedger
+from hermes_topic_memory.query_history import QueryHistoryStore
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
 from hermes_topic_memory.store import FileTopicStore
 
@@ -12,6 +15,24 @@ from hermes_topic_memory.store import FileTopicStore
 class FixedReader:
     def read(self, request: ReaderRequest) -> ReaderResponse:
         return ReaderResponse(answer="grounded CLI answer", model="cli-fake")
+
+
+class MultiCliReader:
+    def __init__(self) -> None:
+        self.requests: list[ReaderRequest] = []
+
+    def read(self, request: ReaderRequest) -> ReaderResponse:
+        self.requests.append(request)
+        if '"topic_id":"alpha"' in request.prefix:
+            return ReaderResponse(answer="alpha CLI capsule", model="cli-reader")
+        if '"topic_id":"beta"' in request.prefix:
+            return ReaderResponse(answer="beta CLI capsule", model="cli-reader")
+        assert "Alpha private body" not in request.prefix
+        assert "Beta private body" not in request.prefix
+        return ReaderResponse(
+            answer="[Alpha/alpha] alpha CLI capsule; [Beta/beta] beta CLI capsule",
+            model="cli-synthesizer",
+        )
 
 
 def invoke(capsys, argv: list[str], *, reader=None) -> dict:
@@ -120,3 +141,92 @@ def test_cli_import_dry_run_import_and_dashboard(tmp_path: Path, capsys) -> None
     assert dashboard["status"] == "generated"
     assert dashboard["topic_count"] == 1
     assert dashboard["output_bytes"] == len(output.read_bytes())
+
+
+def test_cli_recall_multi_uses_paired_topics_and_returns_structured_json(
+    tmp_path: Path, capsys
+) -> None:
+    data_root = tmp_path / "data"
+    store = FileTopicStore(data_root)
+    store.create_topic(
+        "alpha", "# Alpha\n\nAlpha private body.\n", display_name="Alpha", aliases=("a",)
+    )
+    store.create_topic(
+        "beta", "# Beta\n\nBeta private body.\n", display_name="Beta", aliases=("b",)
+    )
+    (data_root / "topic-registry.json").write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        "topic_id": "alpha",
+                        "display_name": "Alpha",
+                        "aliases": ["a"],
+                        "chat_ids": [],
+                    },
+                    {
+                        "topic_id": "beta",
+                        "display_name": "Beta",
+                        "aliases": ["b"],
+                        "chat_ids": [],
+                    },
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    base = ["--data-root", str(data_root)]
+    reader = MultiCliReader()
+
+    result = invoke(
+        capsys,
+        base
+        + [
+            "recall-multi",
+            "Compare Alpha and Beta.",
+            "--topic",
+            "a",
+            "--reason",
+            "Alpha is named",
+            "--topic",
+            "b",
+            "--reason",
+            "Beta is named",
+        ],
+        reader=reader,
+    )
+
+    assert result["question"] == "Compare Alpha and Beta."
+    assert result["final_answer"] == (
+        "[Alpha/alpha] alpha CLI capsule; [Beta/beta] beta CLI capsule"
+    )
+    assert isinstance(result["query_id"], str) and result["query_id"]
+    assert len(result["scope_fingerprint"]) == 64
+    assert [item["topic_id"] for item in result["topic_results"]] == ["alpha", "beta"]
+    assert [item["topic_version"] for item in result["topic_results"]] == [1, 1]
+    assert [item["source"] for item in result["topic_results"]] == ["reader", "reader"]
+    assert all("body" not in item for item in result["topic_results"])
+    records = QueryHistoryStore(data_root).list()
+    assert len(records) == 1
+    assert records[0].source == "cli"
+    assert dict(records[0].selection_reasons) == {
+        "alpha": "Alpha is named",
+        "beta": "Beta is named",
+    }
+
+    with pytest.raises(ValueError, match="same number"):
+        main(
+            base
+            + [
+                "recall-multi",
+                "Compare Alpha and Beta.",
+                "--topic",
+                "alpha",
+                "--topic",
+                "beta",
+                "--reason",
+                "only one reason",
+            ],
+            reader=reader,
+        )

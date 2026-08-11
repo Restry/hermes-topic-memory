@@ -18,6 +18,7 @@ memory_provider = pytest.importorskip("agent.memory_provider")
 from hermes_topic_memory.evidence import EvidenceLedger
 from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.importer import import_markdown_directory
+from hermes_topic_memory.query_history import QueryHistoryStore
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
 from hermes_topic_memory.store import FileTopicStore
 from hermes_topic_memory.updater import UpdateProposal
@@ -43,6 +44,31 @@ class ExactAnswerReader(TopicReader):
     def read(self, request: ReaderRequest) -> ReaderResponse:
         self.requests.append(request)
         return ReaderResponse(answer=self.answer, model="fake-reader")
+
+
+class LabeledSynthesizer:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def synthesize(self, request) -> ReaderResponse:
+        self.requests.append(request)
+        answer = "; ".join(
+            f"{capsule.label} {capsule.answer or capsule.status}"
+            for capsule in request.capsules
+        )
+        return ReaderResponse(answer=answer, model="fake-synthesizer")
+
+
+class TemporalTopicReader(TopicReader):
+    def read(self, request: ReaderRequest) -> ReaderResponse:
+        self.requests.append(request)
+        marker = '"topic_id":"'
+        topic_id = request.prefix.split(marker, 1)[1].split('"', 1)[0]
+        answers = {
+            "alpha": "2031-07-08 09:45，Alpha archived.",
+            "beta": "2032-10-11 16:30，Beta archived.",
+        }
+        return ReaderResponse(answer=answers[topic_id], model="temporal-reader")
 
 
 class BlockingReader(TopicReader):
@@ -124,10 +150,13 @@ def configured_provider(
     *,
     reader=None,
     updater=None,
+    synthesizer=None,
     name: str = "profile",
 ) -> tuple[HermesTopicMemoryProvider, Path, Path]:
     hermes_home, data_root = make_profile(tmp_path, name=name)
-    provider = HermesTopicMemoryProvider(reader=reader or TopicReader(), updater=updater)
+    provider = HermesTopicMemoryProvider(
+        reader=reader or TopicReader(), updater=updater, synthesizer=synthesizer
+    )
     provider.save_config(
         {
             "data_root": "topic-memory/data",
@@ -534,6 +563,7 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
     provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
     assert [schema["name"] for schema in provider.get_tool_schemas()] == [
         "topic_memory_recall",
+        "topic_memory_recall_multi",
         "topic_memory_update",
         "topic_memory_topics",
     ]
@@ -1204,7 +1234,10 @@ def test_recall_query_ambiguous_or_unknown_topic_never_uses_session_fallback(
         )
     )
 
-    assert ambiguous == {"error": "invalid_request"}
+    assert ambiguous == {
+        "error": "multi_topic_required",
+        "candidate_topic_ids": ["alpha", "beta"],
+    }
     assert unknown == {"error": "invalid_request"}
     assert reader.requests == []
     provider.shutdown()
@@ -1352,3 +1385,271 @@ def test_config_schema_marks_only_api_key_secret_and_non_primary_context_skips_w
     provider.sync_turn("private transient prompt", "answer", session_id="subagent-session")
     provider.shutdown()
     assert EvidenceLedger(data_root).records("alpha") == ()
+
+
+
+def test_multi_recall_schema_and_prompt_choose_minimum_sufficient_topics() -> None:
+    provider = HermesTopicMemoryProvider(reader=TopicReader())
+    schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
+    schema = schemas["topic_memory_recall_multi"]
+    parameters = schema["parameters"]
+    topics = parameters["properties"]["topics"]
+    item = topics["items"]
+    prompt = provider.system_prompt_block().casefold()
+
+    assert parameters["required"] == ["query", "topics"]
+    assert topics["type"] == "array"
+    assert (topics["minItems"], topics["maxItems"]) == (1, 8)
+    assert item["required"] == ["topic", "reason"]
+    assert item["properties"]["topic"]["type"] == "string"
+    assert item["properties"]["reason"]["type"] == "string"
+    assert item["additionalProperties"] is False
+    assert "minimum sufficient topic set" in prompt
+    assert "topic_memory_recall_multi" in prompt
+    assert "several topics" in prompt
+    assert "never automatically include general" in prompt
+    assert "dates, times" in schema["description"].casefold()
+    assert "source labels" in schema["description"].casefold()
+
+
+def test_multi_tool_returns_labeled_body_free_result_and_persists_query(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    synthesizer = LabeledSynthesizer()
+    provider, hermes_home, data_root = configured_provider(
+        tmp_path, reader=reader, synthesizer=synthesizer
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Compare Alpha and Beta exactly.",
+                "topics": [
+                    {"topic": "a", "reason": "Alpha is named"},
+                    {"topic": "b", "reason": "Beta is named"},
+                ],
+            },
+            session_id="session-a",
+        )
+    )
+    provider.shutdown()
+
+    assert result["verbatim_answer"] == (
+        "[Alpha/alpha] answer from alpha; [Beta/beta] answer from beta"
+    )
+    assert result["response_policy"] == (
+        "copy_verbatim_answer_exactly_preserving_dates_times_and_source_labels"
+    )
+    assert isinstance(result["query_id"], str) and result["query_id"]
+    assert [item["topic_id"] for item in result["topic_results"]] == ["alpha", "beta"]
+    assert [item["topic_version"] for item in result["topic_results"]] == [1, 1]
+    assert [item["status"] for item in result["topic_results"]] == [
+        "answered",
+        "answered",
+    ]
+    assert [item["source"] for item in result["topic_results"]] == ["reader", "reader"]
+    assert [item["reason"] for item in result["topic_results"]] == [
+        "Alpha is named",
+        "Beta is named",
+    ]
+    assert "body" not in result
+    assert all("body" not in item for item in result["topic_results"])
+    assert len(reader.requests) == 2
+    assert "Alpha canonical fact" in reader.requests[0].prefix
+    assert "Beta canonical fact" not in reader.requests[0].prefix
+    assert "Beta canonical fact" in reader.requests[1].prefix
+    assert "Alpha canonical fact" not in reader.requests[1].prefix
+    records = QueryHistoryStore(data_root).list()
+    assert len(records) == 1 and records[0].query_id == result["query_id"]
+
+
+def test_multi_tool_allows_one_topic_and_rejects_unknown_or_ambiguous_before_reader(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(
+        tmp_path, reader=reader, synthesizer=LabeledSynthesizer()
+    )
+    registry_path = data_root / "topic-registry.json"
+    registry_value = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry_value["topics"][0]["display_name"] = "Shared"
+    registry_value["topics"][1]["display_name"] = "Shared"
+    registry_path.write_text(json.dumps(registry_value) + "\n", encoding="utf-8")
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+
+    one = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Alpha only",
+                "topics": [{"topic": "a", "reason": "only Alpha is needed"}],
+            },
+            session_id="session-a",
+        )
+    )
+    request_count = len(reader.requests)
+    unknown = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "compare",
+                "topics": [
+                    {"topic": "alpha", "reason": "valid"},
+                    {"topic": "missing", "reason": "unknown"},
+                ],
+            },
+            session_id="session-a",
+        )
+    )
+    ambiguous = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Shared",
+                "topics": [{"topic": "Shared", "reason": "conflicting name"}],
+            },
+            session_id="session-a",
+        )
+    )
+
+    assert [item["topic_id"] for item in one["topic_results"]] == ["alpha"]
+    assert provider._session_topics == {"session-a": "alpha"}
+    assert unknown == {"error": "topic_unresolved"}
+    assert ambiguous == {"error": "topic_ambiguous"}
+    assert len(reader.requests) == request_count
+    provider.shutdown()
+
+
+def test_single_tool_reports_multi_topic_required_even_with_explicit_topic(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {
+                "query": "Compare Beta with Alpha.",
+                "topic": "alpha",
+            },
+            session_id="session-a",
+        )
+    )
+
+    assert result == {
+        "error": "multi_topic_required",
+        "candidate_topic_ids": ["beta", "alpha"],
+    }
+    assert reader.requests == []
+    provider.shutdown()
+
+
+def test_multi_topic_prefetch_fails_open_without_arbitrary_session_topic(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    query = "Compare Alpha and Beta project archives."
+
+    provider.on_turn_start(1, query, session_id="session-a")
+    provider.queue_prefetch(query, session_id="session-a")
+
+    assert provider.prefetch(query, session_id="session-a") == ""
+    assert provider._session_topics == {}
+    assert provider._routed_archive_queries == {}
+    assert reader.requests == []
+    provider.shutdown()
+
+
+def test_multi_scope_does_not_collapse_and_new_single_topic_overrides_it(
+    tmp_path: Path,
+) -> None:
+    reader = TopicReader()
+    provider, hermes_home, _data_root = configured_provider(
+        tmp_path, reader=reader, synthesizer=LabeledSynthesizer()
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    first = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "Alpha status", "topic": "alpha"},
+            session_id="session-a",
+        )
+    )
+    assert first["topic_id"] == "alpha"
+
+    multi = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Compare Alpha and Beta",
+                "topics": [
+                    {"topic": "alpha", "reason": "named"},
+                    {"topic": "beta", "reason": "named"},
+                ],
+            },
+            session_id="session-a",
+        )
+    )
+    follow_up = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What about that scope?"},
+            session_id="session-a",
+        )
+    )
+
+    assert multi["verbatim_answer"]
+    assert provider._session_topics == {}
+    assert provider._session_multi_scopes == {"session-a": ("alpha", "beta")}
+    assert follow_up == {
+        "error": "multi_topic_required",
+        "candidate_topic_ids": ["alpha", "beta"],
+    }
+
+    switched = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "What is archived for Beta?"},
+            session_id="session-a",
+        )
+    )
+    assert switched["topic_id"] == "beta"
+    assert provider._session_topics == {"session-a": "beta"}
+    assert provider._session_multi_scopes == {}
+    provider.shutdown()
+
+
+def test_multi_tool_preserves_exact_dates_times_and_source_labels(tmp_path: Path) -> None:
+    reader = TemporalTopicReader()
+    provider, hermes_home, _data_root = configured_provider(
+        tmp_path, reader=reader, synthesizer=LabeledSynthesizer()
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Compare the exact Alpha and Beta archive times.",
+                "topics": [
+                    {"topic": "alpha", "reason": "exact Alpha time"},
+                    {"topic": "beta", "reason": "exact Beta time"},
+                ],
+            },
+            session_id="session-a",
+        )
+    )
+
+    assert result["verbatim_answer"] == (
+        "[Alpha/alpha] 2031-07-08 09:45，Alpha archived.; "
+        "[Beta/beta] 2032-10-11 16:30，Beta archived."
+    )
+    assert result["response_policy"].endswith("dates_times_and_source_labels")
+    provider.shutdown()

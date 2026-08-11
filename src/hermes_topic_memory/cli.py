@@ -10,10 +10,12 @@ from typing import Sequence
 from .cache import QuestionCache
 from .dashboard import generate_dashboard
 from .engine import RecallEngine
+from .multi_recall import MultiRecallEngine, ReaderCapsuleSynthesizer, TopicSelection
 from .evidence import EvidenceLedger
 from .operations import apply_evidence_update
 from .importer import import_markdown_directory
 from .reader import OpenAICompatibleReader, Reader
+from .query_history import QueryHistoryStore
 from .router import TopicRegistry
 from .store import FileTopicStore
 from .validation import validate_data_root
@@ -38,6 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("query")
     recall.add_argument("--topic")
     recall.add_argument("--chat-id")
+
+    recall_multi = subparsers.add_parser(
+        "recall-multi", help="Recall independently from one to eight selected topics"
+    )
+    recall_multi.add_argument("query")
+    recall_multi.add_argument("--topic", action="append", required=True)
+    recall_multi.add_argument("--reason", action="append", required=True)
 
     update = subparsers.add_parser("update", help="Apply an evidence-backed replacement")
     update.add_argument("topic")
@@ -74,6 +83,8 @@ def main(argv: Sequence[str] | None = None, *, reader: Reader | None = None) -> 
         result = _topics(data_root)
     elif args.command == "recall":
         result = _recall(data_root, args, reader)
+    elif args.command == "recall-multi":
+        result = _recall_multi(data_root, args, reader)
     elif args.command == "update":
         result = _update(data_root, args)
     elif args.command == "rollback":
@@ -167,6 +178,71 @@ def _recall(data_root: Path, args: argparse.Namespace, reader: Reader | None) ->
         "topic_version": result.topic_version,
         "answer": result.answer,
         "source": result.source,
+    }
+    if result.failure is not None:
+        response["failure"] = {
+            "code": result.failure.code,
+            "message": result.failure.message,
+            "attempts": result.failure.attempts,
+        }
+    return response
+
+
+def _recall_multi(data_root: Path, args: argparse.Namespace, reader: Reader | None) -> dict:
+    if len(args.topic) != len(args.reason):
+        raise ValueError("--topic and --reason must be supplied the same number of times")
+    if not 1 <= len(args.topic) <= 8:
+        raise ValueError("recall-multi requires 1 to 8 topic/reason pairs")
+    registry = TopicRegistry.from_file(_registry_path(data_root))
+    active_reader = reader or _reader_from_environment()
+    selections = tuple(
+        TopicSelection(topic, reason)
+        for topic, reason in zip(args.topic, args.reason, strict=True)
+    )
+    result = MultiRecallEngine(
+        recall_engine=RecallEngine(
+            store=FileTopicStore(data_root),
+            cache=QuestionCache(data_root),
+            reader=active_reader,
+        ),
+        registry=registry,
+        synthesizer=ReaderCapsuleSynthesizer(active_reader),
+        query_history=QueryHistoryStore(data_root),
+    ).recall_multi(
+        question=args.query,
+        selections=selections,
+        source="cli",
+    )
+    reasons: dict[str, str] = {}
+    for selection in selections:
+        topic_id = registry.resolve_name(selection.topic_id, context="selected topic")
+        reasons.setdefault(topic_id, selection.reason)
+    topic_results = []
+    for item in result.topic_results:
+        value = {
+            "topic_id": item.topic_id,
+            "topic_version": item.topic_version,
+            "status": item.status,
+            "answer": item.answer,
+            "source": item.source,
+            "match_kind": item.match_kind,
+            "latency_ms": item.latency_ms,
+            "reason": reasons[item.topic_id],
+        }
+        if item.failure is not None:
+            value["failure"] = {
+                "code": item.failure.code,
+                "message": item.failure.message,
+                "attempts": item.failure.attempts,
+            }
+        topic_results.append(value)
+    response = {
+        "question": result.question,
+        "query_id": result.query_id,
+        "final_answer": result.final_answer,
+        "synthesis_source": result.synthesis_source,
+        "scope_fingerprint": result.scope_fingerprint,
+        "topic_results": topic_results,
     }
     if result.failure is not None:
         response["failure"] = {
