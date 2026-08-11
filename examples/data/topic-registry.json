@@ -1,0 +1,33 @@
+{
+  "default_topic": "global",
+  "topics": [
+    {
+      "topic_id": "gsk-d360",
+      "display_name": "GSK D360 Synthetic Fixture",
+      "aliases": ["d360", "gsk-demo"],
+      "chat_ids": ["fixture-chat-gsk"],
+      "synthetic": true
+    },
+    {
+      "topic_id": "mindmemos",
+      "display_name": "MindMemos Synthetic Fixture",
+      "aliases": ["memory-demo"],
+      "chat_ids": ["fixture-chat-mindmemos"],
+      "synthetic": true
+    },
+    {
+      "topic_id": "growlog",
+      "display_name": "GrowLog Synthetic Fixture",
+      "aliases": ["growth-demo"],
+      "chat_ids": ["fixture-chat-growlog"],
+      "synthetic": true
+    },
+    {
+      "topic_id": "global",
+      "display_name": "Global Synthetic Fixture",
+      "aliases": ["common-demo"],
+      "chat_ids": [],
+      "synthetic": true
+    }
+  ]
+}
