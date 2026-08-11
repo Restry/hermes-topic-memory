@@ -172,6 +172,10 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
     recall_description = schemas["topic_memory_recall"]["description"].casefold()
     topics_description = schemas["topic_memory_topics"]["description"].casefold()
     update_schema = schemas["topic_memory_update"]
+    update_description = update_schema["description"].casefold()
+    update_properties = update_schema["parameters"]["properties"]
+    body_description = update_properties["body"]["description"].casefold()
+    append_description = update_properties["append_text"]["description"].casefold()
 
     query_description = schemas["topic_memory_recall"]["parameters"]["properties"]["query"][
         "description"
@@ -191,8 +195,18 @@ def test_prompt_and_tool_descriptions_route_named_archives_to_recall() -> None:
         assert "return only verbatim_answer exactly as received" in instruction
         assert "never add, remove, infer, normalize, or alter" in instruction
         assert "dates, times, or years" in instruction
-    assert "evidence_ids" not in update_schema["parameters"]["required"]
-    assert "current user turn" in update_schema["description"].casefold()
+    assert update_schema["parameters"]["required"] == ["reason"]
+    assert "body" in update_properties and "append_text" in update_properties
+    assert update_properties["append_text"]["maxLength"] > 0
+    assert "current user turn" in update_description
+    assert "exactly one" in update_description
+    assert "intentional complete replacement" in body_description
+    assert "minimal user-requested markdown addition" in append_description
+    assert "no invented facts" in append_description
+    for instruction in (prompt, update_description):
+        assert "must use append_text" in instruction
+        assert "must not use topic_memory_recall" in instruction
+        assert "request, expose, summarize, or reconstruct" in instruction
 
 
 def test_successful_recall_exposes_exact_verbatim_relay_contract(tmp_path: Path) -> None:
@@ -367,17 +381,23 @@ def test_tools_recall_topics_and_evidence_backed_explicit_update(tmp_path: Path)
     assert FileTopicStore(data_root).get_topic("alpha").metadata.version == 2
     assert update["evidence_ids"] == [evidence.evidence_id]
     assert update["evidence_source"] == "supplied"
+    assert update["update_mode"] == "replace"
+    assert "body" not in update and "append_text" not in update
 
     unknown = json.loads(provider.handle_tool_call("unknown", {}))
     assert unknown == {"error": "unknown_tool"}
     provider.shutdown()
 
 
-def test_same_turn_update_without_evidence_ids_persists_raw_user_evidence(
+def test_same_turn_append_without_evidence_ids_preserves_body_and_audits(
     tmp_path: Path,
 ) -> None:
-    provider, hermes_home, data_root = configured_provider(tmp_path)
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
     provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    store = FileTopicStore(data_root)
+    old_body = store.get_topic("alpha").body
+    append_text = "## Subjects\n\n- Information technology"
     raw_user_turn = "Please add information technology to Alpha."
     provider.on_turn_start(1, raw_user_turn, session_id="session-a")
 
@@ -386,26 +406,241 @@ def test_same_turn_update_without_evidence_ids_persists_raw_user_evidence(
             "topic_memory_update",
             {
                 "topic": "alpha",
-                "body": "# Alpha\n\nAlpha canonical fact.\n\n- Information technology\n",
+                "append_text": append_text,
                 "reason": "The current user explicitly requested this addition.",
             },
             session_id="session-a",
         )
     )
 
+    expected_body = old_body + "\n" + append_text + "\n"
     assert update["status"] == "updated"
+    assert update["update_mode"] == "append"
     assert (update["previous_version"], update["current_version"]) == (1, 2)
     assert update["evidence_source"] == "current_turn"
     assert len(update["evidence_ids"]) == 1
-    assert "body" not in update and "reason" not in update
+    assert "body" not in update and "append_text" not in update and "reason" not in update
+    assert reader.requests == []
     records = EvidenceLedger(data_root).records("alpha")
     assert [record.evidence_id for record in records] == update["evidence_ids"]
     assert [(record.session_id, record.user_text, record.assistant_text) for record in records] == [
         ("session-a", raw_user_turn, "")
     ]
+    memory = store.get_topic("alpha")
+    assert memory.metadata.version == 2
+    assert memory.body.encode("utf-8").startswith(old_body.encode("utf-8"))
+    assert memory.body == expected_body
+    assert store.get_topic("beta").body == "# Beta\n\nBeta canonical fact.\n"
+    audit = json.loads(
+        (data_root / "update-proposals" / "alpha.jsonl").read_text(encoding="utf-8")
+    )
+    assert audit["status"] == "applied"
+    assert audit["evidence_ids"] == update["evidence_ids"]
+    assert (audit["previous_version"], audit["current_version"]) == (1, 2)
+    assert audit["proposed_body"] == expected_body
+    provider.shutdown()
+
+@pytest.mark.parametrize(
+    ("old_body", "append_text", "expected_suffix"),
+    [
+        (
+            "# Alpha\n\nNo terminal newline.",
+            "\n## Added\n\n- item\n\n",
+            "\n\n## Added\n\n- item\n",
+        ),
+        (
+            "# Alpha\n\nOne terminal newline.\n",
+            "## Added\n\n- item",
+            "\n## Added\n\n- item\n",
+        ),
+        (
+            "# Alpha\n\nBlank line already.\n\n",
+            "\n## Added\n\n- item\n",
+            "## Added\n\n- item\n",
+        ),
+    ],
+)
+def test_append_newline_boundary_is_deterministic(
+    tmp_path: Path,
+    old_body: str,
+    append_text: str,
+    expected_suffix: str,
+) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    store = FileTopicStore(data_root)
+    initial = store.update_topic("alpha", old_body)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    provider.on_turn_start(1, "Add one item to Alpha.", session_id="session-a")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "topic": "alpha",
+                "append_text": append_text,
+                "reason": "The user requested the item.",
+            },
+            session_id="session-a",
+        )
+    )
+
+    memory = store.get_topic("alpha")
+    assert result["update_mode"] == "append"
+    assert (result["previous_version"], result["current_version"]) == (
+        initial.metadata.version,
+        initial.metadata.version + 1,
+    )
+    assert memory.body.encode("utf-8").startswith(old_body.encode("utf-8"))
+    assert memory.body == old_body + expected_suffix
+    provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "update_args",
+    [
+        {"reason": "No content argument."},
+        {
+            "body": "# Alpha\n\nReplacement.\n",
+            "append_text": "- Addition",
+            "reason": "Conflicting content arguments.",
+        },
+    ],
+)
+def test_update_requires_exactly_one_body_or_append_text(
+    tmp_path: Path,
+    update_args: dict[str, str],
+) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    provider.on_turn_start(1, "Change Alpha.", session_id="session-a")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {"topic": "alpha", **update_args},
+            session_id="session-a",
+        )
+    )
+
+    assert result == {"error": "invalid_update_arguments"}
+    assert FileTopicStore(data_root).get_topic("alpha").metadata.version == 1
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    provider.shutdown()
+
+
+def test_empty_and_oversized_appends_fail_without_writes(tmp_path: Path) -> None:
+    provider, hermes_home, data_root = configured_provider(tmp_path)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    provider.on_turn_start(1, "Add a bounded item to Alpha.", session_id="session-a")
+    update_schema = {
+        schema["name"]: schema for schema in provider.get_tool_schemas()
+    }["topic_memory_update"]
+    max_append_chars = update_schema["parameters"]["properties"]["append_text"][
+        "maxLength"
+    ]
+
+    for append_text in ("", " \n\t", "x" * (max_append_chars + 1)):
+        result = json.loads(
+            provider.handle_tool_call(
+                "topic_memory_update",
+                {
+                    "topic": "alpha",
+                    "append_text": append_text,
+                    "reason": "The user requested this addition.",
+                },
+                session_id="session-a",
+            )
+        )
+        assert result == {"error": "invalid_update_arguments"}
+
+    assert FileTopicStore(data_root).get_topic("alpha").metadata.version == 1
+    assert EvidenceLedger(data_root).records("alpha") == ()
+    assert not (data_root / "update-proposals" / "alpha.jsonl").exists()
+    provider.shutdown()
+
+
+def test_duplicate_append_has_specific_error_and_no_partial_write(tmp_path: Path) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    append_text = "- Information technology"
+    args = {
+        "topic": "alpha",
+        "append_text": append_text,
+        "reason": "The user requested this subject.",
+    }
+    provider.on_turn_start(1, "Add information technology.", session_id="session-a")
+    first = json.loads(
+        provider.handle_tool_call("topic_memory_update", args, session_id="session-a")
+    )
+    provider.on_turn_start(2, "Add information technology again.", session_id="session-a")
+
+    duplicate = json.loads(
+        provider.handle_tool_call("topic_memory_update", args, session_id="session-a")
+    )
+
+    assert first["status"] == "updated"
+    assert duplicate == {"error": "append_duplicate"}
     memory = FileTopicStore(data_root).get_topic("alpha")
     assert memory.metadata.version == 2
-    assert memory.body.endswith("- Information technology\n")
+    assert memory.body.count(append_text) == 1
+    assert len(EvidenceLedger(data_root).records("alpha")) == 1
+    audit_lines = (data_root / "update-proposals" / "alpha.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(audit_lines) == 1
+    assert reader.requests == []
+    provider.shutdown()
+
+
+def test_append_uses_session_topic_and_invalidates_its_stale_cache(tmp_path: Path) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    provider.initialize("session-a", hermes_home=str(hermes_home), chat_id="chat-alpha")
+    store = FileTopicStore(data_root)
+    old_alpha = store.get_topic("alpha")
+    old_beta = store.get_topic("beta")
+    before = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status", "topic": "beta"},
+            session_id="session-a",
+        )
+    )
+    provider.on_turn_start(1, "Add the new Beta item.", session_id="session-a")
+
+    update = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_update",
+            {
+                "append_text": "- New Beta item",
+                "reason": "The current user requested this Beta addition.",
+            },
+            session_id="session-a",
+        )
+    )
+    provider.on_turn_start(2, "", session_id="session-a")
+    after = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status"},
+            session_id="session-a",
+        )
+    )
+
+    assert before["source"] == after["source"] == "reader"
+    assert (before["topic_version"], after["topic_version"]) == (1, 2)
+    assert update["topic_id"] == "beta"
+    assert update["update_mode"] == "append"
+    assert len(reader.requests) == 2
+    assert store.get_topic("alpha") == old_alpha
+    beta = store.get_topic("beta")
+    assert beta.body.encode("utf-8").startswith(old_beta.body.encode("utf-8"))
+    assert beta.metadata.version == old_beta.metadata.version + 1
+    assert [record.topic_version for record in QuestionCache(data_root).records("beta")] == [
+        1,
+        2,
+    ]
     provider.shutdown()
 
 

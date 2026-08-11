@@ -49,6 +49,7 @@ _CONFIG_KEYS = {
 }
 
 _MAX_UPDATE_BODY_CHARS = 200_000
+_MAX_APPEND_TEXT_CHARS = 20_000
 _MISSING = object()
 
 RECALL_SCHEMA = {
@@ -83,14 +84,33 @@ RECALL_SCHEMA = {
 UPDATE_SCHEMA = {
     "name": "topic_memory_update",
     "description": (
-        "Replace one canonical topic using supplied verified raw evidence IDs, or evidence "
-        "captured from the active current user turn when evidence IDs are omitted."
+        "Safely update one canonical topic using supplied verified raw evidence IDs, or evidence "
+        "captured from the active current user turn when evidence IDs are omitted. Exactly one "
+        "of body or append_text is required. For a request to add or append a subject, item, or "
+        "note without deleting existing content, the agent must use append_text and must not use "
+        "topic_memory_recall to obtain the canonical body. Never request, expose, summarize, or "
+        "reconstruct the full canonical document."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "topic": {"type": "string", "description": "Optional topic ID or alias."},
-            "body": {"type": "string", "description": "Complete replacement Markdown body."},
+            "body": {
+                "type": "string",
+                "maxLength": _MAX_UPDATE_BODY_CHARS,
+                "description": (
+                    "Complete replacement Markdown body; use only for an intentional complete "
+                    "replacement, never for an additive request."
+                ),
+            },
+            "append_text": {
+                "type": "string",
+                "maxLength": _MAX_APPEND_TEXT_CHARS,
+                "description": (
+                    "Only the minimal user-requested Markdown addition, with no invented facts "
+                    "and none of the existing canonical body."
+                ),
+            },
             "evidence_ids": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -100,9 +120,9 @@ UPDATE_SCHEMA = {
                     "Optional verified raw evidence IDs. Omit only during an active user turn."
                 ),
             },
-            "reason": {"type": "string", "description": "Why the evidence requires this replacement."},
+            "reason": {"type": "string", "description": "Why the evidence requires this update."},
         },
-        "required": ["body", "reason"],
+        "required": ["reason"],
         "additionalProperties": False,
     },
 }
@@ -271,8 +291,13 @@ class HermesTopicMemoryProvider(MemoryProvider):
             "it, especially dates, times, or years. topic_memory_topics is for discovery only "
             "when available names are unknown, not for answering archive questions. Use "
             "topic_memory_update with supplied verified evidence IDs or during an active user "
-            "turn so the current turn can be captured as evidence. Recall is isolated to one "
-            "topic; never infer cross-topic context."
+            "turn so the current turn can be captured as evidence. For a user request to add or "
+            "append a subject, item, or note without deleting existing content, you must use "
+            "append_text and must not use topic_memory_recall to obtain the canonical body. Never "
+            "request, expose, summarize, or reconstruct the full canonical document. append_text "
+            "must contain only the minimal user-requested Markdown addition and no invented facts; "
+            "use body only for an intentional complete replacement. Recall and updates are isolated "
+            "to one topic; never infer cross-topic context."
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
@@ -526,25 +551,54 @@ class HermesTopicMemoryProvider(MemoryProvider):
         session_id: str,
         kwargs: dict[str, Any],
     ) -> str:
-        body = args.get("body")
+        raw_body = args.get("body", _MISSING)
+        raw_append_text = args.get("append_text", _MISSING)
         reason = args.get("reason")
+        body_supplied = raw_body is not _MISSING
+        append_supplied = raw_append_text is not _MISSING
         with self._lock:
             raw_turn = self._raw_turn_questions.get(session_id)
         private_values = tuple(
-            value for value in (body, reason, raw_turn) if isinstance(value, str) and value
+            value
+            for value in (raw_body, raw_append_text, reason, raw_turn)
+            if isinstance(value, str) and value
         )
-        if (
-            not isinstance(body, str)
-            or not body.strip()
-            or len(body) > _MAX_UPDATE_BODY_CHARS
-            or not isinstance(reason, str)
-            or not reason.strip()
-        ):
+        if body_supplied == append_supplied:
             return self._update_failure_result(
                 "invalid_update_arguments",
-                ValueError("body and reason must be non-empty and within limits"),
+                ValueError("exactly one of body or append_text must be supplied"),
                 private_values=private_values,
             )
+        if not isinstance(reason, str) or not reason.strip():
+            return self._update_failure_result(
+                "invalid_update_arguments",
+                ValueError("reason must be non-empty"),
+                private_values=private_values,
+            )
+        if body_supplied:
+            if (
+                not isinstance(raw_body, str)
+                or not raw_body.strip()
+                or len(raw_body) > _MAX_UPDATE_BODY_CHARS
+            ):
+                return self._update_failure_result(
+                    "invalid_update_arguments",
+                    ValueError("body must be non-empty and within limits"),
+                    private_values=private_values,
+                )
+            update_mode = "replace"
+        else:
+            if (
+                not isinstance(raw_append_text, str)
+                or not raw_append_text.strip()
+                or len(raw_append_text) > _MAX_APPEND_TEXT_CHARS
+            ):
+                return self._update_failure_result(
+                    "invalid_update_arguments",
+                    ValueError("append_text must be non-empty and within limits"),
+                    private_values=private_values,
+                )
+            update_mode = "append"
 
         raw_topic = args.get("topic", _MISSING)
         if raw_topic is not _MISSING and (
@@ -591,12 +645,29 @@ class HermesTopicMemoryProvider(MemoryProvider):
 
         try:
             memory = self._require_store().get_topic(decision.topic_id)
-            if body == memory.body:
-                return self._update_failure_result(
-                    "body_unchanged",
-                    ValueError("replacement body must differ from current body"),
-                    private_values=private_values,
-                )
+            if update_mode == "replace":
+                replacement_body = raw_body
+                if replacement_body == memory.body:
+                    return self._update_failure_result(
+                        "body_unchanged",
+                        ValueError("replacement body must differ from current body"),
+                        private_values=private_values,
+                    )
+            else:
+                addition = _normalize_append_text(raw_append_text)
+                if _contains_markdown_block(memory.body, addition):
+                    return self._update_failure_result(
+                        "append_duplicate",
+                        ValueError("append_text already exists as a canonical Markdown block"),
+                        private_values=private_values,
+                    )
+                replacement_body = _append_markdown(memory.body, addition)
+                if len(replacement_body) > _MAX_UPDATE_BODY_CHARS:
+                    return self._update_failure_result(
+                        "invalid_update_arguments",
+                        ValueError("appended body exceeds maximum size"),
+                        private_values=private_values,
+                    )
 
             if evidence_supplied:
                 evidence_ids = tuple(raw_evidence_ids)
@@ -621,7 +692,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 store=self._require_store(),
                 ledger=self._require_ledger(),
                 topic_id=decision.topic_id,
-                body=body,
+                body=replacement_body,
                 evidence_ids=evidence_ids,
                 reason=reason,
             )
@@ -659,6 +730,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
             {
                 "status": result.status,
                 "topic_id": result.topic_id,
+                "update_mode": update_mode,
                 "previous_version": result.previous_version,
                 "current_version": result.current_version,
                 "evidence_ids": list(result.evidence_ids),
@@ -941,6 +1013,32 @@ def _recall_result(result: RecallResult) -> dict[str, Any]:
             "attempts": result.failure.attempts,
         }
     return value
+
+
+def _normalize_append_text(value: str) -> str:
+    return value.strip("\r\n")
+
+
+def _contains_markdown_block(body: str, addition: str) -> bool:
+    position = body.find(addition)
+    while position >= 0:
+        end = position + len(addition)
+        starts_on_boundary = position == 0 or body[position - 1] in "\r\n"
+        ends_on_boundary = end == len(body) or body[end] in "\r\n"
+        if starts_on_boundary and ends_on_boundary:
+            return True
+        position = body.find(addition, position + 1)
+    return False
+
+
+def _append_markdown(body: str, addition: str) -> str:
+    if body.endswith(("\n\n", "\r\n\r\n", "\r\r")):
+        separator = ""
+    elif body.endswith(("\n", "\r")):
+        separator = "\n"
+    else:
+        separator = "\n\n"
+    return f"{body}{separator}{addition}\n"
 
 
 def _json_result(value: Any) -> str:
