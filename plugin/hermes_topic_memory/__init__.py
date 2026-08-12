@@ -7,6 +7,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,7 @@ from hermes_topic_memory.multi_recall import (
 )
 from hermes_topic_memory.operations import apply_evidence_update
 from hermes_topic_memory.reader import OpenAICompatibleReader, Reader, ReaderRequest
-from hermes_topic_memory.query_history import QueryHistoryStore
+from hermes_topic_memory.query_history import QueryHistoryStore, QueryRecord, TopicQueryResult
 from hermes_topic_memory.router import (
     AmbiguousRegistryError,
     MultiTopicRequiredError,
@@ -60,6 +61,15 @@ _CONFIG_KEYS = {
 _MAX_UPDATE_BODY_CHARS = 200_000
 _MAX_APPEND_TEXT_CHARS = 20_000
 _MISSING = object()
+
+_SINGLE_RECALL_SELECTION_REASONS = {
+    "explicit": "explicit topic argument",
+    "query": "topic named in recall question",
+    "session": "active session topic",
+    "chat_id": "configured chat topic",
+    "default": "configured default topic",
+    "global": "global fallback topic",
+}
 
 RECALL_SCHEMA = {
     "name": "topic_memory_recall",
@@ -680,6 +690,7 @@ class HermesTopicMemoryProvider(MemoryProvider):
             not isinstance(explicit, str) or not explicit.strip()
         ):
             return _json_result({"error": "invalid_request"})
+        started_ns = time.perf_counter_ns()
         with self._lock:
             current_question = self._raw_turn_questions.get(session_id)
             routed_query = self._routed_archive_queries.get(session_id)
@@ -712,7 +723,11 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 self._remember_routed_archive_query(
                     session_id, decision.topic_id, query
                 )
+            recall_started_ns = time.perf_counter_ns()
             result = self._require_engine().recall(decision.topic_id, query)
+            recall_latency_ms = max(
+                0, (time.perf_counter_ns() - recall_started_ns) // 1_000_000
+            )
         except MultiTopicRequiredError as error:
             return _json_result(
                 {
@@ -734,6 +749,16 @@ class HermesTopicMemoryProvider(MemoryProvider):
                 error,
             )
             return _json_result({"error": "operation_failed"})
+        self._append_single_recall_history(
+            question=query,
+            result=result,
+            route_source=decision.source,
+            session_id=session_id,
+            recall_latency_ms=recall_latency_ms,
+            total_latency_ms=max(
+                0, (time.perf_counter_ns() - started_ns) // 1_000_000
+            ),
+        )
         if (
             result.failure is None
             and result.answer is not None
@@ -741,6 +766,56 @@ class HermesTopicMemoryProvider(MemoryProvider):
         ):
             self._remember_session_topic(session_id, decision.topic_id)
         return _json_result(_recall_result(result))
+
+    def _append_single_recall_history(
+        self,
+        *,
+        question: str,
+        result: RecallResult,
+        route_source: str,
+        session_id: str,
+        recall_latency_ms: int,
+        total_latency_ms: int,
+    ) -> None:
+        try:
+            status = (
+                result.status
+                if result.status in {"answered", "no_fact", "error"}
+                else "error"
+            )
+            source = result.source if result.source in {"cache", "reader"} else "failure"
+            answer = result.answer if status == "answered" else None
+            record = QueryRecord.create(
+                question=question,
+                selected_topics=(
+                    TopicQueryResult(
+                        topic_id=result.topic_id,
+                        topic_version=result.topic_version,
+                        status=status,
+                        answer=answer,
+                        source=source,
+                        match_kind=result.match_kind,
+                        latency_ms=recall_latency_ms,
+                    ),
+                ),
+                final_answer=answer,
+                selection_reasons={
+                    result.topic_id: _SINGLE_RECALL_SELECTION_REASONS.get(
+                        route_source, "provider routing decision"
+                    )
+                },
+                source="hermes",
+                session_ref=session_id,
+                total_latency_ms=total_latency_ms,
+            )
+            if self._query_history is None:
+                raise RuntimeError("provider is not initialized")
+            self._query_history.append(record)
+        except Exception as error:
+            logger.warning(
+                "Topic-memory single recall history append failed: %s",
+                type(error).__name__,
+            )
 
     def _handle_recall_multi(
         self,

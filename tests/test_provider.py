@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sys
@@ -500,6 +501,182 @@ def test_current_turn_prefetch_cache_hit_requires_tool_without_reader(
     assert result["source"] == "cache"
     assert reader.requests == []
     provider.shutdown()
+
+
+def test_single_recall_reader_hit_persists_corrected_question_and_hashed_session(
+    tmp_path: Path,
+) -> None:
+    grounded_answer = "Alpha 的主题档案答案。"
+    reader = ExactAnswerReader(grounded_answer)
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    raw_session_id = "PRIVATE-RAW-SESSION-ID"
+    raw_question = "Alpha 项目6月28日下午4:30做了什么？"
+    rewritten_question = "Alpha 项目2024年6月28日下午4:30做了什么？"
+    provider.initialize(raw_session_id, hermes_home=str(hermes_home))
+
+    provider.on_turn_start(1, raw_question, session_id=raw_session_id)
+    assert provider.prefetch(raw_question, session_id=raw_session_id) == (
+        expected_single_tool_directive("alpha", raw_question)
+    )
+    assert QueryHistoryStore(data_root).list() == ()
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": rewritten_question, "topic": "alpha"},
+            session_id=raw_session_id,
+        )
+    )
+    provider.shutdown()
+
+    assert result["verbatim_answer"] == grounded_answer
+    assert [request.question for request in reader.requests] == [raw_question]
+    records = QueryHistoryStore(data_root).list()
+    assert len(records) == 1
+    record = records[0]
+    assert record.question == raw_question
+    assert record.source == "hermes"
+    assert record.final_answer == grounded_answer
+    assert dict(record.selection_reasons) == {"alpha": "explicit topic argument"}
+    assert len(record.session_ref or "") == 64
+    assert record.session_ref == hashlib.sha256(raw_session_id.encode()).hexdigest()
+    topic_result = record.selected_topics[0]
+    assert topic_result.topic_id == "alpha"
+    assert topic_result.topic_version == 1
+    assert topic_result.status == "answered"
+    assert topic_result.source == "reader"
+    assert topic_result.answer == grounded_answer
+    assert topic_result.match_kind is None
+    history_payload = b"".join(
+        path.read_bytes() for path in (data_root / "query-history").iterdir()
+    )
+    assert raw_session_id.encode() not in history_payload
+    assert rewritten_question.encode() not in history_payload
+
+
+def test_single_recall_cache_hit_persists_cache_metadata(tmp_path: Path) -> None:
+    reader = TopicReader()
+    provider, hermes_home, data_root = configured_mafu_provider(
+        tmp_path, reader=reader
+    )
+    question = "马夫这个项目是用来做什么的？"
+    cached_answer = "cached mafu answer"
+    QuestionCache(data_root).put(
+        question=question,
+        answer=cached_answer,
+        topic_id="dm-mafu",
+        topic_version=1,
+        model="fake-reader",
+        prompt_version="v1",
+    )
+    provider.initialize("cache-session", hermes_home=str(hermes_home))
+
+    provider.on_turn_start(1, question, session_id="cache-session")
+    assert provider.prefetch(question, session_id="cache-session") == (
+        expected_single_tool_directive("dm-mafu", question)
+    )
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": question, "topic": "dm-mafu"},
+            session_id="cache-session",
+        )
+    )
+    provider.shutdown()
+
+    assert result["verbatim_answer"] == cached_answer
+    assert reader.requests == []
+    records = QueryHistoryStore(data_root).list()
+    assert len(records) == 1
+    record = records[0]
+    assert record.question == question
+    assert record.final_answer == cached_answer
+    assert dict(record.selection_reasons) == {"dm-mafu": "explicit topic argument"}
+    topic_result = record.selected_topics[0]
+    assert topic_result.topic_id == "dm-mafu"
+    assert topic_result.topic_version == 1
+    assert topic_result.status == "answered"
+    assert topic_result.source == "cache"
+    assert topic_result.answer == cached_answer
+    assert topic_result.match_kind == "exact"
+
+
+def test_single_recall_no_fact_is_recorded_safely(tmp_path: Path) -> None:
+    reader = ExactAnswerReader("No stored fact answers the question.")
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    question = "What is archived for Alpha?"
+    provider.initialize("no-fact-session", hermes_home=str(hermes_home))
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": question},
+            session_id="no-fact-session",
+        )
+    )
+    provider.shutdown()
+
+    assert result["answer"] is None
+    assert result["source"] == "reader"
+    records = QueryHistoryStore(data_root).list()
+    assert len(records) == 1
+    record = records[0]
+    assert record.question == question
+    assert record.final_answer is None
+    assert dict(record.selection_reasons) == {
+        "alpha": "topic named in recall question"
+    }
+    topic_result = record.selected_topics[0]
+    assert topic_result.topic_id == "alpha"
+    assert topic_result.topic_version == 1
+    assert topic_result.status == "no_fact"
+    assert topic_result.source == "reader"
+    assert topic_result.answer is None
+
+
+def test_single_recall_query_history_failure_preserves_answer_and_sanitizes_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    grounded_answer = "PRIVATE-SUCCESSFUL-ANSWER"
+    reader = ExactAnswerReader(grounded_answer)
+    provider, hermes_home, data_root = configured_provider(tmp_path, reader=reader)
+    raw_session_id = "PRIVATE-SESSION-ID"
+    question = "PRIVATE-QUESTION"
+    private_token = "PRIVATE-TOKEN"
+    private_path = "/private/query-history/path"
+    provider.initialize(raw_session_id, hermes_home=str(hermes_home))
+    assert provider._query_history is not None
+
+    def fail_append(_record) -> None:
+        raise OSError(
+            f"{question} {raw_session_id} {grounded_answer} {private_token} {private_path}"
+        )
+
+    monkeypatch.setattr(provider._query_history, "append", fail_append)
+    with caplog.at_level(logging.WARNING, logger="plugin.hermes_topic_memory"):
+        result = json.loads(
+            provider.handle_tool_call(
+                "topic_memory_recall",
+                {"query": question, "topic": "alpha"},
+                session_id=raw_session_id,
+            )
+        )
+    provider.shutdown()
+
+    assert result["verbatim_answer"] == grounded_answer
+    assert result["source"] == "reader"
+    assert QueryHistoryStore(data_root).list() == ()
+    assert "Topic-memory single recall history append failed: OSError" in caplog.text
+    for secret in (
+        question,
+        raw_session_id,
+        grounded_answer,
+        private_token,
+        private_path,
+    ):
+        assert secret not in caplog.text
 
 
 
@@ -1692,6 +1869,42 @@ def test_multi_tool_returns_labeled_body_free_result_and_persists_query(
     assert "Alpha canonical fact" not in reader.requests[1].prefix
     records = QueryHistoryStore(data_root).list()
     assert len(records) == 1 and records[0].query_id == result["query_id"]
+
+
+def test_multi_tool_query_history_append_remains_single(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider, hermes_home, data_root = configured_provider(
+        tmp_path, reader=TopicReader(), synthesizer=LabeledSynthesizer()
+    )
+    provider.initialize("session-a", hermes_home=str(hermes_home))
+    assert provider._query_history is not None
+    real_append = provider._query_history.append
+    appended_records = []
+
+    def track_append(record):
+        appended_records.append(record)
+        return real_append(record)
+
+    monkeypatch.setattr(provider._query_history, "append", track_append)
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall_multi",
+            {
+                "query": "Compare Alpha and Beta exactly.",
+                "topics": [
+                    {"topic": "alpha", "reason": "Alpha is named"},
+                    {"topic": "beta", "reason": "Beta is named"},
+                ],
+            },
+            session_id="session-a",
+        )
+    )
+    provider.shutdown()
+
+    assert result["query_id"] == appended_records[0].query_id
+    assert len(appended_records) == 1
+    assert len(QueryHistoryStore(data_root).list()) == 1
 
 
 def test_multi_tool_allows_one_topic_and_rejects_unknown_or_ambiguous_before_reader(
