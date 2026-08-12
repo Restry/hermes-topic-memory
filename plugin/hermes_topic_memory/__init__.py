@@ -422,7 +422,11 @@ class HermesTopicMemoryProvider(MemoryProvider):
     ) -> None:
         try:
             result = self._require_engine().recall(topic_id, query)
-            block = _format_prefetch(result)
+            block = (
+                _format_single_recall_directive(topic_id, query)
+                if result.answer is not None
+                else ""
+            )
         except Exception as error:
             logger.debug(
                 "Topic-memory background prefetch status=failed topic_id=%s reason=%s",
@@ -499,12 +503,8 @@ class HermesTopicMemoryProvider(MemoryProvider):
             )
             return ""
 
-        if cached is None:
-            block = _format_single_recall_directive(topic_id, query)
-            status = "tool_required"
-        else:
-            block = _format_prefetch(cached)
-            status = "cache_hit"
+        block = _format_single_recall_directive(topic_id, query)
+        status = "tool_required" if cached is None else "cache_hit"
         if named_topic:
             self._remember_routed_archive_query(sid, topic_id, query)
             self._remember_session_topic(sid, topic_id)
@@ -1282,10 +1282,6 @@ def _positive_int(value: Any, field: str) -> int:
     return result
 
 
-def _format_prefetch(result: RecallResult) -> str:
-    if result.answer is None:
-        return ""
-    return f"[Topic Memory: {result.topic_id} v{result.topic_version}]\n{result.answer}"
 
 
 def _format_single_recall_directive(topic_id: str, query: str) -> str:

@@ -461,7 +461,7 @@ def test_cache_miss_directive_then_tool_calls_reader_once_and_returns_verbatim(
     provider.shutdown()
 
 
-def test_current_turn_prefetch_uses_existing_topic_cache_without_reader(
+def test_current_turn_prefetch_cache_hit_requires_tool_without_reader(
     tmp_path: Path,
 ) -> None:
     reader = TopicReader()
@@ -469,9 +469,10 @@ def test_current_turn_prefetch_uses_existing_topic_cache_without_reader(
         tmp_path, reader=reader
     )
     query = "你跟我讲讲马夫是用来做什么的？"
+    cached_answer = "cached mafu answer"
     QuestionCache(data_root).put(
         question=query,
-        answer="cached mafu answer",
+        answer=cached_answer,
         topic_id="dm-mafu",
         topic_version=1,
         model="fake-reader",
@@ -482,9 +483,24 @@ def test_current_turn_prefetch_uses_existing_topic_cache_without_reader(
     provider.on_turn_start(1, query, session_id="fresh-session")
     prefetched = provider.prefetch(query, session_id="fresh-session")
 
-    assert prefetched == "[Topic Memory: dm-mafu v1]\ncached mafu answer"
+    assert prefetched == expected_single_tool_directive("dm-mafu", query)
+    assert cached_answer not in prefetched
+    assert reader.requests == []
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": query, "topic": "dm-mafu"},
+            session_id="fresh-session",
+        )
+    )
+
+    assert result["verbatim_answer"] == cached_answer
+    assert result["response_policy"] == "copy_verbatim_answer_exactly"
+    assert result["source"] == "cache"
     assert reader.requests == []
     provider.shutdown()
+
 
 
 def test_exact_temporal_prefetch_ignores_fuzzy_cache_and_requires_tool(
@@ -624,7 +640,7 @@ def test_current_turn_cache_lookup_failure_is_safely_logged_and_fails_closed(
     provider.shutdown()
 
 
-def test_ready_background_prefetch_is_consumed_without_duplicate_sync_recall(
+def test_ready_background_prefetch_requires_tool_without_duplicate_reader(
     tmp_path: Path,
 ) -> None:
     reader = BlockingReader()
@@ -648,7 +664,21 @@ def test_ready_background_prefetch_is_consumed_without_duplicate_sync_recall(
         raise AssertionError("background prefetch did not become ready")
 
     prefetched = provider.prefetch(query, session_id="fresh-session")
-    assert prefetched == "[Topic Memory: dm-mafu v1]\nanswer from dm-mafu"
+    assert prefetched == expected_single_tool_directive("dm-mafu", query)
+    assert "answer from dm-mafu" not in prefetched
+    assert [request.question for request in reader.requests] == [query]
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": query, "topic": "dm-mafu"},
+            session_id="fresh-session",
+        )
+    )
+
+    assert result["verbatim_answer"] == "answer from dm-mafu"
+    assert result["response_policy"] == "copy_verbatim_answer_exactly"
+    assert result["source"] == "cache"
     assert [request.question for request in reader.requests] == [query]
     provider.shutdown()
 
@@ -689,14 +719,36 @@ def test_background_prefetch_is_non_blocking_and_session_topic_isolation(tmp_pat
 
     reader.release.set()
     alpha = wait_for_prefetch(provider, "status", "session-a")
-    assert "answer from alpha" in alpha
-    assert "beta" not in alpha
+    assert alpha == expected_single_tool_directive("alpha", "status")
+    assert "answer from alpha" not in alpha
+    alpha_result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status", "topic": "alpha"},
+            session_id="session-a",
+        )
+    )
+    assert alpha_result["verbatim_answer"] == "answer from alpha"
+    assert alpha_result["source"] == "cache"
 
     provider.on_session_switch("session-b", chat_id="chat-beta", reset=True)
     provider.queue_prefetch("status", session_id="session-b")
     beta = wait_for_prefetch(provider, "status", "session-b")
-    assert "answer from beta" in beta
-    assert provider.prefetch("status", session_id="session-a") == ""
+    assert beta == expected_single_tool_directive("beta", "status")
+    assert "answer from beta" not in beta
+    beta_result = json.loads(
+        provider.handle_tool_call(
+            "topic_memory_recall",
+            {"query": "status", "topic": "beta"},
+            session_id="session-b",
+        )
+    )
+    assert beta_result["verbatim_answer"] == "answer from beta"
+    assert beta_result["source"] == "cache"
+    assert [request.question for request in reader.requests] == ["status", "status"]
+    assert provider.prefetch(
+        "status", session_id="session-a"
+    ) == expected_single_tool_directive("alpha", "status")
     provider.shutdown()
 
 
