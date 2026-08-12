@@ -10,6 +10,7 @@ import pytest
 
 from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.panel_app import PanelApplication, PanelResponse
+from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
 from hermes_topic_memory.query_history import (
     QueryHistoryStore,
     QueryRecord,
@@ -29,11 +30,54 @@ _READER_SECRET = "reader-api-key-DO-NOT-LEAK"
 class _Reader:
     api_key = _READER_SECRET
 
+    def __init__(self) -> None:
+        self.planner_output = (
+            '{"topics":[{"topic":"alpha","reason":"explicitly named"}]}'
+        )
+        self.requests: list[ReaderRequest] = []
+        self.fail_topics: set[str] = set()
+        self.no_fact_topics: set[str] = set()
+
+    def read(self, request: ReaderRequest) -> ReaderResponse:
+        self.requests.append(request)
+        if "TOPIC PLANNING RULES" in request.prefix:
+            return ReaderResponse(answer=self.planner_output, model="panel-planner")
+        if "Synthesize only the labeled topic capsules" in request.prefix:
+            labels = [
+                line.removeprefix("LABEL:")
+                for line in request.prefix.splitlines()
+                if line.startswith("LABEL:")
+            ]
+            return ReaderResponse(
+                answer="; ".join(f"{label} recalled" for label in labels),
+                model="panel-synthesizer",
+            )
+        if _ALPHA_BODY_V2 in request.prefix:
+            if "alpha" in self.fail_topics:
+                raise RuntimeError("PRIVATE_ALPHA_BACKEND_FAILURE")
+            if "alpha" in self.no_fact_topics:
+                return ReaderResponse(
+                    answer="no stored fact answers the question",
+                    model="panel-reader",
+                )
+            return ReaderResponse(answer="alpha recalled fact", model="panel-reader")
+        if _BETA_BODY in request.prefix:
+            if "beta" in self.fail_topics:
+                raise RuntimeError("PRIVATE_BETA_BACKEND_FAILURE")
+            if "beta" in self.no_fact_topics:
+                return ReaderResponse(
+                    answer="no stored fact answers the question",
+                    model="panel-reader",
+                )
+            return ReaderResponse(answer="beta recalled fact", model="panel-reader")
+        raise AssertionError("unexpected Reader request")
+
 
 @dataclass(frozen=True)
 class PanelFixture:
     app: PanelApplication
     data_root: Path
+    reader: _Reader
 
 
 @pytest.fixture
@@ -94,9 +138,11 @@ def panel_fixture(tmp_path: Path) -> PanelFixture:
         topic_results=(("beta", "answered", "reader"),),
         source="panel",
     )
+    reader = _Reader()
     return PanelFixture(
-        app=PanelApplication(data_root, _Reader(), _AUTH_TOKEN),
+        app=PanelApplication(data_root, reader, _AUTH_TOKEN),
         data_root=data_root,
+        reader=reader,
     )
 
 
@@ -434,8 +480,310 @@ def test_response_never_serializes_reader_key_token_absolute_root_or_neighbor_bo
     assert str(panel_fixture.data_root).encode() not in alpha_response.body
 
 
+def test_recall_plan_is_authenticated_and_preserves_raw_question(
+    panel_fixture: PanelFixture,
+) -> None:
+    raw_question = "  Alpha 在 2026-08-12 09:07:03+08:00 的事实？\n保持原样。  "
+
+    unauthorized = panel_fixture.app.dispatch(
+        "POST",
+        "/api/recall/plan",
+        body=json.dumps({"question": raw_question}, ensure_ascii=False).encode(),
+    )
+    response, payload = _post(
+        panel_fixture.app, "/api/recall/plan", {"question": raw_question}
+    )
+
+    assert unauthorized.status == 401
+    assert response.status == 200
+    assert payload["question"] == raw_question
+    assert payload["plan"] == {
+        "mode": "agent",
+        "topics": [
+            {
+                "topic": "alpha",
+                "topic_id": "alpha",
+                "display_name": "Alpha Topic",
+                "reason": "explicitly named",
+            }
+        ],
+    }
+    assert payload["latency_ms"] >= 0
+    assert panel_fixture.reader.requests[-1].question == raw_question
+    _assert_no_body_or_secret(response.body, panel_fixture.data_root)
+
+
+def test_recall_run_returns_plan_results_answer_versions_cache_latency_and_query(
+    panel_fixture: PanelFixture,
+) -> None:
+    raw_question = "Compare alpha and beta at 2026-08-12T01:02:03Z exactly."
+    panel_fixture.reader.planner_output = json.dumps(
+        {
+            "topics": [
+                {"topic": "first", "reason": "alpha named"},
+                {"topic": "second", "reason": "beta named"},
+            ]
+        }
+    )
+
+    response, payload = _post(
+        panel_fixture.app, "/api/recall/run", {"question": raw_question}
+    )
+
+    assert response.status == 200
+    assert payload["status"] == "answered"
+    assert payload["question"] == raw_question
+    assert payload["query_id"]
+    assert payload["plan"]["mode"] == "agent"
+    assert [item["topic_id"] for item in payload["topic_results"]] == [
+        "alpha",
+        "beta",
+    ]
+    assert [item["topic_version"] for item in payload["topic_results"]] == [2, 1]
+    assert all(item["cache_status"] in {"hit", "miss"} for item in payload["topic_results"])
+    assert "[Alpha Topic/alpha]" in payload["final_answer"]
+    assert "[Beta Topic/beta]" in payload["final_answer"]
+    assert set(payload["latency_ms"]) == {
+        "planning",
+        "recall",
+        "topics",
+        "synthesis",
+        "total",
+    }
+    record = panel_fixture.app.history.get(payload["query_id"])
+    assert record is not None
+    assert record.question == raw_question
+    assert record.source == "panel"
+    assert [item.topic_id for item in record.selected_topics] == ["alpha", "beta"]
+    assert panel_fixture.reader.requests[0].question == raw_question
+    topic_requests = [
+        request
+        for request in panel_fixture.reader.requests
+        if "CANONICAL MEMORY (verbatim UTF-8)" in request.prefix
+    ]
+    assert len(topic_requests) == 2
+    assert all(request.question == raw_question for request in topic_requests)
+    synthesis_request = panel_fixture.reader.requests[-1]
+    assert raw_question in synthesis_request.prefix
+    _assert_no_body_or_secret(response.body, panel_fixture.data_root)
+
+
+def test_manual_recall_bypasses_planner_and_is_labeled_manual(
+    panel_fixture: PanelFixture,
+) -> None:
+    before = len(panel_fixture.reader.requests)
+    response, payload = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {
+            "question": "Manual alpha question",
+            "manual_topics": [{"topic": "first", "reason": "manual test scope"}],
+        },
+    )
+
+    assert response.status == 200
+    assert payload["plan"]["mode"] == "manual"
+    assert payload["plan"]["topics"][0]["reason"] == "manual test scope"
+    new_requests = panel_fixture.reader.requests[before:]
+    assert new_requests
+    assert all("TOPIC PLANNING RULES" not in request.prefix for request in new_requests)
+
+
+@pytest.mark.parametrize(
+    "manual_topics",
+    [
+        [],
+        [{"topic": "missing", "reason": "manual"}],
+        [
+            {"topic": "alpha", "reason": "manual"},
+            {"topic": "first", "reason": "duplicate"},
+        ],
+        [{"topic": "alpha", "reason": "manual"}] * 9,
+    ],
+)
+def test_manual_recall_rejects_unsafe_scope_before_reader_calls(
+    panel_fixture: PanelFixture, manual_topics: list[dict[str, str]]
+) -> None:
+    before_requests = len(panel_fixture.reader.requests)
+    before_history = len(panel_fixture.app.history.list())
+
+    response, payload = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {"question": "unsafe manual scope", "manual_topics": manual_topics},
+    )
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_recall_scope"
+    assert len(panel_fixture.reader.requests) == before_requests
+    assert len(panel_fixture.app.history.list()) == before_history
+    _assert_no_body_or_secret(response.body, panel_fixture.data_root)
+
+
+def test_malformed_planner_json_fails_before_topic_read(
+    panel_fixture: PanelFixture,
+) -> None:
+    panel_fixture.reader.planner_output = "```json\nnot strict json\n```"
+    before_history = len(panel_fixture.app.history.list())
+
+    response, payload = _post(
+        panel_fixture.app, "/api/recall/run", {"question": "alpha question"}
+    )
+
+    assert response.status == 422
+    assert payload["error"]["code"] == "planning_failed"
+    assert len(panel_fixture.reader.requests) == 1
+    assert "TOPIC PLANNING RULES" in panel_fixture.reader.requests[0].prefix
+    assert len(panel_fixture.app.history.list()) == before_history
+    _assert_no_body_or_secret(response.body, panel_fixture.data_root)
+
+
+def test_recall_rerun_uses_exact_original_question_current_versions_and_new_id(
+    panel_fixture: PanelFixture,
+) -> None:
+    raw_question = "  exact 2026-08-12 17:45:09+08:00?\nKeep spacing.  "
+    _, first = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {
+            "question": raw_question,
+            "manual_topics": [{"topic": "alpha", "reason": "manual rerun seed"}],
+        },
+    )
+    panel_fixture.app.store.update_topic("alpha", _ALPHA_BODY_V2 + "new version\n")
+
+    response, rerun = _post(
+        panel_fixture.app, f"/api/recall/rerun/{first['query_id']}", {}
+    )
+
+    assert response.status == 200
+    assert rerun["question"] == raw_question
+    assert rerun["query_id"] != first["query_id"]
+    assert rerun["plan"]["mode"] == "rerun"
+    assert rerun["topic_results"][0]["topic_version"] == 3
+    old_record = panel_fixture.app.history.get(first["query_id"])
+    new_record = panel_fixture.app.history.get(rerun["query_id"])
+    assert old_record is not None and new_record is not None
+    assert old_record.question == raw_question == new_record.question
+    assert old_record.selected_topics[0].topic_version == 2
+    assert new_record.selected_topics[0].topic_version == 3
+    assert new_record.source == "panel"
+
+
+def test_failed_recall_is_recorded_as_real_panel_error_without_false_success(
+    panel_fixture: PanelFixture,
+) -> None:
+    panel_fixture.reader.fail_topics.add("beta")
+
+    response, payload = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {
+            "question": "beta failure",
+            "manual_topics": [{"topic": "beta", "reason": "manual failure test"}],
+        },
+    )
+
+    assert response.status == 200
+    assert payload["status"] == "error"
+    assert payload["final_answer"] is None
+    assert payload["failure"]["code"] == "no_answered_topics"
+    assert payload["topic_results"][0]["status"] == "error"
+    assert payload["topic_results"][0]["failure"]["code"] == "recall_error"
+    record = panel_fixture.app.history.get(payload["query_id"])
+    assert record is not None
+    assert record.source == "panel"
+    assert record.final_answer is None
+    assert record.selected_topics[0].status == "error"
+    assert b"PRIVATE_BETA_BACKEND_FAILURE" not in response.body
+
+
+def test_no_fact_recall_is_durably_recorded_with_panel_source(
+    panel_fixture: PanelFixture,
+) -> None:
+    panel_fixture.reader.no_fact_topics.add("alpha")
+
+    response, payload = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {
+            "question": "alpha has no matching fact",
+            "manual_topics": [{"topic": "alpha", "reason": "manual no-fact test"}],
+        },
+    )
+
+    assert response.status == 200
+    assert payload["status"] == "no_fact"
+    assert payload["final_answer"] is None
+    assert payload["topic_results"][0]["status"] == "no_fact"
+    record = panel_fixture.app.history.get(payload["query_id"])
+    assert record is not None
+    assert record.source == "panel"
+    assert record.final_answer is None
+    assert record.selected_topics[0].status == "no_fact"
+
+
+
+def test_query_history_write_failure_cannot_report_no_fact_as_success(
+    panel_fixture: PanelFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panel_fixture.reader.no_fact_topics.add("alpha")
+
+    def fail_append(_record: QueryRecord) -> QueryRecord:
+        raise OSError("PRIVATE_QUERY_LEDGER_WRITE_FAILURE")
+
+    monkeypatch.setattr(panel_fixture.app.history, "append", fail_append)
+    response, payload = _post(
+        panel_fixture.app,
+        "/api/recall/run",
+        {
+            "question": "alpha ledger failure",
+            "manual_topics": [{"topic": "alpha", "reason": "manual ledger test"}],
+        },
+    )
+
+    assert response.status == 200
+    assert payload["status"] == "error"
+    assert payload["query_id"] is None
+    assert payload["failure"]["code"] == "query_history_write_failed"
+    assert b"PRIVATE_QUERY_LEDGER_WRITE_FAILURE" not in response.body
+
+
+def test_recall_routes_reject_bad_auth_without_planning_or_private_data(
+    panel_fixture: PanelFixture,
+) -> None:
+    before = len(panel_fixture.reader.requests)
+    for target in (
+        "/api/recall/plan",
+        "/api/recall/run",
+        "/api/recall/rerun/alpha-old",
+    ):
+        response = panel_fixture.app.dispatch(
+            "POST",
+            target,
+            headers={"Authorization": "Bearer wrong-token"},
+            body=b'{"question":"private input"}',
+        )
+        assert response.status == 401
+        assert json.loads(response.body)["error"]["code"] == "unauthorized"
+        _assert_no_body_or_secret(response.body, panel_fixture.data_root)
+    assert len(panel_fixture.reader.requests) == before
+
+
 def _dispatch(app: PanelApplication, path: str) -> tuple[PanelResponse, dict[str, Any]]:
     response = app.dispatch("GET", path, headers=_headers())
+    return response, json.loads(response.body)
+
+
+def _post(
+    app: PanelApplication, path: str, payload: dict[str, Any]
+) -> tuple[PanelResponse, dict[str, Any]]:
+    response = app.dispatch(
+        "POST",
+        path,
+        headers=_headers(),
+        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
     return response, json.loads(response.body)
 
 

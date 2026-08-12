@@ -4,15 +4,26 @@ import hashlib
 import json
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlsplit
 
+from .cache import QuestionCache
 from .catalog import TopicCatalog
+from .engine import RecallEngine
+from .multi_recall import (
+    MultiRecallEngine,
+    MultiRecallResult,
+    ReaderCapsuleSynthesizer,
+    TopicSelection,
+)
 from .query_history import QueryHistoryStore, QueryRecord
+from .router import TopicRegistry
 from .store import FileTopicStore, TopicNotFoundError
+from .topic_planner import PlanningError, TopicPlan, TopicPlanner
 
 _TOPIC_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MAX_PAGE_SIZE = 100
@@ -73,12 +84,13 @@ class PanelApplication:
 
         try:
             path, params = _parse_target(target)
-            _parse_json_body(body)
-            if method.upper() != "GET":
-                return _error_response(
-                    405, "method_not_allowed", "Method not allowed."
-                )
-            return self._dispatch_get(path, params)
+            payload = _parse_json_body(body)
+            request_method = method.upper()
+            if request_method == "GET":
+                return self._dispatch_get(path, params)
+            if request_method == "POST":
+                return self._dispatch_post(path, params, payload)
+            return _error_response(405, "method_not_allowed", "Method not allowed.")
         except _RequestError as error:
             return _error_response(400, error.code, error.message)
         except (_ResourceNotFound, TopicNotFoundError):
@@ -139,6 +151,145 @@ class PanelApplication:
                 return _json_response(200, self._version_body(topic_id, version))
 
         raise _ResourceNotFound
+
+    def _dispatch_post(
+        self,
+        path: tuple[str, ...],
+        params: dict[str, str],
+        payload: dict[str, Any] | None,
+    ) -> PanelResponse:
+        _reject_params(params, set())
+        if path == ("api", "recall", "plan"):
+            return self._recall_plan(payload)
+        if path == ("api", "recall", "run"):
+            return self._recall_run(payload)
+        if len(path) == 4 and path[:3] == ("api", "recall", "rerun"):
+            return self._recall_rerun(path[3], payload)
+        raise _ResourceNotFound
+
+    def _recall_plan(self, payload: dict[str, Any] | None) -> PanelResponse:
+        value = _required_payload(payload, {"question"})
+        question = _raw_question(value)
+        registry, planner, _engine = self._recall_services()
+        started_ns = time.perf_counter_ns()
+        try:
+            plan = planner.plan(question)
+        except PlanningError:
+            return _error_response(
+                422, "planning_failed", "Topic planning produced no safe plan."
+            )
+        latency_ms = _elapsed_ms(started_ns)
+        return _json_response(
+            200,
+            {
+                "question": question,
+                "plan": _plan_dict(plan, registry),
+                "latency_ms": latency_ms,
+            },
+        )
+
+    def _recall_run(self, payload: dict[str, Any] | None) -> PanelResponse:
+        value = _required_payload(payload, {"question", "manual_topics"})
+        question = _raw_question(value)
+        registry, planner, engine = self._recall_services()
+        planning_started_ns = time.perf_counter_ns()
+        if "manual_topics" in value:
+            selections = _manual_selections(value["manual_topics"])
+            try:
+                plan = planner.manual(question=question, selections=selections)
+            except PlanningError as error:
+                raise _RequestError(
+                    "invalid_recall_scope", "Manual recall scope is invalid."
+                ) from error
+        else:
+            try:
+                plan = planner.plan(question)
+            except PlanningError:
+                return _error_response(
+                    422, "planning_failed", "Topic planning produced no safe plan."
+                )
+        planning_ms = _elapsed_ms(planning_started_ns)
+        return self._execute_recall(
+            plan=plan,
+            registry=registry,
+            engine=engine,
+            planning_ms=planning_ms,
+        )
+
+    def _recall_rerun(
+        self, query_id: str, payload: dict[str, Any] | None
+    ) -> PanelResponse:
+        _required_payload(payload or {}, set())
+        try:
+            original = self.history.get(query_id)
+        except ValueError as error:
+            raise _RequestError("invalid_request", "Invalid query id.") from error
+        if original is None:
+            raise _ResourceNotFound
+
+        registry, planner, engine = self._recall_services()
+        selections = tuple(
+            TopicSelection(
+                result.topic_id,
+                original.selection_reasons[result.topic_id],
+            )
+            for result in original.selected_topics
+        )
+        try:
+            plan = planner.rerun(question=original.question, selections=selections)
+        except PlanningError as error:
+            raise _RequestError(
+                "invalid_recall_scope", "Rerun topic scope is no longer available."
+            ) from error
+        return self._execute_recall(
+            plan=plan,
+            registry=registry,
+            engine=engine,
+            planning_ms=0,
+        )
+
+    def _recall_services(
+        self,
+    ) -> tuple[TopicRegistry, TopicPlanner, MultiRecallEngine]:
+        registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
+        planner = TopicPlanner(registry=registry, model=self._reader)  # type: ignore[arg-type]
+        engine = MultiRecallEngine(
+            recall_engine=RecallEngine(
+                store=self.store,
+                cache=QuestionCache(self.data_root),
+                reader=self._reader,  # type: ignore[arg-type]
+            ),
+            registry=registry,
+            synthesizer=ReaderCapsuleSynthesizer(self._reader),  # type: ignore[arg-type]
+            query_history=self.history,
+        )
+        return registry, planner, engine
+
+    def _execute_recall(
+        self,
+        *,
+        plan: TopicPlan,
+        registry: TopicRegistry,
+        engine: MultiRecallEngine,
+        planning_ms: int,
+    ) -> PanelResponse:
+        recall_started_ns = time.perf_counter_ns()
+        result = engine.recall_multi(
+            question=plan.question,
+            selections=plan.selections,
+            source="panel",
+        )
+        recall_ms = _elapsed_ms(recall_started_ns)
+        return _json_response(
+            200,
+            _recall_dict(
+                result=result,
+                plan=plan,
+                registry=registry,
+                planning_ms=planning_ms,
+                recall_ms=recall_ms,
+            ),
+        )
 
     def _overview(self) -> dict[str, Any]:
         snapshot = TopicCatalog(self.data_root).snapshot()
@@ -427,6 +578,151 @@ class PanelApplication:
             key=lambda item: (item["trashed_at"], item["topic_id"]), reverse=True
         )
         return items
+
+
+def _required_payload(
+    payload: dict[str, Any] | None, allowed: set[str]
+) -> dict[str, Any]:
+    if payload is None:
+        raise _RequestError("invalid_request", "JSON body is required.")
+    if not set(payload).issubset(allowed):
+        raise _RequestError("invalid_request", "Unknown JSON field.")
+    if "question" in allowed and "question" not in payload:
+        raise _RequestError("invalid_request", "Question is required.")
+    return payload
+
+
+def _raw_question(payload: Mapping[str, Any]) -> str:
+    question = payload.get("question")
+    if (
+        not isinstance(question, str)
+        or not question.strip()
+        or len(question) > 4_096
+    ):
+        raise _RequestError(
+            "invalid_request", "Question must contain 1 to 4096 characters."
+        )
+    return question
+
+
+def _manual_selections(value: Any) -> tuple[TopicSelection, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise _RequestError(
+            "invalid_recall_scope", "Manual recall scope is invalid."
+        )
+    selections: list[TopicSelection] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"topic", "reason"}:
+            raise _RequestError(
+                "invalid_recall_scope", "Manual recall scope is invalid."
+            )
+        try:
+            selections.append(TopicSelection(item["topic"], item["reason"]))
+        except (TypeError, ValueError) as error:
+            raise _RequestError(
+                "invalid_recall_scope", "Manual recall scope is invalid."
+            ) from error
+    return tuple(selections)
+
+
+def _plan_dict(plan: TopicPlan, registry: TopicRegistry) -> dict[str, Any]:
+    display_names = {
+        topic.topic_id: topic.display_name for topic in registry.topics
+    }
+    return {
+        "mode": plan.mode,
+        "topics": [
+            {
+                "topic": selection.topic_id,
+                "topic_id": selection.topic_id,
+                "display_name": display_names[selection.topic_id],
+                "reason": selection.reason,
+            }
+            for selection in plan.selections
+        ],
+    }
+
+
+def _recall_dict(
+    *,
+    result: MultiRecallResult,
+    plan: TopicPlan,
+    registry: TopicRegistry,
+    planning_ms: int,
+    recall_ms: int,
+) -> dict[str, Any]:
+    reasons = {
+        selection.topic_id: selection.reason for selection in plan.selections
+    }
+    topic_results: list[dict[str, Any]] = []
+    topic_latencies: dict[str, int] = {}
+    for item in result.topic_results:
+        topic_latencies[item.topic_id] = item.latency_ms
+        topic_value: dict[str, Any] = {
+            "topic_id": item.topic_id,
+            "topic_version": item.topic_version,
+            "status": item.status,
+            "answer": item.answer,
+            "source": item.source,
+            "cache_status": "hit" if item.source == "cache" else "miss",
+            "match_kind": item.match_kind,
+            "latency_ms": item.latency_ms,
+            "reason": reasons[item.topic_id],
+        }
+        if item.failure is not None:
+            topic_value["failure"] = _failure_dict(item.failure)
+        topic_results.append(topic_value)
+
+    topics_ms = sum(topic_latencies.values())
+    status = _recall_status(result)
+    response: dict[str, Any] = {
+        "status": status,
+        "question": result.question,
+        "query_id": result.query_id,
+        "plan": _plan_dict(plan, registry),
+        "topic_results": topic_results,
+        "final_answer": result.final_answer,
+        "final": {
+            "answer": result.final_answer,
+            "source": result.synthesis_source,
+        },
+        "synthesis_source": result.synthesis_source,
+        "scope_fingerprint": result.scope_fingerprint,
+        "latency_ms": {
+            "planning": planning_ms,
+            "recall": recall_ms,
+            "topics": topic_latencies,
+            "synthesis": max(0, recall_ms - topics_ms),
+            "total": planning_ms + recall_ms,
+        },
+    }
+    if result.failure is not None and status == "error":
+        response["failure"] = _failure_dict(result.failure)
+    return response
+
+
+def _recall_status(result: MultiRecallResult) -> str:
+    if result.failure is None and result.final_answer is not None:
+        return "answered"
+    if result.failure is not None and result.failure.code != "no_answered_topics":
+        return "error"
+    if result.topic_results and all(
+        item.status == "no_fact" for item in result.topic_results
+    ):
+        return "no_fact"
+    return "error"
+
+
+def _failure_dict(failure: Any) -> dict[str, Any]:
+    return {
+        "code": failure.code,
+        "message": failure.message,
+        "attempts": failure.attempts,
+    }
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return (time.perf_counter_ns() - started_ns) // 1_000_000
 
 
 def _parse_target(target: str) -> tuple[tuple[str, ...], dict[str, str]]:
