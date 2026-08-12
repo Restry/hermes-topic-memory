@@ -52,6 +52,14 @@ Write routes:
 
 `/api/overview` exposes Core metadata as the separate top-level `core_memory` object. Core never enters topic catalogs, topic KPIs, topic distribution, query summaries, or lifecycle routes. Body text appears only on authenticated body endpoints.
 
+## Authenticated Panel surface
+
+WP2 exposes Core as a primary `#core` route and a visually pinned home card ahead of topic analytics. The home card renders overview metadata only—presence, version, update time, fingerprint prefix, and the 4,000-character budget—and never fetches or embeds body text. Core remains absent from topic counts, distribution, recall selectors, recycle-bin data, and topic lifecycle actions.
+
+Entering the Core route lazily reads the authenticated current-body endpoint. The focused surface provides an absent-state initializer, current body with preserved line breaks, a full-replace dialog with Unicode character counting and line diff, paginated versions, on-demand historical body comparison, and a warning-styled two-stage rollback requiring the exact `Core / WhoAmI` confirmation. Replace and rollback bind the version and fingerprint returned by the body read; a stale response leaves the server body untouched and requires an explicit reload before retry.
+
+All Core loading, empty, success, authorization, error, and concurrency states are explicit. Native dialogs close on Escape and restore trigger focus; long bodies and fingerprints wrap at mobile widths. Body text and drafts remain in memory only, are rendered through text nodes, and never enter static HTML, overview data, logs, URLs, browser storage, topic catalogs, or telemetry.
+
 ## Delivery boundary
 
-WP1 implements storage, runtime injection, authenticated API, audit/concurrency safety, and tests. WP2 Panel UI is pending; WP1 does not modify Panel HTML, CSS, or JavaScript and does not seed live Core content.
+WP1 provides storage, runtime injection, authenticated API, audit/concurrency safety, and backend tests. WP2 provides the authenticated no-framework Panel UI and focused static/browser coverage. Neither work package seeds live Core content or changes topic routing and lifecycle semantics.

@@ -21,6 +21,7 @@
   </header>
 
   <nav id="primary-navigation" class="primary-navigation" aria-label="主导航">
+    <a class="nav-item" href="#core" data-view="core">核心记忆</a>
     <a class="nav-item is-active" href="#home" data-view="home" aria-current="page">首页</a>
     <a class="nav-item" href="#recall" data-view="recall">多主题召回</a>
     <a class="nav-item" href="#recent" data-view="recent">最近提问</a>
@@ -55,6 +56,21 @@
         <div id="error-state" class="state-panel state-panel--error" role="alert" hidden><span class="state-kicker">ERROR / OVERVIEW</span><h3>无法读取记忆资产</h3><p id="error-message">请检查服务状态和会话权限，然后重试。</p><div class="state-actions"><button id="retry-overview" class="button button--primary" type="button">重试概览</button><button id="reset-session" class="button button--quiet" type="button">重新输入令牌</button></div></div>
         <div id="empty-state" class="state-panel" hidden><span class="state-kicker">EMPTY / FIRST TOPIC</span><h3>尚无可管理的主题</h3><p>直接创建首个规范主题；成功后目录会从服务端读回版本、指纹和状态。</p><div class="state-actions"><button id="open-create-empty" class="button button--primary" type="button">创建首个主题</button><button id="refresh-empty" class="button button--quiet" type="button">重新载入</button></div></div>
 
+          <article id="core-home-card" class="core-home-card" aria-labelledby="core-home-title" hidden>
+            <div class="core-home-card__identity">
+              <p class="section-index">// ALWAYS-ON CORE</p>
+              <h3 id="core-home-title">Core / WhoAmI</h3>
+              <p>独立于 51 个路由主题；每次 Hermes 对话都会自动获得这份记忆背景。</p>
+            </div>
+            <dl class="core-home-card__metadata">
+              <div><dt>状态</dt><dd id="core-home-presence">待载入</dd></div>
+              <div><dt>版本</dt><dd id="core-home-version">待载入</dd></div>
+              <div><dt>更新时间</dt><dd id="core-home-updated">待载入</dd></div>
+              <div><dt>指纹</dt><dd id="core-home-fingerprint">待载入</dd></div>
+              <div><dt>字符预算</dt><dd id="core-home-budget">待载入 / 4,000</dd></div>
+            </dl>
+            <button id="open-core-memory" class="button button--primary" type="button">打开核心记忆</button>
+          </article>
         <div id="dashboard-data" hidden>
           <section aria-labelledby="kpi-title">
             <div class="section-heading"><div><p class="section-index">// SIGNALS</p><h3 id="kpi-title">关键指标</h3></div><p id="secondary-counts" class="section-meta"></p></div>
@@ -105,6 +121,81 @@
           </section>
         </div>
       </section>
+
+      <section id="core-view" class="view-panel core-surface" data-panel="core" aria-labelledby="core-title" hidden>
+        <div class="view-heading">
+          <div><p class="section-index">// ALWAYS-ON REMEMBERED BACKGROUND</p><h2 id="core-title" tabindex="-1">Core / WhoAmI</h2><p class="snapshot-status">这份已记住的背景会在每次 Hermes 对话中自动可用，不参与 51 个主题的路由。</p></div>
+          <div class="view-actions"><button id="refresh-core" class="button button--quiet" type="button">刷新核心记忆</button><button id="return-core-home" class="button button--quiet" type="button">返回首页</button></div>
+        </div>
+        <div id="core-metadata" class="metadata-grid" aria-label="核心记忆元数据"></div>
+        <div id="core-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">LOADING / CORE</span><p>正在读取核心记忆状态…</p></div>
+
+        <section id="core-absent" class="core-absent" aria-labelledby="core-init-title" hidden>
+          <p class="section-index">// INITIALIZE ONCE</p>
+          <h3 id="core-init-title">初始化核心记忆</h3>
+          <p class="field-help">提交后创建 v1，并从下一次 Hermes 对话开始成为自动可用的常驻背景。不会自动保存草稿。</p>
+          <form id="core-init-form" class="core-form" novalidate>
+            <label for="core-init-body">初始全文</label>
+            <textarea id="core-init-body" rows="14" required aria-describedby="core-init-counter core-init-error" placeholder="# 我是谁&#10;&#10;只写需要在每次对话中自动记住的背景。"></textarea>
+            <div class="counter-row"><span id="core-init-counter">0 / 4,000</span><span>非空且不超过预算才能提交</span></div>
+            <p id="core-init-error" class="field-error" role="alert" hidden></p>
+            <div class="form-actions"><button id="core-init-submit" class="button button--primary" type="submit" disabled>初始化为 v1</button></div>
+          </form>
+        </section>
+
+        <div id="core-present" hidden>
+          <div id="core-tabs" class="detail-tabs" role="tablist" aria-label="核心记忆分区">
+            <button id="core-body-tab" class="detail-tab is-active" type="button" role="tab" data-core-tab="body" aria-controls="core-body-panel" aria-selected="true">正文</button>
+            <button id="core-versions-tab" class="detail-tab" type="button" role="tab" data-core-tab="versions" aria-controls="core-versions-panel" aria-selected="false">版本</button>
+          </div>
+          <section id="core-body-panel" class="detail-panel" role="tabpanel" data-core-panel="body">
+            <div class="section-heading"><div><p class="section-index">// CURRENT BODY</p><h3>当前全文</h3></div><button id="open-core-edit" class="button button--primary" type="button" disabled>编辑全文</button></div>
+            <p class="field-help">正文只在进入此视图后通过鉴权端点读取；不会出现在首页概览或静态外壳中。</p>
+            <pre id="core-body-content" class="body-viewer" tabindex="0"></pre>
+          </section>
+          <section id="core-versions-panel" class="detail-panel" role="tabpanel" data-core-panel="versions" hidden>
+            <div class="section-heading"><div><p class="section-index">// VERSION HISTORY</p><h3>版本时间线</h3></div><p id="core-version-count" class="section-meta"></p></div>
+            <p class="field-help">历史正文仅在选择后读取。回滚会从目标历史版本创建一个新的当前版本，不删除任何历史。</p>
+            <div id="core-version-state" class="state-panel compact-state" role="status" aria-live="polite">切换到版本页后读取版本列表。</div>
+            <div id="core-version-list" class="version-list"></div>
+            <div id="core-version-pagination" class="pagination"></div>
+          </section>
+        </div>
+      </section>
+
+      <dialog id="core-edit-dialog" class="core-dialog" aria-labelledby="core-edit-title">
+        <form id="core-edit-form" class="core-dialog__content" novalidate>
+          <div class="section-heading"><div><p class="section-index">// FULL REPLACE</p><h2 id="core-edit-title">编辑 Core / WhoAmI 全文</h2></div><button id="close-core-edit" class="button button--quiet" type="button">取消</button></div>
+          <label for="core-edit-body">完整新正文</label>
+          <textarea id="core-edit-body" rows="16" required aria-describedby="core-edit-counter core-edit-error"></textarea>
+          <div class="counter-row"><span id="core-edit-counter">0 / 4,000</span><span>空白、超限或未修改时不能保存</span></div>
+          <section class="diff-section" aria-labelledby="core-edit-preview-title"><h3 id="core-edit-preview-title">逐行差异预览</h3><pre id="core-edit-preview" class="diff-preview">修改正文后显示逐行差异。</pre></section>
+          <p id="core-edit-error" class="field-error" role="alert" hidden></p>
+          <div class="form-actions"><button id="core-edit-submit" class="button button--primary" type="submit" disabled>保存为新版本</button></div>
+        </form>
+      </dialog>
+
+      <dialog id="core-version-dialog" class="core-dialog" aria-labelledby="core-version-title">
+        <div class="core-dialog__content">
+          <div class="section-heading"><div><p class="section-index">// HISTORICAL BODY</p><h2 id="core-version-title">历史版本正文</h2></div><button id="close-core-version" class="button button--quiet" type="button">关闭</button></div>
+          <div id="core-version-dialog-state" class="state-panel compact-state" role="status" aria-live="polite">正在读取历史正文…</div>
+          <pre id="core-version-body" class="body-viewer" tabindex="0"></pre>
+          <section class="diff-section" aria-labelledby="core-version-compare-title"><h3 id="core-version-compare-title">与当前正文比较</h3><pre id="core-version-compare" class="diff-preview"></pre></section>
+          <div class="form-actions"><button id="open-core-rollback" class="button button--warning" type="button">准备回滚此版本</button></div>
+        </div>
+      </dialog>
+
+      <dialog id="core-rollback-dialog" class="core-dialog core-dialog--warning" aria-labelledby="core-rollback-title">
+        <form id="core-rollback-form" class="core-dialog__content" novalidate>
+          <div class="section-heading"><div><p class="section-index">// CONFIRMED ROLLBACK</p><h2 id="core-rollback-title">回滚 Core / WhoAmI</h2></div><button id="close-core-rollback" class="button button--quiet" type="button">取消</button></div>
+          <p id="core-rollback-summary" class="rollback-summary"></p>
+          <label for="core-rollback-confirmation">输入 <code>Core / WhoAmI</code> 继续</label>
+          <input id="core-rollback-confirmation" autocomplete="off" spellcheck="false" aria-describedby="core-rollback-help core-rollback-error">
+          <p id="core-rollback-help" class="field-help">此操作不会删除历史；它会把目标正文写成一个新的当前版本。</p>
+          <p id="core-rollback-error" class="field-error" role="alert" hidden></p>
+          <div class="form-actions"><button id="core-rollback-submit" class="button button--warning" type="submit" disabled>确认创建回滚版本</button></div>
+        </form>
+      </dialog>
 
       <section id="topic-detail-view" class="view-panel" data-panel="detail" aria-labelledby="topic-detail-title" hidden>
         <div class="view-heading">

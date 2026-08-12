@@ -125,7 +125,7 @@ def test_home_dom_has_shell_dashboard_catalog_and_accessible_controls() -> None:
         "error-state",
         "retry-overview",
     } <= parser.ids
-    assert ["首页", "多主题召回", "最近提问", "回收站"] == parser.nav_labels
+    assert ["核心记忆", "首页", "多主题召回", "最近提问", "回收站"] == parser.nav_labels
     assert {
         "session-token",
         "topic-search",
@@ -179,6 +179,97 @@ def test_app_uses_one_authenticated_overview_snapshot_and_safe_dom_updates() -> 
     assert "catch" in script
     assert "finally" in script
     assert "console." not in script
+
+
+def test_core_panel_dom_is_first_class_operational_and_body_free() -> None:
+    html = _asset_text("index.html")
+    parser = _ContractParser()
+    parser.feed(html)
+
+    assert {
+        "core-home-card",
+        "core-home-presence",
+        "core-home-version",
+        "core-home-updated",
+        "core-home-fingerprint",
+        "core-home-budget",
+        "open-core-memory",
+        "core-view",
+        "core-title",
+        "core-metadata",
+        "core-state",
+        "core-init-form",
+        "core-init-body",
+        "core-init-counter",
+        "core-init-submit",
+        "core-tabs",
+        "core-body-panel",
+        "core-body-content",
+        "open-core-edit",
+        "core-versions-panel",
+        "core-version-list",
+        "core-version-pagination",
+        "core-edit-dialog",
+        "core-edit-body",
+        "core-edit-counter",
+        "core-edit-preview",
+        "core-edit-submit",
+        "core-version-dialog",
+        "core-version-body",
+        "core-version-compare",
+        "core-rollback-dialog",
+        "core-rollback-confirmation",
+        "core-rollback-submit",
+    } <= parser.ids
+    assert {"core-init-body", "core-edit-body", "core-rollback-confirmation"} <= parser.label_targets
+    assert "Core / WhoAmI" in html
+    assert "每次 Hermes 对话" in html
+    assert "ASSET_TEST_PRIVATE_CANONICAL_BODY" not in html
+    assert "core-archive" not in html
+    assert "core-trash" not in html
+    assert "core-delete" not in html
+
+
+def test_core_script_uses_exact_lazy_authenticated_contracts_and_safe_updates() -> None:
+    script = _asset_text("app.js")
+
+    for contract in (
+        'const CORE_MAX_CHARS = 4000',
+        '"/api/core-memory/body"',
+        '"/api/core-memory/initialize"',
+        '"/api/core-memory/replace"',
+        '"/api/core-memory/rollback"',
+        '"/api/core-memory/versions?page=',
+        '"/api/core-memory/versions/',
+        'confirmation: "Core / WhoAmI"',
+        "loadCoreBody",
+        "loadCoreVersions",
+        "loadCoreVersionBody",
+        "renderCoreDiffPreview",
+        "refreshCoreSurfaces",
+        'route.view === "core"',
+        'event.key === "Escape"',
+        "coreReturnFocus",
+    ):
+        assert contract in script
+    assert script.count('api("/api/core-memory/body")') == 1
+    assert "innerHTML" not in script
+    assert "localStorage" not in script
+    assert "console." not in script
+
+
+def test_core_styles_distinguish_pinned_card_dialog_warning_and_mobile_wrap() -> None:
+    css = _asset_text("styles.css")
+
+    for contract in (
+        ".core-home-card",
+        ".core-surface",
+        ".core-dialog",
+        ".button--warning",
+        "overflow-wrap: anywhere",
+        "@media (max-width: 640px)",
+    ):
+        assert contract in css
 
 
 def test_task10_dom_exposes_integrated_detail_recall_and_history_views() -> None:

@@ -4,8 +4,9 @@
   const SESSION_KEY = "hermes-topic-memory.panel-session";
   const SVG_NS = "http://www.w3.org/2000/svg";
   const PAGE_SIZE = 6;
+  const CORE_MAX_CHARS = 4000;
   const DETAIL_TABS = ["overview", "questions", "ask", "body", "versions", "settings"];
-  const PRIMARY_VIEWS = ["home", "recall", "recent", "recycle", "detail"];
+  const PRIMARY_VIEWS = ["core", "home", "recall", "recent", "recycle", "detail"];
   const TOPIC_STATE_PATHS = { archive: "/archive", restore: "/restore", trash: "/trash" };
   const numberFormat = new Intl.NumberFormat("zh-CN");
   const timeFormat = new Intl.DateTimeFormat("zh-CN", {
@@ -21,6 +22,7 @@
   const elements = Object.fromEntries(
     Array.from(document.querySelectorAll("[id]"), (element) => [element.id, element]),
   );
+  const dialogReturnFocus = new WeakMap();
 
   const state = {
     token: "",
@@ -40,6 +42,17 @@
       versions: [],
       versionsLoaded: false,
       versionBodies: {},
+    },
+    core: {
+      metadata: null,
+      body: null,
+      tab: "body",
+      versionsPage: 1,
+      versions: [],
+      versionsLoaded: false,
+      versionBodies: {},
+      selectedVersion: null,
+      selectedVersionTrigger: null,
     },
     recall: {
       running: false,
@@ -155,6 +168,13 @@
     state.token = "";
     state.snapshot = null;
     state.topics = [];
+    state.core.metadata = null;
+    resetCorePrivateState(true);
+    [byId("core-edit-dialog"), byId("core-version-dialog"), byId("core-rollback-dialog")].forEach((dialog) => {
+      if (dialog.open) {
+        closeCoreDialog(dialog, false);
+      }
+    });
     setHidden(byId("panel-shell"), true);
     setHidden(byId("session-gate"), false);
     byId("session-error").textContent = message;
@@ -234,8 +254,14 @@
     if (!snapshot || !snapshot.kpis || !snapshot.charts || !Array.isArray(snapshot.topics)) {
       throw new ApiError(502, "概览响应缺少必要字段。请检查服务版本。");
     }
+    const previousCore = state.core.metadata;
     state.snapshot = snapshot;
     state.topics = snapshot.topics.slice();
+    state.core.metadata = snapshot.core_memory || { present: false, max_body_chars: CORE_MAX_CHARS };
+    if (previousCore && state.core.body && (Number(previousCore.version) !== Number(state.core.metadata.version) || previousCore.content_fingerprint !== state.core.metadata.content_fingerprint)) {
+      resetCorePrivateState(true);
+    }
+    renderCoreHomeCard(state.core.metadata);
     renderKpis(snapshot.kpis);
     renderActivity(snapshot.charts.daily_questions || []);
     renderDistribution(snapshot.charts.topic_distribution || []);
@@ -245,6 +271,440 @@
     byId("snapshot-status").textContent = `已鉴权快照 / ${timeFormat.format(new Date())}`;
     const isEmpty = snapshot.topics.length === 0 && Number(snapshot.kpis.total_question_count) === 0;
     showShellState(isEmpty ? "empty" : "ready");
+  }
+
+  function resetCorePrivateState(clearDrafts = false) {
+    state.core.body = null;
+    state.core.versionsPage = 1;
+    state.core.versions = [];
+    state.core.versionsLoaded = false;
+    state.core.versionBodies = {};
+    state.core.selectedVersion = null;
+    state.core.selectedVersionTrigger = null;
+    byId("core-body-content").textContent = "";
+    byId("core-version-body").textContent = "";
+    byId("core-version-compare").textContent = "";
+    clear(byId("core-version-list"));
+    clear(byId("core-version-pagination"));
+    if (clearDrafts) {
+      byId("core-init-form").reset();
+      byId("core-edit-form").reset();
+      byId("core-rollback-form").reset();
+      byId("core-init-error").textContent = "";
+      byId("core-edit-preview").textContent = "";
+      byId("core-edit-error").textContent = "";
+      byId("core-rollback-summary").textContent = "";
+      byId("core-rollback-error").textContent = "";
+    }
+  }
+
+  function fingerprintPrefix(value) {
+    const fingerprint = String(value || "");
+    return fingerprint ? `${fingerprint.slice(0, 12)}…` : "—";
+  }
+
+  function coreBudgetText(metadata = state.core.metadata) {
+    const maximum = Number(metadata && metadata.max_body_chars) || CORE_MAX_CHARS;
+    const bodyMatches = state.core.body && metadata && state.core.body.fingerprint === metadata.content_fingerprint;
+    const count = bodyMatches ? coreCharCount(state.core.body.body) : Number(metadata && metadata.body_chars);
+    return `${Number.isFinite(count) ? formatCount(count) : "—"} / ${formatCount(maximum)}`;
+  }
+
+  function renderCoreHomeCard(metadata) {
+    const value = metadata || { present: false, max_body_chars: CORE_MAX_CHARS };
+    setHidden(byId("core-home-card"), false);
+    byId("core-home-presence").textContent = value.present ? "已初始化 / 常驻" : "尚未初始化";
+    byId("core-home-version").textContent = value.present ? `v${formatCount(value.version)}` : "—";
+    byId("core-home-updated").textContent = value.present ? formatTime(value.updated_at) : "—";
+    byId("core-home-fingerprint").textContent = value.present ? fingerprintPrefix(value.content_fingerprint) : "—";
+    byId("core-home-budget").textContent = coreBudgetText(value);
+    byId("open-core-memory").textContent = value.present ? "打开核心记忆" : "初始化核心记忆";
+  }
+
+  function coreCharCount(value) {
+    return Array.from(String(value || "")).length;
+  }
+
+  function renderCoreMetadata() {
+    const metadata = state.core.metadata || { present: false, max_body_chars: CORE_MAX_CHARS };
+    renderMetadata(byId("core-metadata"), [
+      ["状态", metadata.present ? "已初始化 / 每轮自动可用" : "尚未初始化"],
+      ["版本", metadata.present ? `v${formatCount(metadata.version)}` : "—"],
+      ["更新时间", metadata.present ? formatTime(metadata.updated_at) : "—"],
+      ["指纹", metadata.present ? fingerprintPrefix(metadata.content_fingerprint) : "—"],
+      ["字符预算", coreBudgetText(metadata)],
+    ]);
+  }
+
+  function renderCoreSurface() {
+    const metadata = state.core.metadata || { present: false, max_body_chars: CORE_MAX_CHARS };
+    renderCoreMetadata();
+    setHidden(byId("core-absent"), Boolean(metadata.present));
+    setHidden(byId("core-present"), !metadata.present);
+    if (!metadata.present) {
+      resetCorePrivateState();
+      updateCoreInitState();
+      showInlineState(byId("core-state"), "EMPTY / CORE", "核心记忆尚未初始化。填写下方全文后将创建 v1，并从下一次 Hermes 对话开始自动可用。");
+      return;
+    }
+    selectCoreTab(state.core.tab, false);
+    if (state.core.body) {
+      renderCoreBody(state.core.body);
+    } else {
+      showInlineState(byId("core-state"), "LOADING / CORE BODY", "正在通过鉴权端点读取当前正文…");
+      byId("open-core-edit").disabled = true;
+    }
+  }
+
+  async function openCoreView() {
+    switchView("core");
+    renderCoreSurface();
+    window.requestAnimationFrame(() => byId("core-title").focus());
+    if (state.core.metadata && state.core.metadata.present) {
+      await loadCoreBody();
+    }
+  }
+
+  async function refreshCoreSurfaces(successMessage = "") {
+    showInlineState(byId("core-state"), "LOADING / CORE", "正在刷新核心元数据与当前正文…");
+    try {
+      const snapshot = await api("/api/overview");
+      renderSnapshot(snapshot);
+      renderCoreSurface();
+      if (state.core.metadata && state.core.metadata.present && state.view === "core") {
+        await loadCoreBody(true);
+        if (state.core.tab === "versions") {
+          await loadCoreVersions(1);
+        }
+      }
+      if (successMessage) {
+        showInlineState(byId("core-state"), "VERIFIED / CORE", successMessage);
+      }
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("core-state"), "ERROR / CORE", `${errorMessage(error)} 核心正文未更改，请重新载入。`, "重新载入核心记忆", () => { void refreshCoreSurfaces(); });
+      }
+    }
+  }
+
+  async function loadCoreBody(force = false) {
+    if (state.view !== "core" || !state.core.metadata || !state.core.metadata.present || (state.core.body && !force)) {
+      return;
+    }
+    showInlineState(byId("core-state"), "LOADING / CORE BODY", "正在通过鉴权端点读取当前正文…");
+    byId("open-core-edit").disabled = true;
+    try {
+      const payload = await api("/api/core-memory/body");
+      if (state.view !== "core") {
+        return;
+      }
+      state.core.body = payload;
+      state.core.versionBodies[String(payload.version)] = { ...payload, current: true };
+      renderCoreBody(payload);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("core-state"), "ERROR / CORE BODY", `${errorMessage(error)} 正文未显示。`, "重试正文", () => { void loadCoreBody(true); });
+      }
+    }
+  }
+
+  function renderCoreBody(payload) {
+    byId("core-body-content").textContent = String(payload.body || "");
+    byId("open-core-edit").disabled = false;
+    renderCoreMetadata();
+    renderCoreHomeCard(state.core.metadata);
+    showInlineState(byId("core-state"), "READY / CORE", `已读取 v${formatCount(payload.version)} / 指纹 ${fingerprintPrefix(payload.fingerprint)} / ${coreBudgetText()}`);
+  }
+
+  function updateCoreInitState() {
+    const body = byId("core-init-body").value;
+    const count = coreCharCount(body);
+    byId("core-init-counter").textContent = `${formatCount(count)} / ${formatCount(CORE_MAX_CHARS)}`;
+    byId("core-init-submit").disabled = !body.trim() || count > CORE_MAX_CHARS;
+  }
+
+  async function initializeCore(event) {
+    event.preventDefault();
+    const body = byId("core-init-body").value;
+    const count = coreCharCount(body);
+    updateCoreInitState();
+    if (!body.trim() || count > CORE_MAX_CHARS) {
+      byId("core-init-error").textContent = count > CORE_MAX_CHARS ? "全文超过 4,000 个字符，请缩短后再提交。" : "核心记忆不能只包含空白。";
+      setHidden(byId("core-init-error"), false);
+      return;
+    }
+    setHidden(byId("core-init-error"), true);
+    const button = byId("core-init-submit");
+    setButtonLoading(button, true, "初始化并读回中…", "初始化为 v1");
+    try {
+      await api("/api/core-memory/initialize", { method: "POST", body: { body } });
+      byId("core-init-form").reset();
+      updateCoreInitState();
+      await refreshCoreSurfaces("初始化已读回确认；Core / WhoAmI 当前为 v1，并将在下一次 Hermes 对话自动可用。");
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        byId("core-init-error").textContent = `${errorMessage(error)} 请刷新状态后重试初始化。`;
+        setHidden(byId("core-init-error"), false);
+      }
+    } finally {
+      setButtonLoading(button, false, "初始化并读回中…", "初始化为 v1");
+      updateCoreInitState();
+    }
+  }
+
+  function openCoreDialog(dialog, trigger, focusTarget) {
+    dialogReturnFocus.set(dialog, trigger);
+    dialog.dataset.restoreFocus = "true";
+    dialog.showModal();
+    window.requestAnimationFrame(() => (focusTarget || dialog).focus());
+  }
+
+  function closeCoreDialog(dialog, restoreFocus = true) {
+    dialog.dataset.restoreFocus = String(restoreFocus);
+    if (dialog.open) {
+      dialog.close();
+    }
+  }
+
+  function coreReturnFocus(dialog) {
+    const trigger = dialogReturnFocus.get(dialog);
+    dialogReturnFocus.delete(dialog);
+    if (dialog.dataset.restoreFocus === "true" && trigger && trigger.isConnected) {
+      window.setTimeout(() => trigger.focus({ preventScroll: true }), 0);
+    }
+  }
+
+  function openCoreEdit() {
+    if (!state.core.body) {
+      return;
+    }
+    const dialog = byId("core-edit-dialog");
+    byId("core-edit-body").value = String(state.core.body.body || "");
+    setHidden(byId("core-edit-error"), true);
+    renderCoreDiffPreview();
+    openCoreDialog(dialog, byId("open-core-edit"), byId("core-edit-body"));
+  }
+
+  function lineDiffText(beforeValue, afterValue) {
+    const before = String(beforeValue || "").split("\n");
+    const after = String(afterValue || "").split("\n");
+    let prefix = 0;
+    while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) {
+      prefix += 1;
+    }
+    let suffix = 0;
+    while (suffix < before.length - prefix && suffix < after.length - prefix && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) {
+      suffix += 1;
+    }
+    const output = [];
+    before.slice(Math.max(0, prefix - 3), prefix).forEach((line) => output.push(`  ${line}`));
+    before.slice(prefix, before.length - suffix).slice(0, 200).forEach((line) => output.push(`- ${line}`));
+    after.slice(prefix, after.length - suffix).slice(0, 200).forEach((line) => output.push(`+ ${line}`));
+    before.slice(before.length - suffix, before.length - suffix + 3).forEach((line) => output.push(`  ${line}`));
+    if (before.length - prefix - suffix > 200 || after.length - prefix - suffix > 200) {
+      output.push("… 差异过长；这里只显示前 200 行变更。");
+    }
+    return output.length ? output.join("\n") : "没有正文差异；不会提交。";
+  }
+
+  function renderCoreDiffPreview() {
+    const body = byId("core-edit-body").value;
+    const current = String(state.core.body && state.core.body.body || "");
+    const count = coreCharCount(body);
+    byId("core-edit-counter").textContent = `${formatCount(count)} / ${formatCount(CORE_MAX_CHARS)}`;
+    byId("core-edit-preview").textContent = lineDiffText(current, body);
+    byId("core-edit-submit").disabled = !state.core.body || !body.trim() || count > CORE_MAX_CHARS || body === current;
+  }
+
+  function showCoreMutationError(element, error, reload) {
+    const message = error instanceof ApiError && error.status === 409
+      ? "服务器上的核心记忆已变化；本次内容没有覆盖服务器正文。"
+      : `${errorMessage(error)} 本次内容没有写入。`;
+    element.replaceChildren(textNode(message));
+    if (error instanceof ApiError && error.status === 409) {
+      const button = create("button", "button button--quiet", "重新加载最新正文后重试");
+      button.type = "button";
+      button.addEventListener("click", reload);
+      element.append(textNode(" "), button);
+    }
+    setHidden(element, false);
+  }
+
+  async function replaceCoreBody(event) {
+    event.preventDefault();
+    const current = state.core.body;
+    const body = byId("core-edit-body").value;
+    renderCoreDiffPreview();
+    if (!current || byId("core-edit-submit").disabled) {
+      byId("core-edit-error").textContent = "请输入非空、有变化且不超过 4,000 个字符的完整正文。";
+      setHidden(byId("core-edit-error"), false);
+      return;
+    }
+    setHidden(byId("core-edit-error"), true);
+    const button = byId("core-edit-submit");
+    setButtonLoading(button, true, "保存并读回中…", "保存为新版本");
+    try {
+      await api("/api/core-memory/replace", {
+        method: "POST",
+        body: { body, expected_version: current.version, expected_fingerprint: current.fingerprint },
+      });
+      closeCoreDialog(byId("core-edit-dialog"));
+      await refreshCoreSurfaces(`完整替换已读回确认；当前为 v${formatCount(Number(current.version) + 1)}。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showCoreMutationError(byId("core-edit-error"), error, () => {
+          closeCoreDialog(byId("core-edit-dialog"));
+          void refreshCoreSurfaces();
+        });
+      }
+    } finally {
+      setButtonLoading(button, false, "保存并读回中…", "保存为新版本");
+      renderCoreDiffPreview();
+    }
+  }
+
+  function selectCoreTab(tab, load = true) {
+    const next = tab === "versions" ? "versions" : "body";
+    state.core.tab = next;
+    document.querySelectorAll("[data-core-tab]").forEach((button) => {
+      const active = button.dataset.coreTab === next;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    document.querySelectorAll("[data-core-panel]").forEach((panel) => {
+      setHidden(panel, panel.dataset.corePanel !== next);
+    });
+    if (load && next === "versions" && !state.core.versionsLoaded) {
+      void loadCoreVersions(1);
+    }
+  }
+
+  async function loadCoreVersions(page = state.core.versionsPage) {
+    state.core.versionsPage = page;
+    state.core.versionsLoaded = false;
+    showInlineState(byId("core-version-state"), "LOADING / CORE VERSIONS", "正在读取核心记忆版本列表…");
+    clear(byId("core-version-list"));
+    clear(byId("core-version-pagination"));
+    try {
+      const payload = await api("/api/core-memory/versions?page=" + page + "&page_size=" + PAGE_SIZE);
+      state.core.versionsLoaded = true;
+      state.core.versions = Array.isArray(payload.items) ? payload.items.slice() : [];
+      byId("core-version-count").textContent = `共 ${formatCount(payload.total)} 个版本`;
+      if (!state.core.versions.length) {
+        showInlineState(byId("core-version-state"), "EMPTY / CORE VERSIONS", "暂无版本记录。");
+        return;
+      }
+      setHidden(byId("core-version-state"), true);
+      state.core.versions.forEach((version) => {
+        const row = create("div", "version-row");
+        const label = create("strong", "", `v${formatCount(version.version)}${version.current ? " / 当前" : ""}`);
+        const fingerprint = create("code", "", fingerprintPrefix(version.fingerprint));
+        const actions = create("div", "version-actions");
+        const view = create("button", "button", version.current ? "查看当前正文" : "查看并比较");
+        view.type = "button";
+        view.addEventListener("click", () => { void loadCoreVersionBody(version, view); });
+        actions.append(view);
+        row.append(label, fingerprint, actions);
+        byId("core-version-list").append(row);
+      });
+      renderPagination(byId("core-version-pagination"), payload, (nextPage) => { void loadCoreVersions(nextPage); });
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("core-version-state"), "ERROR / CORE VERSIONS", `${errorMessage(error)} 请重试版本列表。`, "重试版本", () => { void loadCoreVersions(page); });
+      }
+    }
+  }
+
+  async function readCoreVersionBody(version) {
+    const key = String(version);
+    if (state.core.versionBodies[key]) {
+      return state.core.versionBodies[key];
+    }
+    const payload = await api("/api/core-memory/versions/" + encodeURIComponent(key) + "/body");
+    state.core.versionBodies[key] = payload;
+    return payload;
+  }
+
+  async function loadCoreVersionBody(version, button) {
+    state.core.selectedVersion = null;
+    state.core.selectedVersionTrigger = button;
+    byId("core-version-title").textContent = `Core / WhoAmI · v${formatCount(version.version)}`;
+    byId("core-version-body").textContent = "";
+    byId("core-version-compare").textContent = "";
+    setHidden(byId("open-core-rollback"), true);
+    showInlineState(byId("core-version-dialog-state"), "LOADING / HISTORICAL BODY", "正在按需读取所选版本正文…");
+    if (!byId("core-version-dialog").open) {
+      openCoreDialog(byId("core-version-dialog"), button, byId("close-core-version"));
+    }
+    try {
+      const payload = await readCoreVersionBody(version.version);
+      state.core.selectedVersion = payload;
+      byId("core-version-body").textContent = String(payload.body || "");
+      byId("core-version-compare").textContent = lineDiffText(state.core.body && state.core.body.body, payload.body);
+      showInlineState(byId("core-version-dialog-state"), "READY / HISTORICAL BODY", `已读取 v${formatCount(payload.version)} / 指纹 ${fingerprintPrefix(payload.fingerprint)}。`);
+      setHidden(byId("open-core-rollback"), Boolean(payload.current));
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("core-version-dialog-state"), "ERROR / HISTORICAL BODY", `${errorMessage(error)} 历史正文未显示。`, "重试读取", () => { void loadCoreVersionBody(version, button); });
+      }
+    }
+  }
+
+  function openCoreRollback() {
+    const selected = state.core.selectedVersion;
+    const current = state.core.body;
+    if (!selected || !current || selected.current) {
+      return;
+    }
+    closeCoreDialog(byId("core-version-dialog"), false);
+    byId("core-rollback-form").reset();
+    byId("core-rollback-summary").textContent = `目标历史版本 v${formatCount(selected.version)}；当前版本 v${formatCount(current.version)}。确认后将创建 v${formatCount(Number(current.version) + 1)}，不会删除任何版本。`;
+    setHidden(byId("core-rollback-error"), true);
+    updateCoreRollbackSubmit();
+    openCoreDialog(byId("core-rollback-dialog"), state.core.selectedVersionTrigger, byId("core-rollback-confirmation"));
+  }
+
+  function updateCoreRollbackSubmit() {
+    byId("core-rollback-submit").disabled = byId("core-rollback-confirmation").value !== "Core / WhoAmI";
+  }
+
+  async function rollbackCoreVersion(event) {
+    event.preventDefault();
+    const target = state.core.selectedVersion;
+    const current = state.core.body;
+    updateCoreRollbackSubmit();
+    if (!target || !current || byId("core-rollback-submit").disabled) {
+      byId("core-rollback-error").textContent = "请输入完全一致的 Core / WhoAmI，并确认目标与当前版本。";
+      setHidden(byId("core-rollback-error"), false);
+      return;
+    }
+    setHidden(byId("core-rollback-error"), true);
+    const button = byId("core-rollback-submit");
+    setButtonLoading(button, true, "回滚并读回中…", "确认创建回滚版本");
+    try {
+      await api("/api/core-memory/rollback", {
+        method: "POST",
+        body: {
+          target_version: Number(target.version),
+          expected_version: current.version,
+          expected_fingerprint: current.fingerprint,
+          confirmation: "Core / WhoAmI",
+        },
+      });
+      closeCoreDialog(byId("core-rollback-dialog"));
+      await refreshCoreSurfaces(`已从 v${formatCount(target.version)} 创建新的当前 v${formatCount(Number(current.version) + 1)}；历史版本保持不变。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showCoreMutationError(byId("core-rollback-error"), error, () => {
+          closeCoreDialog(byId("core-rollback-dialog"));
+          void refreshCoreSurfaces();
+        });
+      }
+    } finally {
+      setButtonLoading(button, false, "回滚并读回中…", "确认创建回滚版本");
+      updateCoreRollbackSubmit();
+    }
   }
 
   function renderKpis(kpis) {
@@ -1540,7 +2000,7 @@
       }
       return { view: "detail", topicId, tab: DETAIL_TABS.includes(parts[2]) ? parts[2] : "overview" };
     }
-    if (["home", "recall", "recent", "recycle"].includes(parts[0]) && parts.length === 1) {
+    if (["core", "home", "recall", "recent", "recycle"].includes(parts[0]) && parts.length === 1) {
       return { view: parts[0] };
     }
     return { view: "home", invalid: true };
@@ -1556,6 +2016,10 @@
     }
     if (route.view === "detail") {
       await openTopicDetail(route.topicId, route.tab);
+      return;
+    }
+    if (route.view === "core") {
+      await openCoreView();
       return;
     }
     switchView(route.view);
@@ -1671,6 +2135,41 @@
   byId("refresh-overview").addEventListener("click", () => { void refreshOverview(); });
   byId("clear-session").addEventListener("click", clearSession);
   byId("reset-session").addEventListener("click", clearSession);
+  byId("open-core-memory").addEventListener("click", () => { setHash("core"); });
+  byId("refresh-core").addEventListener("click", () => { void refreshCoreSurfaces(); });
+  byId("return-core-home").addEventListener("click", () => { setHash("home"); });
+  byId("core-init-body").addEventListener("input", updateCoreInitState);
+  byId("core-init-form").addEventListener("submit", (event) => { void initializeCore(event); });
+  byId("open-core-edit").addEventListener("click", openCoreEdit);
+  byId("close-core-edit").addEventListener("click", () => { closeCoreDialog(byId("core-edit-dialog")); });
+  byId("core-edit-body").addEventListener("input", renderCoreDiffPreview);
+  byId("core-edit-form").addEventListener("submit", (event) => { void replaceCoreBody(event); });
+  byId("close-core-version").addEventListener("click", () => { closeCoreDialog(byId("core-version-dialog")); });
+  byId("open-core-rollback").addEventListener("click", openCoreRollback);
+  byId("close-core-rollback").addEventListener("click", () => { closeCoreDialog(byId("core-rollback-dialog")); });
+  byId("core-rollback-confirmation").addEventListener("input", updateCoreRollbackSubmit);
+  byId("core-rollback-form").addEventListener("submit", (event) => { void rollbackCoreVersion(event); });
+  [byId("core-edit-dialog"), byId("core-version-dialog"), byId("core-rollback-dialog")].forEach((dialog) => {
+    dialog.addEventListener("close", () => { coreReturnFocus(dialog); });
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeCoreDialog(dialog);
+    });
+  });
+  document.querySelectorAll("[data-core-tab]").forEach((button) => {
+    button.addEventListener("click", () => { selectCoreTab(button.dataset.coreTab); });
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+        return;
+      }
+      event.preventDefault();
+      const buttons = Array.from(document.querySelectorAll("[data-core-tab]"));
+      const index = buttons.indexOf(button);
+      const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : event.key === "ArrowRight" ? (index + 1) % buttons.length : (index - 1 + buttons.length) % buttons.length;
+      buttons[nextIndex].focus();
+      selectCoreTab(buttons[nextIndex].dataset.coreTab);
+    });
+  });
   byId("topic-search").addEventListener("input", renderCatalog);
   byId("topic-status-filter").addEventListener("change", renderCatalog);
   byId("topic-sort").addEventListener("change", renderCatalog);
