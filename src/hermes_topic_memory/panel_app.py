@@ -1,0 +1,608 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import secrets
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import parse_qsl, urlsplit
+
+from .catalog import TopicCatalog
+from .query_history import QueryHistoryStore, QueryRecord
+from .store import FileTopicStore, TopicNotFoundError
+
+_TOPIC_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_MAX_PAGE_SIZE = 100
+_DEFAULT_PAGE_SIZE = 50
+_MAX_QUERY_FIELDS = 32
+
+
+@dataclass(frozen=True, slots=True)
+class PanelResponse:
+    status: int
+    body: bytes
+    content_type: str = "application/json; charset=utf-8"
+
+
+class _RequestError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+class _ResourceNotFound(LookupError):
+    pass
+
+
+class PanelApplication:
+    """Authenticated Panel routing and serialization, independent of HTTP."""
+
+    __slots__ = ("_auth_token", "_reader", "data_root", "history", "store")
+
+    def __init__(self, data_root: str | Path, reader: object, auth_token: str) -> None:
+        root_input = Path(data_root).expanduser()
+        if root_input.is_symlink():
+            raise ValueError("data root must not be a symlink")
+        self.data_root = root_input.resolve(strict=True)
+        if (
+            not isinstance(auth_token, str)
+            or not auth_token
+            or "\n" in auth_token
+            or "\r" in auth_token
+        ):
+            raise ValueError("Panel auth token must be non-empty single-line text")
+        self._reader = reader
+        self._auth_token = auth_token
+        self.store = FileTopicStore(self.data_root)
+        self.history = QueryHistoryStore(self.data_root)
+
+    def dispatch(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        body: bytes = b"",
+    ) -> PanelResponse:
+        if not self._is_authorized(headers):
+            return _error_response(401, "unauthorized", "Authentication required.")
+
+        try:
+            path, params = _parse_target(target)
+            _parse_json_body(body)
+            if method.upper() != "GET":
+                return _error_response(
+                    405, "method_not_allowed", "Method not allowed."
+                )
+            return self._dispatch_get(path, params)
+        except _RequestError as error:
+            return _error_response(400, error.code, error.message)
+        except (_ResourceNotFound, TopicNotFoundError):
+            return _error_response(404, "not_found", "Resource not found.")
+        except Exception:
+            return _error_response(
+                500, "internal_error", "Request could not be completed."
+            )
+
+    def _is_authorized(self, headers: Mapping[str, str] | None) -> bool:
+        authorization = ""
+        if headers is not None:
+            for name, value in headers.items():
+                if str(name).casefold() == "authorization":
+                    authorization = str(value)
+                    break
+        prefix = "Bearer "
+        has_bearer_prefix = authorization.startswith(prefix)
+        supplied = authorization[len(prefix) :] if has_bearer_prefix else ""
+        matches = secrets.compare_digest(supplied, self._auth_token)
+        return has_bearer_prefix and matches
+
+    def _dispatch_get(
+        self, path: tuple[str, ...], params: dict[str, str]
+    ) -> PanelResponse:
+        if path == ("api", "overview"):
+            _reject_params(params, set())
+            return _json_response(200, self._overview())
+        if path == ("api", "topics"):
+            return _json_response(200, self._topics(params))
+        if path == ("api", "questions"):
+            return _json_response(200, self._questions(params))
+        if path == ("api", "recycle-bin"):
+            _reject_params(params, set())
+            return _json_response(200, {"items": self._recycle_items()})
+
+        if len(path) >= 3 and path[:2] == ("api", "topics"):
+            topic_id = _validated_topic_id(path[2])
+            if len(path) == 3:
+                _reject_params(params, set())
+                return _json_response(200, {"topic": self._topic_detail(topic_id)})
+            if len(path) == 4 and path[3] == "body":
+                _reject_params(params, set())
+                return _json_response(200, self._current_body(topic_id))
+            if len(path) == 4 and path[3] == "questions":
+                return _json_response(
+                    200, self._questions(params, topic_id=topic_id)
+                )
+            if len(path) == 4 and path[3] == "versions":
+                return _json_response(200, self._versions(topic_id, params))
+            if (
+                len(path) == 6
+                and path[3] == "versions"
+                and path[5] == "body"
+            ):
+                _reject_params(params, set())
+                version = _positive_integer(path[4], "version")
+                return _json_response(200, self._version_body(topic_id, version))
+
+        raise _ResourceNotFound
+
+    def _overview(self) -> dict[str, Any]:
+        snapshot = TopicCatalog(self.data_root).snapshot()
+        recycled = self._recycle_items()
+        topics = [topic.to_public_dict() for topic in snapshot.topics]
+        distribution = sorted(
+            (
+                {
+                    "topic_id": topic.topic_id,
+                    "display_name": topic.display_name,
+                    "question_count": topic.question_count,
+                }
+                for topic in snapshot.topics
+            ),
+            key=lambda item: (
+                -item["question_count"],
+                item["display_name"].casefold(),
+                item["topic_id"],
+            ),
+        )
+        return {
+            "kpis": {
+                "active_topic_count": snapshot.active_topic_count,
+                "total_question_count": snapshot.total_question_count,
+                "active_cache_count": snapshot.active_cache_count,
+                "questions_last_30_days": snapshot.questions_last_30_days,
+                "archived_topic_count": sum(
+                    topic.status == "archived" for topic in snapshot.topics
+                ),
+                "trashed_topic_count": len(recycled),
+            },
+            "charts": {
+                "daily_questions": [
+                    item.to_public_dict() for item in snapshot.daily_questions
+                ],
+                "topic_distribution": distribution,
+            },
+            "topics": topics,
+            "recent_questions": [
+                _query_summary(record) for record in self.history.list(limit=10)
+            ],
+        }
+
+    def _topics(self, params: dict[str, str]) -> dict[str, Any]:
+        _reject_params(
+            params, {"q", "status", "sort", "order", "page", "page_size"}
+        )
+        query = params.get("q", "").strip().casefold()
+        if len(query) > 200:
+            raise _RequestError("invalid_request", "Search text is too long.")
+        status = params.get("status")
+        if status is not None and status not in {"active", "archived"}:
+            raise _RequestError("invalid_request", "Invalid topic status.")
+        sort_name = params.get("sort", "title")
+        if sort_name not in {
+            "title",
+            "question_count",
+            "updated_at",
+            "version",
+        }:
+            raise _RequestError("invalid_request", "Invalid topic sort.")
+        order = params.get("order", "asc")
+        if order not in {"asc", "desc"}:
+            raise _RequestError("invalid_request", "Invalid sort order.")
+        page, page_size = _pagination(params)
+
+        topics = list(TopicCatalog(self.data_root).snapshot().topics)
+        if query:
+            topics = [
+                topic
+                for topic in topics
+                if query
+                in "\n".join((topic.topic_id, topic.display_name, *topic.aliases)).casefold()
+            ]
+        if status is not None:
+            topics = [topic for topic in topics if topic.status == status]
+        topics.sort(key=_topic_sort_key(sort_name), reverse=order == "desc")
+        return _page([topic.to_public_dict() for topic in topics], page, page_size)
+
+    def _topic_detail(self, topic_id: str) -> dict[str, Any]:
+        memory = self.store.get_topic(topic_id)
+        try:
+            summary = TopicCatalog(self.data_root).snapshot().topic(topic_id)
+        except KeyError as error:
+            raise _ResourceNotFound from error
+        metadata = memory.metadata
+        source_relative_path = _safe_relative_path(metadata.source_relative_path)
+        return {
+            "topic_id": metadata.topic_id,
+            "display_name": metadata.display_name,
+            "aliases": list(metadata.aliases),
+            "version": metadata.version,
+            "content_fingerprint": metadata.content_fingerprint,
+            "created_at": metadata.created_at,
+            "updated_at": metadata.updated_at,
+            "source_policy": metadata.source_policy,
+            "state": metadata.state,
+            "source_relative_path": source_relative_path,
+            "source_sha256": metadata.source_sha256,
+            "source_bytes": metadata.source_bytes,
+            "source_chars": metadata.source_chars,
+            "source_lines": metadata.source_lines,
+            "imported_at": metadata.imported_at,
+            "question_count": summary.question_count,
+            "active_cache_count": summary.active_cache_count,
+            "version_count": summary.version_count,
+        }
+
+    def _current_body(self, topic_id: str) -> dict[str, Any]:
+        memory = self.store.get_topic(topic_id)
+        return {
+            "topic_id": topic_id,
+            "version": memory.metadata.version,
+            "body": memory.body,
+            "fingerprint": memory.metadata.content_fingerprint,
+        }
+
+    def _questions(
+        self,
+        params: dict[str, str],
+        *,
+        topic_id: str | None = None,
+    ) -> dict[str, Any]:
+        _reject_params(
+            params,
+            {
+                "topic",
+                "status",
+                "source",
+                "date_from",
+                "date_to",
+                "scope",
+                "cache",
+                "page",
+                "page_size",
+            },
+        )
+        requested_topic = params.get("topic")
+        if topic_id is not None:
+            self.store.get_topic(topic_id)
+            if requested_topic is not None and requested_topic != topic_id:
+                raise _RequestError("invalid_request", "Conflicting topic filters.")
+            requested_topic = topic_id
+        if requested_topic is not None:
+            requested_topic = _validated_topic_id(requested_topic)
+
+        status = params.get("status")
+        if status is not None and status not in {"answered", "no_fact", "error"}:
+            raise _RequestError("invalid_request", "Invalid question status.")
+        source = params.get("source")
+        if source is not None and source not in {"hermes", "panel", "cli"}:
+            raise _RequestError("invalid_request", "Invalid question source.")
+        scope = params.get("scope")
+        if scope is not None and scope not in {"single", "multi"}:
+            raise _RequestError("invalid_request", "Invalid question scope.")
+        cache = params.get("cache")
+        if cache is not None and cache not in {"hit", "miss"}:
+            raise _RequestError("invalid_request", "Invalid cache filter.")
+        first_date = _optional_date(params.get("date_from"), "date_from")
+        last_date = _optional_date(params.get("date_to"), "date_to")
+        if (
+            first_date is not None
+            and last_date is not None
+            and first_date > last_date
+        ):
+            raise _RequestError("invalid_request", "Invalid date range.")
+        page, page_size = _pagination(params)
+
+        records = list(self.history.list())
+        filtered: list[QueryRecord] = []
+        for record in records:
+            relevant_results = tuple(
+                result
+                for result in record.selected_topics
+                if requested_topic is None or result.topic_id == requested_topic
+            )
+            if requested_topic is not None and not relevant_results:
+                continue
+            if status is not None and not any(
+                result.status == status for result in relevant_results
+            ):
+                continue
+            if source is not None and record.source != source:
+                continue
+            if scope == "single" and len(record.selected_topics) != 1:
+                continue
+            if scope == "multi" and len(record.selected_topics) <= 1:
+                continue
+            if cache == "hit" and not any(
+                result.source == "cache" for result in relevant_results
+            ):
+                continue
+            if cache == "miss" and any(
+                result.source == "cache" for result in relevant_results
+            ):
+                continue
+            record_date = _record_datetime(record).date()
+            if first_date is not None and record_date < first_date:
+                continue
+            if last_date is not None and record_date > last_date:
+                continue
+            filtered.append(record)
+        return _page([_query_dict(record) for record in filtered], page, page_size)
+
+    def _versions(self, topic_id: str, params: dict[str, str]) -> dict[str, Any]:
+        _reject_params(params, {"page", "page_size"})
+        current = self.store.get_topic(topic_id)
+        versions = sorted(self.store.list_versions(topic_id), reverse=True)
+        page, page_size = _pagination(params)
+        start = (page - 1) * page_size
+        items = []
+        for version in versions[start : start + page_size]:
+            body = self.store.read_version(topic_id, version)
+            items.append(
+                {
+                    "version": version,
+                    "current": version == current.metadata.version,
+                    "fingerprint": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                }
+            )
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": len(versions),
+        }
+
+    def _version_body(self, topic_id: str, version: int) -> dict[str, Any]:
+        current = self.store.get_topic(topic_id)
+        try:
+            body = self.store.read_version(topic_id, version)
+        except TopicNotFoundError as error:
+            raise _ResourceNotFound from error
+        return {
+            "topic_id": topic_id,
+            "version": version,
+            "body": body,
+            "fingerprint": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "current": version == current.metadata.version,
+        }
+
+    def _recycle_items(self) -> list[dict[str, Any]]:
+        recycle_root = self.data_root / "recycle-bin"
+        if not recycle_root.exists():
+            return []
+        if recycle_root.is_symlink() or not recycle_root.is_dir():
+            raise RuntimeError("invalid recycle bin")
+        items: list[dict[str, Any]] = []
+        for entry in recycle_root.iterdir():
+            if entry.name.startswith("."):
+                continue
+            if (
+                entry.is_symlink()
+                or not entry.is_dir()
+                or not _TOPIC_ID.fullmatch(entry.name)
+            ):
+                raise RuntimeError("invalid recycle entry")
+            tombstone_path = entry / "tombstone.json"
+            if tombstone_path.is_symlink() or not tombstone_path.is_file():
+                raise RuntimeError("invalid recycle tombstone")
+            value = json.loads(tombstone_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or value.get("topic_id") != entry.name:
+                raise RuntimeError("invalid recycle tombstone")
+            display_name = value.get("display_name")
+            prior_state = value.get("prior_state")
+            created_at = value.get("created_at")
+            trashed_at = value.get("trashed_at")
+            if (
+                not isinstance(display_name, str)
+                or not display_name
+                or prior_state not in {"active", "archived"}
+                or not isinstance(created_at, str)
+                or not isinstance(trashed_at, str)
+            ):
+                raise RuntimeError("invalid recycle tombstone")
+            items.append(
+                {
+                    "topic_id": entry.name,
+                    "display_name": display_name,
+                    "prior_state": prior_state,
+                    "created_at": created_at,
+                    "trashed_at": trashed_at,
+                }
+            )
+        items.sort(
+            key=lambda item: (item["trashed_at"], item["topic_id"]), reverse=True
+        )
+        return items
+
+
+def _parse_target(target: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    if not isinstance(target, str):
+        raise _RequestError("invalid_path", "Invalid request path.")
+    parsed = urlsplit(target)
+    raw_path = parsed.path
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or parsed.fragment
+        or not raw_path.startswith("/")
+        or "%" in raw_path
+        or "\\" in raw_path
+        or "\x00" in raw_path
+        or "//" in raw_path
+        or any(character.isspace() for character in raw_path)
+    ):
+        raise _RequestError("invalid_path", "Invalid request path.")
+    segments = tuple(raw_path.strip("/").split("/")) if raw_path != "/" else ()
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise _RequestError("invalid_path", "Invalid request path.")
+    try:
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=_MAX_QUERY_FIELDS,
+        )
+    except ValueError as error:
+        raise _RequestError("invalid_request", "Invalid query string.") from error
+    params: dict[str, str] = {}
+    for name, value in pairs:
+        if name in params:
+            raise _RequestError("invalid_request", "Duplicate query parameter.")
+        params[name] = value
+    return segments, params
+
+
+def _parse_json_body(body: bytes) -> dict[str, Any] | None:
+    if not isinstance(body, bytes):
+        raise _RequestError("invalid_json", "Malformed JSON body.")
+    if not body:
+        return None
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _RequestError("invalid_json", "Malformed JSON body.") from error
+    if not isinstance(value, dict):
+        raise _RequestError("invalid_json", "JSON body must be an object.")
+    return value
+
+
+def _validated_topic_id(topic_id: str) -> str:
+    if not _TOPIC_ID.fullmatch(topic_id):
+        raise _RequestError("invalid_request", "Invalid topic id.")
+    return topic_id
+
+
+def _positive_integer(value: str, label: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        raise _RequestError("invalid_request", f"Invalid {label}.")
+    number = int(value)
+    if number < 1:
+        raise _RequestError("invalid_request", f"Invalid {label}.")
+    return number
+
+
+def _pagination(params: Mapping[str, str]) -> tuple[int, int]:
+    page = _positive_integer(params.get("page", "1"), "page")
+    page_size = _positive_integer(
+        params.get("page_size", str(_DEFAULT_PAGE_SIZE)), "page size"
+    )
+    if page_size > _MAX_PAGE_SIZE:
+        raise _RequestError("invalid_request", "Page size exceeds 100.")
+    return page, page_size
+
+
+def _page(
+    items: list[dict[str, Any]], page: int, page_size: int
+) -> dict[str, Any]:
+    start = (page - 1) * page_size
+    return {
+        "items": items[start : start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "total": len(items),
+    }
+
+
+def _reject_params(params: Mapping[str, str], allowed: set[str]) -> None:
+    if not set(params).issubset(allowed):
+        raise _RequestError("invalid_request", "Unknown query parameter.")
+
+
+def _topic_sort_key(name: str):
+    if name == "title":
+        return lambda topic: (topic.display_name.casefold(), topic.topic_id)
+    if name == "question_count":
+        return lambda topic: (
+            topic.question_count,
+            topic.display_name.casefold(),
+            topic.topic_id,
+        )
+    if name == "updated_at":
+        return lambda topic: (
+            topic.updated_at,
+            topic.display_name.casefold(),
+            topic.topic_id,
+        )
+    return lambda topic: (topic.version, topic.display_name.casefold(), topic.topic_id)
+
+
+def _safe_relative_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    return path.as_posix()
+
+
+def _optional_date(value: str | None, label: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise _RequestError("invalid_request", f"Invalid {label}.") from error
+    if parsed.isoformat() != value:
+        raise _RequestError("invalid_request", f"Invalid {label}.")
+    return parsed
+
+
+def _record_datetime(record: QueryRecord) -> datetime:
+    suffix = "+00:00" if record.created_at.endswith("Z") else ""
+    parsed = datetime.fromisoformat(record.created_at.removesuffix("Z") + suffix)
+    return parsed.astimezone(UTC)
+
+
+def _query_summary(record: QueryRecord) -> dict[str, Any]:
+    return {
+        "query_id": record.query_id,
+        "question": record.question,
+        "created_at": record.created_at,
+        "topic_ids": [result.topic_id for result in record.selected_topics],
+        "scope": "single" if len(record.selected_topics) == 1 else "multi",
+        "source": record.source,
+    }
+
+
+def _query_dict(record: QueryRecord) -> dict[str, Any]:
+    return {
+        "query_id": record.query_id,
+        "question": record.question,
+        "created_at": record.created_at,
+        "selected_topics": [
+            result.to_dict() for result in record.selected_topics
+        ],
+        "final_answer": record.final_answer,
+        "selection_reasons": dict(record.selection_reasons),
+        "source": record.source,
+        "total_latency_ms": record.total_latency_ms,
+        "scope": "single" if len(record.selected_topics) == 1 else "multi",
+    }
+
+
+def _json_response(status: int, value: Mapping[str, Any]) -> PanelResponse:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return PanelResponse(status=status, body=payload)
+
+
+def _error_response(status: int, code: str, message: str) -> PanelResponse:
+    return _json_response(status, {"error": {"code": code, "message": message}})
