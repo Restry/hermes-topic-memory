@@ -12,6 +12,14 @@ from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlsplit
 
 from .cache import QuestionCache
+from .core_memory import (
+    CORE_DISPLAY_NAME,
+    CORE_ID,
+    CORE_MAX_BODY_CHARS,
+    CoreMemoryError,
+    CoreMemoryNotFoundError,
+    CoreMemoryService,
+)
 from .catalog import TopicCatalog
 from .engine import RecallEngine
 from .multi_recall import (
@@ -53,7 +61,15 @@ class _ResourceNotFound(LookupError):
 class PanelApplication:
     """Authenticated Panel routing and serialization, independent of HTTP."""
 
-    __slots__ = ("_auth_token", "_reader", "admin", "data_root", "history", "store")
+    __slots__ = (
+        "_auth_token",
+        "_reader",
+        "admin",
+        "core_memory",
+        "data_root",
+        "history",
+        "store",
+    )
 
     def __init__(self, data_root: str | Path, reader: object, auth_token: str) -> None:
         root_input = Path(data_root).expanduser()
@@ -72,6 +88,7 @@ class PanelApplication:
         self.store = FileTopicStore(self.data_root)
         self.history = QueryHistoryStore(self.data_root)
         self.admin = TopicAdminService(self.data_root)
+        self.core_memory = CoreMemoryService(self.data_root)
 
     def dispatch(
         self,
@@ -98,6 +115,10 @@ class PanelApplication:
             code = "invalid_request" if is_mutation else error.code
             message = _MUTATION_MESSAGES[code] if is_mutation else error.message
             return _error_response(400, code, message)
+        except CoreMemoryNotFoundError:
+            if is_mutation:
+                return _mutation_error("core_memory_not_found")
+            return _error_response(404, "not_found", "Resource not found.")
         except (_ResourceNotFound, TopicNotFoundError):
             if is_mutation:
                 return _mutation_error("topic_not_found")
@@ -128,6 +149,22 @@ class PanelApplication:
         if path == ("api", "overview"):
             _reject_params(params, set())
             return _json_response(200, self._overview())
+        if path == ("api", "core-memory"):
+            _reject_params(params, set())
+            return _json_response(200, {"core_memory": self._core_metadata()})
+        if path == ("api", "core-memory", "body"):
+            _reject_params(params, set())
+            return _json_response(200, self._core_body())
+        if path == ("api", "core-memory", "versions"):
+            return _json_response(200, self._core_versions(params))
+        if (
+            len(path) == 5
+            and path[:3] == ("api", "core-memory", "versions")
+            and path[4] == "body"
+        ):
+            _reject_params(params, set())
+            version = _positive_integer(path[3], "version")
+            return _json_response(200, self._core_version_body(version))
         if path == ("api", "topics"):
             return _json_response(200, self._topics(params))
         if path == ("api", "questions"):
@@ -168,6 +205,12 @@ class PanelApplication:
         payload: dict[str, Any] | None,
     ) -> PanelResponse:
         _reject_params(params, set())
+        if path == ("api", "core-memory", "initialize"):
+            return self._initialize_core(payload)
+        if path == ("api", "core-memory", "replace"):
+            return self._replace_core(payload)
+        if path == ("api", "core-memory", "rollback"):
+            return self._rollback_core(payload)
         if path == ("api", "recall", "plan"):
             return self._recall_plan(payload)
         if path == ("api", "recall", "run"):
@@ -183,6 +226,57 @@ class PanelApplication:
                 _validated_topic_id(path[2]), path[3], payload
             )
         raise _ResourceNotFound
+
+    def _initialize_core(self, payload: dict[str, Any] | None) -> PanelResponse:
+        try:
+            value = _required_payload(payload, {"body"})
+            initialized = self.core_memory.initialize(
+                _text_field(value, "body", CORE_MAX_BODY_CHARS)
+            )
+            return _json_response(
+                201, {"core_memory": self._verified_core(initialized)}
+            )
+        except Exception as error:
+            return _safe_mutation_exception(error)
+
+    def _replace_core(self, payload: dict[str, Any] | None) -> PanelResponse:
+        try:
+            value = _required_payload(
+                payload, {"body", "expected_version", "expected_fingerprint"}
+            )
+            updated = self.core_memory.replace(
+                _text_field(value, "body", CORE_MAX_BODY_CHARS),
+                expected_version=_integer_field(value, "expected_version"),
+                expected_fingerprint=_fingerprint_field(
+                    value, "expected_fingerprint"
+                ),
+            )
+            return _json_response(200, {"core_memory": self._verified_core(updated)})
+        except Exception as error:
+            return _safe_mutation_exception(error)
+
+    def _rollback_core(self, payload: dict[str, Any] | None) -> PanelResponse:
+        try:
+            value = _required_payload(
+                payload,
+                {
+                    "target_version",
+                    "expected_version",
+                    "expected_fingerprint",
+                    "confirmation",
+                },
+            )
+            updated = self.core_memory.rollback(
+                _integer_field(value, "target_version"),
+                expected_version=_integer_field(value, "expected_version"),
+                expected_fingerprint=_fingerprint_field(
+                    value, "expected_fingerprint"
+                ),
+                confirmation=_text_field(value, "confirmation", 200),
+            )
+            return _json_response(200, {"core_memory": self._verified_core(updated)})
+        except Exception as error:
+            return _safe_mutation_exception(error)
 
     def _create_topic(self, payload: dict[str, Any] | None) -> PanelResponse:
         try:
@@ -449,6 +543,7 @@ class PanelApplication:
             ),
         )
         return {
+            "core_memory": self._core_metadata(),
             "kpis": {
                 "active_topic_count": snapshot.active_topic_count,
                 "total_question_count": snapshot.total_question_count,
@@ -506,6 +601,71 @@ class PanelApplication:
             topics = [topic for topic in topics if topic.status == status]
         topics.sort(key=_topic_sort_key(sort_name), reverse=order == "desc")
         return _page([topic.to_public_dict() for topic in topics], page, page_size)
+
+    def _core_metadata(self) -> dict[str, Any]:
+        memory = self.core_memory.get_optional()
+        value: dict[str, Any] = {
+            "id": CORE_ID,
+            "display_name": CORE_DISPLAY_NAME,
+            "present": memory is not None,
+            "max_body_chars": CORE_MAX_BODY_CHARS,
+        }
+        if memory is not None:
+            metadata = memory.metadata
+            value.update(
+                {
+                    "version": metadata.version,
+                    "content_fingerprint": metadata.content_fingerprint,
+                    "created_at": metadata.created_at,
+                    "updated_at": metadata.updated_at,
+                }
+            )
+        return value
+
+    def _verified_core(self, expected: Any) -> dict[str, Any]:
+        readback = self.core_memory.get()
+        if (
+            readback.metadata.version != expected.metadata.version
+            or readback.metadata.content_fingerprint
+            != expected.metadata.content_fingerprint
+        ):
+            raise CoreMemoryError("operation_failed", "Core readback mismatch")
+        return self._core_metadata()
+
+    def _core_body(self) -> dict[str, Any]:
+        memory = self.core_memory.get()
+        return {
+            "id": CORE_ID,
+            "display_name": CORE_DISPLAY_NAME,
+            "version": memory.metadata.version,
+            "fingerprint": memory.metadata.content_fingerprint,
+            "body": memory.body,
+        }
+
+    def _core_versions(self, params: dict[str, str]) -> dict[str, Any]:
+        _reject_params(params, {"page", "page_size"})
+        page, page_size = _pagination(params)
+        current, version_bodies = self.core_memory.version_snapshot()
+        items = [
+            {
+                "version": version,
+                "current": version == current.metadata.version,
+                "fingerprint": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            }
+            for version, body in reversed(version_bodies)
+        ]
+        return _page(items, page, page_size)
+
+    def _core_version_body(self, version: int) -> dict[str, Any]:
+        current, body = self.core_memory.read_version_snapshot(version)
+        return {
+            "id": CORE_ID,
+            "display_name": CORE_DISPLAY_NAME,
+            "version": version,
+            "fingerprint": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "current": version == current.metadata.version,
+            "body": body,
+        }
 
     def _verified_topic(self, expected: Any) -> dict[str, Any]:
         metadata = expected.metadata
@@ -745,6 +905,8 @@ class PanelApplication:
 
 
 _MUTATION_MESSAGES = {
+    "core_memory_exists": "Core / WhoAmI 已初始化。请刷新后使用替换操作。",
+    "core_memory_not_found": "Core / WhoAmI 尚未初始化。请先初始化。",
     "invalid_request": "请求字段无效。请按当前表单修正后重试。",
     "topic_exists": "主题 ID 已存在。请更换主题 ID 后重试。",
     "topic_not_found": "主题不存在或已变化。请刷新目录后重试。",
@@ -758,6 +920,9 @@ _MUTATION_MESSAGES = {
 
 
 def _safe_mutation_exception(error: Exception) -> PanelResponse:
+    if isinstance(error, CoreMemoryError):
+        code = error.code if error.code in _MUTATION_MESSAGES else "operation_failed"
+        return _mutation_error(code)
     if isinstance(error, TopicAdminError):
         code = error.code if error.code in _MUTATION_MESSAGES else "operation_failed"
         return _mutation_error(code)
@@ -769,7 +934,14 @@ def _safe_mutation_exception(error: Exception) -> PanelResponse:
 
 
 def _mutation_error(code: str) -> PanelResponse:
-    status = 400 if code == "invalid_request" else 404 if code == "topic_not_found" else 500 if code == "operation_failed" else 409
+    if code == "invalid_request":
+        status = 400
+    elif code in {"topic_not_found", "core_memory_not_found"}:
+        status = 404
+    elif code == "operation_failed":
+        status = 500
+    else:
+        status = 409
     return _error_response(status, code, _MUTATION_MESSAGES[code])
 
 
@@ -777,7 +949,12 @@ def _is_topic_mutation_target(method: str, target: str) -> bool:
     if not isinstance(method, str) or method.upper() != "POST" or not isinstance(target, str):
         return False
     path = urlsplit(target).path
-    return path == "/api/topics" or path.startswith("/api/topics/") or path.startswith("/api/recycle-bin/")
+    return (
+        path == "/api/topics"
+        or path.startswith("/api/topics/")
+        or path.startswith("/api/recycle-bin/")
+        or path.startswith("/api/core-memory/")
+    )
 
 
 def _text_field(
