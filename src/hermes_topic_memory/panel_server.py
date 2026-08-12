@@ -14,7 +14,7 @@ from .panel_app import PanelApplication, PanelResponse
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8080
 PANEL_AUTH_TOKEN_ENV = "HERMES_TOPIC_MEMORY_PANEL_TOKEN"
-_MAX_REQUEST_BODY = 64 * 1024
+_MAX_REQUEST_BODY = 2_100_000
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
     "form-action 'self'; object-src 'none'"
@@ -99,7 +99,7 @@ class TopicMemoryPanelHandler(BaseHTTPRequestHandler):
         if length < 0:
             return _transport_error(400, "invalid_request", "Invalid request length.")
         if length > _MAX_REQUEST_BODY:
-            return _transport_error(413, "request_too_large", "Request body is too large.")
+            return _transport_error(413, "invalid_request", "Request body is too large.")
         return self.rfile.read(length)
 
     def _send_response(self, response: PanelResponse) -> None:

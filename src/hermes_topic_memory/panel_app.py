@@ -24,6 +24,7 @@ from .query_history import QueryHistoryStore, QueryRecord
 from .router import TopicRegistry
 from .store import FileTopicStore, TopicNotFoundError
 from .topic_planner import PlanningError, TopicPlan, TopicPlanner
+from .topic_admin import TopicAdminError, TopicAdminService
 
 _TOPIC_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MAX_PAGE_SIZE = 100
@@ -52,7 +53,7 @@ class _ResourceNotFound(LookupError):
 class PanelApplication:
     """Authenticated Panel routing and serialization, independent of HTTP."""
 
-    __slots__ = ("_auth_token", "_reader", "data_root", "history", "store")
+    __slots__ = ("_auth_token", "_reader", "admin", "data_root", "history", "store")
 
     def __init__(self, data_root: str | Path, reader: object, auth_token: str) -> None:
         root_input = Path(data_root).expanduser()
@@ -70,6 +71,7 @@ class PanelApplication:
         self._auth_token = auth_token
         self.store = FileTopicStore(self.data_root)
         self.history = QueryHistoryStore(self.data_root)
+        self.admin = TopicAdminService(self.data_root)
 
     def dispatch(
         self,
@@ -82,6 +84,7 @@ class PanelApplication:
         if not self._is_authorized(headers):
             return _error_response(401, "unauthorized", "Authentication required.")
 
+        is_mutation = _is_topic_mutation_target(method, target)
         try:
             path, params = _parse_target(target)
             payload = _parse_json_body(body)
@@ -92,10 +95,16 @@ class PanelApplication:
                 return self._dispatch_post(path, params, payload)
             return _error_response(405, "method_not_allowed", "Method not allowed.")
         except _RequestError as error:
-            return _error_response(400, error.code, error.message)
+            code = "invalid_request" if is_mutation else error.code
+            message = _MUTATION_MESSAGES[code] if is_mutation else error.message
+            return _error_response(400, code, message)
         except (_ResourceNotFound, TopicNotFoundError):
+            if is_mutation:
+                return _mutation_error("topic_not_found")
             return _error_response(404, "not_found", "Resource not found.")
         except Exception:
+            if is_mutation:
+                return _mutation_error("operation_failed")
             return _error_response(
                 500, "internal_error", "Request could not be completed."
             )
@@ -165,7 +174,136 @@ class PanelApplication:
             return self._recall_run(payload)
         if len(path) == 4 and path[:3] == ("api", "recall", "rerun"):
             return self._recall_rerun(path[3], payload)
+        if path == ("api", "topics"):
+            return self._create_topic(payload)
+        if len(path) == 4 and path[:2] == ("api", "topics"):
+            return self._mutate_topic(_validated_topic_id(path[2]), path[3], payload)
+        if len(path) == 4 and path[:2] == ("api", "recycle-bin"):
+            return self._mutate_recycled_topic(
+                _validated_topic_id(path[2]), path[3], payload
+            )
         raise _ResourceNotFound
+
+    def _create_topic(self, payload: dict[str, Any] | None) -> PanelResponse:
+        try:
+            value = _required_payload(
+                payload, {"topic_id", "display_name", "aliases", "body"}
+            )
+            topic_id = _validated_topic_id(_text_field(value, "topic_id", 100))
+            display_name = _text_field(value, "display_name", 200, strip=True)
+            body = _text_field(value, "body", 2_000_000)
+            aliases = _alias_fields(value)
+            created = self.admin.create_topic(topic_id, display_name, aliases, body)
+            return _json_response(201, {"topic": self._verified_topic(created)})
+        except Exception as error:
+            return _safe_mutation_exception(error)
+
+    def _mutate_topic(
+        self, topic_id: str, action: str, payload: dict[str, Any] | None
+    ) -> PanelResponse:
+        if action not in {"append", "replace", "rollback", "archive", "restore", "trash"}:
+            raise _ResourceNotFound
+        try:
+            allowed = {"expected_version", "expected_fingerprint"}
+            if action == "append":
+                allowed.add("text")
+            elif action == "replace":
+                allowed.add("body")
+            elif action == "rollback":
+                allowed.add("target_version")
+            value = _required_payload(payload, allowed)
+            expected_version = _integer_field(value, "expected_version")
+            expected_fingerprint = _fingerprint_field(value, "expected_fingerprint")
+            if action == "append":
+                updated = self.admin.append_text(
+                    topic_id,
+                    _text_field(value, "text", 65_536),
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            elif action == "replace":
+                updated = self.admin.full_edit(
+                    topic_id,
+                    _text_field(value, "body", 2_000_000),
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            elif action == "rollback":
+                target_version = _integer_field(value, "target_version")
+                if target_version >= expected_version:
+                    raise ValueError("rollback target must be historical")
+                updated = self.admin.rollback_if_current(
+                    topic_id,
+                    target_version,
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            elif action == "archive":
+                updated = self.admin.archive(
+                    topic_id,
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            elif action == "restore":
+                updated = self.admin.restore(
+                    topic_id,
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+            else:
+                trashed = self.admin.trash(
+                    topic_id,
+                    expected_version=expected_version,
+                    expected_fingerprint=expected_fingerprint,
+                )
+                item = self._recycle_item(topic_id)
+                if item["trashed_at"] != trashed.trashed_at:
+                    raise TopicAdminError("operation_failed", "trash readback mismatch")
+                return _json_response(200, {"item": item})
+            return _json_response(200, {"topic": self._verified_topic(updated)})
+        except Exception as error:
+            return _safe_mutation_exception(error)
+
+    def _mutate_recycled_topic(
+        self, topic_id: str, action: str, payload: dict[str, Any] | None
+    ) -> PanelResponse:
+        if action not in {"restore", "delete"}:
+            raise _ResourceNotFound
+        try:
+            allowed = {"trashed_at"} if action == "restore" else {
+                "trashed_at",
+                "confirmation",
+            }
+            value = _required_payload(payload, allowed)
+            trashed_at = _text_field(value, "trashed_at", 64)
+            if action == "restore":
+                restored = self.admin.restore_from_trash(
+                    topic_id, expected_trashed_at=trashed_at
+                )
+                return _json_response(
+                    200, {"topic": self._verified_topic(restored)}
+                )
+            result = self.admin.permanent_delete(
+                topic_id,
+                confirmation=_text_field(value, "confirmation", 200),
+                expected_trashed_at=trashed_at,
+            )
+            if (self.data_root / "recycle-bin" / topic_id).exists() or (
+                self.data_root / "topics" / topic_id
+            ).exists():
+                raise TopicAdminError("operation_failed", "delete readback mismatch")
+            return _json_response(
+                200,
+                {
+                    "result": {
+                        "status": result.status,
+                        "topic_id": result.topic_id,
+                        "deleted_at": result.deleted_at,
+                    }
+                },
+            )
+        except Exception as error:
+            return _safe_mutation_exception(error)
 
     def _recall_plan(self, payload: dict[str, Any] | None) -> PanelResponse:
         value = _required_payload(payload, {"question"})
@@ -369,6 +507,28 @@ class PanelApplication:
         topics.sort(key=_topic_sort_key(sort_name), reverse=order == "desc")
         return _page([topic.to_public_dict() for topic in topics], page, page_size)
 
+    def _verified_topic(self, expected: Any) -> dict[str, Any]:
+        metadata = expected.metadata
+        readback = self.store.get_topic(metadata.topic_id)
+        current = readback.metadata
+        if (
+            current.version != metadata.version
+            or current.content_fingerprint != metadata.content_fingerprint
+            or current.state != metadata.state
+        ):
+            raise TopicAdminError("operation_failed", "topic readback mismatch")
+        return {
+            "topic_id": current.topic_id,
+            "display_name": current.display_name,
+            "aliases": list(current.aliases),
+            "version": current.version,
+            "content_fingerprint": current.content_fingerprint,
+            "created_at": current.created_at,
+            "updated_at": current.updated_at,
+            "source_policy": current.source_policy,
+            "state": current.state,
+        }
+
     def _topic_detail(self, topic_id: str) -> dict[str, Any]:
         memory = self.store.get_topic(topic_id)
         try:
@@ -537,47 +697,132 @@ class PanelApplication:
             return []
         if recycle_root.is_symlink() or not recycle_root.is_dir():
             raise RuntimeError("invalid recycle bin")
-        items: list[dict[str, Any]] = []
-        for entry in recycle_root.iterdir():
-            if entry.name.startswith("."):
-                continue
-            if (
-                entry.is_symlink()
-                or not entry.is_dir()
-                or not _TOPIC_ID.fullmatch(entry.name)
-            ):
-                raise RuntimeError("invalid recycle entry")
-            tombstone_path = entry / "tombstone.json"
-            if tombstone_path.is_symlink() or not tombstone_path.is_file():
-                raise RuntimeError("invalid recycle tombstone")
-            value = json.loads(tombstone_path.read_text(encoding="utf-8"))
-            if not isinstance(value, dict) or value.get("topic_id") != entry.name:
-                raise RuntimeError("invalid recycle tombstone")
-            display_name = value.get("display_name")
-            prior_state = value.get("prior_state")
-            created_at = value.get("created_at")
-            trashed_at = value.get("trashed_at")
-            if (
-                not isinstance(display_name, str)
-                or not display_name
-                or prior_state not in {"active", "archived"}
-                or not isinstance(created_at, str)
-                or not isinstance(trashed_at, str)
-            ):
-                raise RuntimeError("invalid recycle tombstone")
-            items.append(
-                {
-                    "topic_id": entry.name,
-                    "display_name": display_name,
-                    "prior_state": prior_state,
-                    "created_at": created_at,
-                    "trashed_at": trashed_at,
-                }
-            )
+        items = [
+            self._recycle_item(entry.name)
+            for entry in recycle_root.iterdir()
+            if not entry.name.startswith(".")
+        ]
         items.sort(
             key=lambda item: (item["trashed_at"], item["topic_id"]), reverse=True
         )
         return items
+
+    def _recycle_item(self, topic_id: str) -> dict[str, Any]:
+        _validated_topic_id(topic_id)
+        entry = self.data_root / "recycle-bin" / topic_id
+        if entry.is_symlink() or not entry.is_dir():
+            raise TopicAdminError("topic_not_found", "recycled topic does not exist")
+        tombstone_path = entry / "tombstone.json"
+        if tombstone_path.is_symlink() or not tombstone_path.is_file():
+            raise TopicAdminError("operation_failed", "invalid recycle tombstone")
+        try:
+            value = json.loads(tombstone_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise TopicAdminError(
+                "operation_failed", "invalid recycle tombstone"
+            ) from error
+        if not isinstance(value, dict) or value.get("topic_id") != topic_id:
+            raise TopicAdminError("operation_failed", "invalid recycle tombstone")
+        display_name = value.get("display_name")
+        prior_state = value.get("prior_state")
+        created_at = value.get("created_at")
+        trashed_at = value.get("trashed_at")
+        if (
+            not isinstance(display_name, str)
+            or not display_name
+            or prior_state not in {"active", "archived"}
+            or not isinstance(created_at, str)
+            or not isinstance(trashed_at, str)
+        ):
+            raise TopicAdminError("operation_failed", "invalid recycle tombstone")
+        return {
+            "topic_id": topic_id,
+            "display_name": display_name,
+            "prior_state": prior_state,
+            "created_at": created_at,
+            "trashed_at": trashed_at,
+        }
+
+
+_MUTATION_MESSAGES = {
+    "invalid_request": "请求字段无效。请按当前表单修正后重试。",
+    "topic_exists": "主题 ID 已存在。请更换主题 ID 后重试。",
+    "topic_not_found": "主题不存在或已变化。请刷新目录后重试。",
+    "alias_conflict": "显示名称或别名与现有主题冲突。请更换后重试。",
+    "concurrent_update": "主题已变化。请重新读取当前版本后再提交。",
+    "append_duplicate": "这段追加内容已经存在。请检查正文后再提交。",
+    "invalid_state": "当前主题状态不允许此操作。请刷新后选择可用操作。",
+    "confirmation_mismatch": "确认名称不匹配。请输入回收站中显示的完整名称。",
+    "operation_failed": "操作未完成且未确认写入。请重新读取当前状态后重试。",
+}
+
+
+def _safe_mutation_exception(error: Exception) -> PanelResponse:
+    if isinstance(error, TopicAdminError):
+        code = error.code if error.code in _MUTATION_MESSAGES else "operation_failed"
+        return _mutation_error(code)
+    if isinstance(error, TopicNotFoundError):
+        return _mutation_error("topic_not_found")
+    if isinstance(error, (TypeError, ValueError)):
+        return _mutation_error("invalid_request")
+    return _mutation_error("operation_failed")
+
+
+def _mutation_error(code: str) -> PanelResponse:
+    status = 400 if code == "invalid_request" else 404 if code == "topic_not_found" else 500 if code == "operation_failed" else 409
+    return _error_response(status, code, _MUTATION_MESSAGES[code])
+
+
+def _is_topic_mutation_target(method: str, target: str) -> bool:
+    if not isinstance(method, str) or method.upper() != "POST" or not isinstance(target, str):
+        return False
+    path = urlsplit(target).path
+    return path == "/api/topics" or path.startswith("/api/topics/") or path.startswith("/api/recycle-bin/")
+
+
+def _text_field(
+    payload: Mapping[str, Any], name: str, maximum: int, *, strip: bool = False
+) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
+        raise ValueError(f"invalid {name}")
+    if strip:
+        value = value.strip()
+        if not value:
+            raise ValueError(f"invalid {name}")
+    return value
+
+
+def _integer_field(payload: Mapping[str, Any], name: str) -> int:
+    value = payload.get(name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _fingerprint_field(payload: Mapping[str, Any], name: str) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"invalid {name}")
+    return value
+
+
+def _alias_fields(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    value = payload.get("aliases")
+    if not isinstance(value, list) or len(value) > 16:
+        raise ValueError("invalid aliases")
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ValueError("invalid aliases")
+        alias = raw.strip()
+        normalized = alias.casefold()
+        if not alias or len(alias) > 200 or normalized in seen:
+            raise ValueError("invalid aliases")
+        seen.add(normalized)
+        aliases.append(alias)
+    return tuple(aliases)
 
 
 def _required_payload(

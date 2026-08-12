@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -749,6 +750,334 @@ def test_query_history_write_failure_cannot_report_no_fact_as_success(
     assert b"PRIVATE_QUERY_LEDGER_WRITE_FAILURE" not in response.body
 
 
+def test_authenticated_write_api_joined_maintenance_journey(
+    panel_fixture: PanelFixture,
+) -> None:
+    app = panel_fixture.app
+    root = panel_fixture.data_root
+    topic_id = "task-eleven-journey"
+    display_name = "Task Eleven Journey"
+    body_v1 = "# Task Eleven\n\nDISPOSABLE_PANEL_BODY_V1\n"
+    append_text = "\nDISPOSABLE_APPEND_V2\n"
+    body_v3 = "# Task Eleven\n\nDISPOSABLE_PANEL_BODY_V3\n"
+    beta_hash = _tree_hash(root / "topics/beta")
+
+    response, created = _post(
+        app,
+        "/api/topics",
+        {
+            "topic_id": topic_id,
+            "display_name": display_name,
+            "aliases": ["task eleven", "maintenance journey"],
+            "body": body_v1,
+        },
+    )
+    assert response.status == 201
+    assert created["topic"]["version"] == 1
+    _assert_topic_coherent(root, topic_id, state="active", version=1)
+    current = _read_body(app, topic_id, expected_body=body_v1, expected_version=1)
+
+    target_cache = _seed_cache(root, topic_id, version=1, marker="target-v1")
+    beta_cache = _seed_cache(root, "beta", version=1, marker="beta-stable")
+    beta_cache_hash = hashlib.sha256(beta_cache.read_bytes()).hexdigest()
+    _, appended = _post(
+        app,
+        f"/api/topics/{topic_id}/append",
+        {
+            "text": append_text,
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert appended["topic"]["version"] == 2
+    assert not target_cache.exists()
+    assert hashlib.sha256(beta_cache.read_bytes()).hexdigest() == beta_cache_hash
+    current = _read_body(
+        app, topic_id, expected_body=body_v1 + append_text, expected_version=2
+    )
+    _assert_topic_coherent(root, topic_id, state="active", version=2)
+
+    duplicate_before = _tree_hash(root)
+    duplicate_response, duplicate = _post(
+        app,
+        f"/api/topics/{topic_id}/append",
+        {
+            "text": append_text,
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert duplicate_response.status == 409
+    assert duplicate["error"]["code"] == "append_duplicate"
+    assert _tree_hash(root) == duplicate_before
+
+    _seed_cache(root, topic_id, version=2, marker="target-v2")
+    _, replaced = _post(
+        app,
+        f"/api/topics/{topic_id}/replace",
+        {
+            "body": body_v3,
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert replaced["topic"]["version"] == 3
+    assert not target_cache.exists()
+    current = _read_body(app, topic_id, expected_body=body_v3, expected_version=3)
+    _assert_topic_coherent(root, topic_id, state="active", version=3)
+
+    _seed_cache(root, topic_id, version=3, marker="target-v3")
+    _, rolled_back = _post(
+        app,
+        f"/api/topics/{topic_id}/rollback",
+        {
+            "target_version": 1,
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert rolled_back["topic"]["version"] == 4
+    assert not target_cache.exists()
+    current = _read_body(app, topic_id, expected_body=body_v1, expected_version=4)
+    _assert_topic_coherent(root, topic_id, state="active", version=4)
+
+    _, archived = _post(
+        app,
+        f"/api/topics/{topic_id}/archive",
+        {
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert archived["topic"]["state"] == "archived"
+    _assert_topic_coherent(root, topic_id, state="archived", version=4)
+    _, restored = _post(
+        app,
+        f"/api/topics/{topic_id}/restore",
+        {
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    assert restored["topic"]["state"] == "active"
+    _assert_topic_coherent(root, topic_id, state="active", version=4)
+
+    _, trashed = _post(
+        app,
+        f"/api/topics/{topic_id}/trash",
+        {
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    tombstone_time = trashed["item"]["trashed_at"]
+    _, recycle = _dispatch(app, "/api/recycle-bin")
+    assert [item["topic_id"] for item in recycle["items"]].count(topic_id) == 1
+    _, restored_from_trash = _post(
+        app,
+        f"/api/recycle-bin/{topic_id}/restore",
+        {"trashed_at": tombstone_time},
+    )
+    assert restored_from_trash["topic"]["version"] == 4
+    current = _read_body(app, topic_id, expected_body=body_v1, expected_version=4)
+    _assert_topic_coherent(root, topic_id, state="active", version=4)
+
+    _, trashed_again = _post(
+        app,
+        f"/api/topics/{topic_id}/trash",
+        {
+            "expected_version": current["version"],
+            "expected_fingerprint": current["fingerprint"],
+        },
+    )
+    second_tombstone_time = trashed_again["item"]["trashed_at"]
+    before_wrong_confirmation = _tree_hash(root)
+    wrong_response, wrong = _post(
+        app,
+        f"/api/recycle-bin/{topic_id}/delete",
+        {"trashed_at": second_tombstone_time, "confirmation": "wrong name"},
+    )
+    assert wrong_response.status == 409
+    assert wrong["error"]["code"] == "confirmation_mismatch"
+    assert _tree_hash(root) == before_wrong_confirmation
+
+    delete_response, deleted = _post(
+        app,
+        f"/api/recycle-bin/{topic_id}/delete",
+        {"trashed_at": second_tombstone_time, "confirmation": display_name},
+    )
+    assert delete_response.status == 200
+    assert deleted["result"]["status"] == "permanently_deleted"
+    assert not (root / "topics" / topic_id).exists()
+    assert not (root / "recycle-bin" / topic_id).exists()
+    assert _tree_hash(root / "topics/beta") == beta_hash
+
+    audit_lines = [
+        json.loads(line)
+        for line in (root / "operation-audit/operations.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line).get("topic_id") == topic_id
+    ]
+    assert [line["action"] for line in audit_lines] == [
+        "create",
+        "append",
+        "replace",
+        "rollback",
+        "archive",
+        "restore",
+        "trash",
+        "restore_from_trash",
+        "trash",
+        "permanent_delete",
+    ]
+    for path in ("/api/overview", "/api/topics"):
+        overview_response, _ = _dispatch(app, path)
+        assert body_v1.encode() not in overview_response.body
+        assert body_v3.encode() not in overview_response.body
+
+
+def test_write_routes_fail_closed_for_auth_schema_concurrency_state_and_audit(
+    panel_fixture: PanelFixture,
+) -> None:
+    app = panel_fixture.app
+    root = panel_fixture.data_root
+    before = _tree_hash(root)
+    write_paths = (
+        "/api/topics",
+        "/api/topics/alpha/append",
+        "/api/topics/alpha/replace",
+        "/api/topics/alpha/rollback",
+        "/api/topics/alpha/archive",
+        "/api/topics/alpha/restore",
+        "/api/topics/alpha/trash",
+        "/api/recycle-bin/discarded/restore",
+        "/api/recycle-bin/discarded/delete",
+    )
+    for path in write_paths:
+        response = app.dispatch(
+            "POST",
+            path,
+            headers={"Authorization": "Bearer wrong-token"},
+            body=b'{"body":"PRIVATE_AUTH_BYPASS_BODY"}',
+        )
+        assert response.status == 401
+        assert b"PRIVATE_AUTH_BYPASS_BODY" not in response.body
+    assert _tree_hash(root) == before
+
+    bad_ids = ("../escape", "%2e%2e%2fescape", "alpha%2F..%2Fescape")
+    for bad_id in bad_ids:
+        response, payload = _post(
+            app,
+            f"/api/topics/{bad_id}/archive",
+            {"expected_version": 2, "expected_fingerprint": "0" * 64},
+        )
+        assert response.status == 400
+        assert payload["error"]["code"] == "invalid_request"
+    assert _tree_hash(root) == before
+
+    response, payload = _post(
+        app,
+        "/api/topics/alpha/replace",
+        {"body": "stale", "expected_version": 1, "expected_fingerprint": "0" * 64},
+    )
+    assert response.status == 409
+    assert payload["error"]["code"] == "concurrent_update"
+    missing_response, missing = _post(
+        app, "/api/topics/alpha/append", {"text": "missing preconditions"}
+    )
+    assert missing_response.status == 400
+    assert missing["error"]["code"] == "invalid_request"
+    state_response, state_payload = _post(
+        app,
+        "/api/topics/beta/append",
+        {
+            "text": "cannot append archived",
+            "expected_version": 1,
+            "expected_fingerprint": FileTopicStore(root)
+            .get_topic("beta")
+            .metadata.content_fingerprint,
+        },
+    )
+    assert state_response.status == 409
+    assert state_payload["error"]["code"] == "invalid_state"
+
+    duplicate_response, duplicate = _post(
+        app,
+        "/api/topics",
+        {"topic_id": "alpha", "display_name": "Other", "aliases": [], "body": "x"},
+    )
+    assert duplicate_response.status == 409
+    assert duplicate["error"]["code"] == "topic_exists"
+
+    current = FileTopicStore(root).get_topic("alpha")
+    before_failure = _tree_hash(root)
+
+    def fail_after_topic_write(point: str) -> None:
+        if point == "after_topic_write":
+            raise OSError("PRIVATE_TRANSACTION_FAILURE_PATH")
+
+    app.admin._failure_injector = fail_after_topic_write
+    failure_response, failure = _post(
+        app,
+        "/api/topics/alpha/replace",
+        {
+            "body": "PRIVATE_FAILED_REPLACEMENT",
+            "expected_version": current.metadata.version,
+            "expected_fingerprint": current.metadata.content_fingerprint,
+        },
+    )
+    app.admin._failure_injector = None
+    assert failure_response.status == 500
+    assert failure["error"] == {
+        "code": "operation_failed",
+        "message": "操作未完成且未确认写入。请重新读取当前状态后重试。",
+    }
+    assert b"PRIVATE_TRANSACTION_FAILURE_PATH" not in failure_response.body
+    assert b"PRIVATE_FAILED_REPLACEMENT" not in failure_response.body
+    assert _tree_hash(root) == before_failure
+
+
+def _read_body(
+    app: PanelApplication,
+    topic_id: str,
+    *,
+    expected_body: str,
+    expected_version: int,
+) -> dict[str, Any]:
+    response, payload = _dispatch(app, f"/api/topics/{topic_id}/body")
+    assert response.status == 200
+    assert payload["body"] == expected_body
+    assert payload["version"] == expected_version
+    assert payload["fingerprint"] == hashlib.sha256(expected_body.encode()).hexdigest()
+    return payload
+
+
+def _assert_topic_coherent(
+    root: Path, topic_id: str, *, state: str, version: int
+) -> None:
+    registry = json.loads((root / "topic-registry.json").read_text(encoding="utf-8"))
+    item = next(item for item in registry["topics"] if item["topic_id"] == topic_id)
+    memory = FileTopicStore(root).get_topic(topic_id)
+    assert item["state"] == memory.metadata.state == state
+    assert memory.metadata.version == version
+    assert memory.metadata.content_fingerprint == hashlib.sha256(
+        memory.body.encode()
+    ).hexdigest()
+
+
+def _tree_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    if not path.exists():
+        return digest.hexdigest()
+    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+        if item.name == ".topic-admin.lock":
+            continue
+        digest.update(item.relative_to(path).as_posix().encode())
+        digest.update(item.read_bytes())
+    return digest.hexdigest()
+
+
 def test_recall_routes_reject_bad_auth_without_planning_or_private_data(
     panel_fixture: PanelFixture,
 ) -> None:
@@ -838,3 +1167,15 @@ def _append_query(
             total_latency_ms=2,
         )
     )
+
+
+def _seed_cache(root: Path, topic_id: str, *, version: int, marker: str) -> Path:
+    QuestionCache(root).put(
+        question=f"disposable question {marker}",
+        answer=f"disposable answer {marker}",
+        topic_id=topic_id,
+        topic_version=version,
+        model="panel-write-test",
+        prompt_version="task-11",
+    )
+    return root / "qa-cache" / f"{topic_id}.jsonl"

@@ -63,6 +63,7 @@ class TopicAdminService:
         self._failure_injector = failure_injector
         self._registry_path = self.root / "topic-registry.json"
         self._transaction_path = self.root / ".topic-admin-transaction"
+        self._operations_audit_path = self.root / "operation-audit" / "operations.jsonl"
 
     def create_topic(
         self,
@@ -99,7 +100,11 @@ class TopicAdminService:
                 candidate["default_topic"] = topic_id
             self._validate_registry(candidate)
 
-            paths = (self._registry_path, self.root / "topics" / topic_id)
+            paths = (
+                self._registry_path,
+                self.root / "topics" / topic_id,
+                self._operations_audit_path,
+            )
             with self._transaction(paths):
                 created = self.store.create_topic(
                     topic_id,
@@ -109,18 +114,33 @@ class TopicAdminService:
                 )
                 self._failpoint("after_topic_write")
                 self._write_registry(candidate)
+                self._append_operation_audit(
+                    "create", topic_id, created.metadata.version, "active"
+                )
             return created
 
-    def archive(self, topic_id: str, *, expected_version: int) -> TopicMemory:
+    def archive(
+        self,
+        topic_id: str,
+        *,
+        expected_version: int,
+        expected_fingerprint: str | None = None,
+    ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         with self._locked():
             registry = self._load_registry()
             item = self._registered_item(registry, topic_id)
             self._require_state(item, ("active",))
-            current = self._current_with_version(topic_id, expected_version)
+            current = self._current_with_preconditions(
+                topic_id, expected_version, expected_fingerprint
+            )
             candidate = self._copy_json(registry)
             self._registered_item(candidate, topic_id)["state"] = "archived"
-            paths = (self._registry_path, self._metadata_path(topic_id))
+            paths = (
+                self._registry_path,
+                self._metadata_path(topic_id),
+                self._operations_audit_path,
+            )
             try:
                 with self._transaction(paths):
                     self._write_registry(candidate)
@@ -131,22 +151,42 @@ class TopicAdminService:
                         expected_state="active",
                     )
                     self._failpoint("after_metadata_write")
+                    self._append_operation_audit(
+                        "archive", topic_id, archived.metadata.version, "archived"
+                    )
             except ConcurrentTopicUpdateError as error:
                 raise TopicAdminError(
                     "concurrent_update", "topic changed before archive"
                 ) from error
             return archived
 
-    def restore(self, topic_id: str) -> TopicMemory:
+    def restore(
+        self,
+        topic_id: str,
+        *,
+        expected_version: int | None = None,
+        expected_fingerprint: str | None = None,
+    ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         with self._locked():
             registry = self._load_registry()
             item = self._registered_item(registry, topic_id)
             self._require_state(item, ("archived",))
-            current = self.store.get_topic(topic_id)
+            if expected_version is None and expected_fingerprint is None:
+                current = self.store.get_topic(topic_id)
+            elif expected_version is None:
+                raise ValueError("expected version is required")
+            else:
+                current = self._current_with_preconditions(
+                    topic_id, expected_version, expected_fingerprint
+                )
             candidate = self._copy_json(registry)
             self._registered_item(candidate, topic_id)["state"] = "active"
-            paths = (self._registry_path, self._metadata_path(topic_id))
+            paths = (
+                self._registry_path,
+                self._metadata_path(topic_id),
+                self._operations_audit_path,
+            )
             try:
                 with self._transaction(paths):
                     restored = self.store.set_topic_state(
@@ -157,19 +197,30 @@ class TopicAdminService:
                     )
                     self._failpoint("after_metadata_write")
                     self._write_registry(candidate)
+                    self._append_operation_audit(
+                        "restore", topic_id, restored.metadata.version, "active"
+                    )
             except ConcurrentTopicUpdateError as error:
                 raise TopicAdminError(
                     "concurrent_update", "topic changed before restore"
                 ) from error
             return restored
 
-    def trash(self, topic_id: str, *, expected_version: int) -> TrashedTopic:
+    def trash(
+        self,
+        topic_id: str,
+        *,
+        expected_version: int,
+        expected_fingerprint: str | None = None,
+    ) -> TrashedTopic:
         self._validate_topic_id(topic_id)
         with self._locked():
             registry = self._load_registry()
             item = self._registered_item(registry, topic_id)
             self._require_state(item, ("active", "archived"))
-            current = self._current_with_version(topic_id, expected_version)
+            current = self._current_with_preconditions(
+                topic_id, expected_version, expected_fingerprint
+            )
             recycle = self.root / "recycle-bin" / topic_id
             if recycle.exists() or recycle.is_symlink():
                 raise TopicAdminError("invalid_state", "topic already exists in recycle bin")
@@ -196,7 +247,12 @@ class TopicAdminService:
                 "was_default": was_default,
             }
             topic_dir = self.root / "topics" / topic_id
-            paths = (self._registry_path, topic_dir, recycle)
+            paths = (
+                self._registry_path,
+                topic_dir,
+                recycle,
+                self._operations_audit_path,
+            )
             try:
                 with self._transaction(paths):
                     self._write_registry(candidate)
@@ -213,6 +269,9 @@ class TopicAdminService:
                     _fsync_directory(recycle)
                     self._atomic_json_write(recycle / "tombstone.json", tombstone)
                     self._failpoint("after_trash_move")
+                    self._append_operation_audit(
+                        "trash", topic_id, current.metadata.version, "trashed"
+                    )
             except ConcurrentTopicUpdateError as error:
                 raise TopicAdminError(
                     "concurrent_update", "topic changed before trash"
@@ -224,7 +283,9 @@ class TopicAdminService:
                 trashed_at=trashed_at,
             )
 
-    def restore_from_trash(self, topic_id: str) -> TopicMemory:
+    def restore_from_trash(
+        self, topic_id: str, *, expected_trashed_at: str | None = None
+    ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         with self._locked():
             registry = self._load_registry()
@@ -233,6 +294,8 @@ class TopicAdminService:
             recycle = self.root / "recycle-bin" / topic_id
             recycled_topic = recycle / "topic"
             tombstone = self._read_tombstone(recycle, topic_id)
+            if expected_trashed_at is not None and tombstone.get("trashed_at") != expected_trashed_at:
+                raise TopicAdminError("concurrent_update", "recycle tombstone changed")
             if not recycled_topic.is_dir() or recycled_topic.is_symlink():
                 raise TopicAdminError("topic_not_found", "recycled topic body is missing")
             target = self.root / "topics" / topic_id
@@ -259,7 +322,12 @@ class TopicAdminService:
             )
             self._validate_registry(candidate)
 
-            paths = (self._registry_path, target, recycle)
+            paths = (
+                self._registry_path,
+                target,
+                recycle,
+                self._operations_audit_path,
+            )
             with self._transaction(paths):
                 metadata_path = recycled_topic / "metadata.json"
                 metadata = self._read_metadata_path(metadata_path, topic_id)
@@ -277,6 +345,9 @@ class TopicAdminService:
                 _fsync_directory(recycle.parent)
                 self._write_registry(candidate)
                 self._failpoint("after_restore_move")
+                self._append_operation_audit(
+                    "restore_from_trash", topic_id, metadata.version, prior_state
+                )
             return self.store.get_topic(topic_id)
 
     def full_edit(
@@ -297,6 +368,31 @@ class TopicAdminService:
                 body,
                 expected_version=expected_version,
                 expected_fingerprint=expected_fingerprint,
+                action="replace",
+            )
+
+    def append_text(
+        self,
+        topic_id: str,
+        text: str,
+        *,
+        expected_version: int,
+        expected_fingerprint: str,
+    ) -> TopicMemory:
+        self._validate_topic_id(topic_id)
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("append text must contain non-whitespace text")
+        with self._locked():
+            registry = self._load_registry()
+            item = self._registered_item(registry, topic_id)
+            self._require_state(item, ("active",))
+            current = self._current_with_preconditions(
+                topic_id, expected_version, expected_fingerprint
+            )
+            if text in current.body:
+                raise TopicAdminError("append_duplicate", "append text already exists")
+            return self._replace_current_locked(
+                current, current.body + text, action="append"
             )
 
     def evidence_backed_edit(
@@ -334,7 +430,28 @@ class TopicAdminService:
             self._require_state(item, ("active",))
             current = self.store.get_topic(topic_id)
             historical_body = self.store.read_version(topic_id, target_version)
-            return self._replace_current_locked(current, historical_body)
+            return self._replace_current_locked(current, historical_body, action="rollback")
+
+    def rollback_if_current(
+        self,
+        topic_id: str,
+        target_version: int,
+        *,
+        expected_version: int,
+        expected_fingerprint: str,
+    ) -> TopicMemory:
+        self._validate_topic_id(topic_id)
+        if not isinstance(target_version, int) or isinstance(target_version, bool):
+            raise ValueError("target version must be an integer")
+        with self._locked():
+            registry = self._load_registry()
+            item = self._registered_item(registry, topic_id)
+            self._require_state(item, ("active",))
+            current = self._current_with_preconditions(
+                topic_id, expected_version, expected_fingerprint
+            )
+            historical_body = self.store.read_version(topic_id, target_version)
+            return self._replace_current_locked(current, historical_body, action="rollback")
 
     def _full_edit_locked(
         self,
@@ -344,19 +461,17 @@ class TopicAdminService:
         *,
         expected_version: int,
         expected_fingerprint: str,
+        action: str = "replace",
     ) -> TopicMemory:
         item = self._registered_item(registry, topic_id)
         self._require_state(item, ("active",))
-        current = self.store.get_topic(topic_id)
-        if (
-            current.metadata.version != expected_version
-            or current.metadata.content_fingerprint != expected_fingerprint
-        ):
-            raise TopicAdminError("concurrent_update", "topic changed before full edit")
-        return self._replace_current_locked(current, body)
+        current = self._current_with_preconditions(
+            topic_id, expected_version, expected_fingerprint
+        )
+        return self._replace_current_locked(current, body, action=action)
 
     def _replace_current_locked(
-        self, current: TopicMemory, body: str
+        self, current: TopicMemory, body: str, *, action: str
     ) -> TopicMemory:
         topic_id = current.metadata.topic_id
         cache_path = self.root / "qa-cache" / f"{topic_id}.jsonl"
@@ -369,6 +484,7 @@ class TopicAdminService:
             / "versions"
             / f"{current.metadata.version}-memory.md",
             cache_path,
+            self._operations_audit_path,
         )
         try:
             with self._transaction(paths):
@@ -383,6 +499,12 @@ class TopicAdminService:
                     cache_path.unlink()
                     _fsync_directory(cache_path.parent)
                 self._failpoint("after_cache_invalidation")
+                self._append_operation_audit(
+                    action,
+                    topic_id,
+                    updated.metadata.version,
+                    updated.metadata.state,
+                )
         except ConcurrentTopicUpdateError as error:
             raise TopicAdminError(
                 "concurrent_update", "topic changed before full edit"
@@ -390,7 +512,11 @@ class TopicAdminService:
         return updated
 
     def permanent_delete(
-        self, topic_id: str, *, confirmation: str
+        self,
+        topic_id: str,
+        *,
+        confirmation: str,
+        expected_trashed_at: str | None = None,
     ) -> PermanentDeleteResult:
         self._validate_topic_id(topic_id)
         if not isinstance(confirmation, str):
@@ -403,6 +529,8 @@ class TopicAdminService:
                 )
             recycle = self.root / "recycle-bin" / topic_id
             tombstone = self._read_tombstone(recycle, topic_id)
+            if expected_trashed_at is not None and tombstone.get("trashed_at") != expected_trashed_at:
+                raise TopicAdminError("concurrent_update", "recycle tombstone changed")
             display_name = tombstone.get("display_confirmation")
             if not isinstance(display_name, str):
                 raise TopicAdminError("operation_failed", "invalid recycle confirmation")
@@ -410,9 +538,11 @@ class TopicAdminService:
                 raise TopicAdminError(
                     "confirmation_mismatch", "display-name confirmation does not match"
                 )
+            metadata = self._read_metadata_path(
+                recycle / "topic" / "metadata.json", topic_id
+            )
 
             deleted_at = _utc_now()
-            self._append_deletion_audit(topic_id, display_name, deleted_at)
             assets = (
                 self.root / "topics" / topic_id,
                 recycle,
@@ -424,7 +554,14 @@ class TopicAdminService:
                 self.root / "evidence" / f"{topic_id}.jsonl",
                 self.root / "evidence" / topic_id,
             )
-            with self._transaction(assets):
+            deletion_audit_path = self.root / "operation-audit" / "deletions.jsonl"
+            with self._transaction(
+                (*assets, deletion_audit_path, self._operations_audit_path)
+            ):
+                self._append_deletion_audit(topic_id, display_name, deleted_at)
+                self._append_operation_audit(
+                    "permanent_delete", topic_id, metadata.version, "deleted"
+                )
                 self._failpoint("before_permanent_remove")
                 for path in assets:
                     self._remove_path(path)
@@ -578,6 +715,24 @@ class TopicAdminService:
             raise TopicAdminError("concurrent_update", "topic version no longer matches")
         return current
 
+    def _current_with_preconditions(
+        self,
+        topic_id: str,
+        expected_version: int,
+        expected_fingerprint: str | None,
+    ) -> TopicMemory:
+        current = self._current_with_version(topic_id, expected_version)
+        if expected_fingerprint is not None:
+            if not isinstance(expected_fingerprint, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected_fingerprint
+            ):
+                raise ValueError("expected fingerprint must be lowercase sha256")
+            if current.metadata.content_fingerprint != expected_fingerprint:
+                raise TopicAdminError(
+                    "concurrent_update", "topic fingerprint no longer matches"
+                )
+        return current
+
     @staticmethod
     def _require_state(item: dict[str, Any], allowed: tuple[TopicState, ...]) -> None:
         state = TopicAdminService._item_state(item)
@@ -633,6 +788,33 @@ class TopicAdminService:
         if not isinstance(value, dict) or value.get("topic_id") != topic_id:
             raise TopicAdminError("operation_failed", "invalid recycle tombstone")
         return value
+
+    def _append_operation_audit(
+        self, action: str, topic_id: str, version: int, state: str
+    ) -> None:
+        payload = json.dumps(
+            {
+                "action": action,
+                "recorded_at": _utc_now(),
+                "state": state,
+                "topic_id": topic_id,
+                "version": version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        path = self._operations_audit_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("incomplete operation audit write")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(path.parent)
 
     def _append_deletion_audit(
         self, topic_id: str, display_name: str, deleted_at: str

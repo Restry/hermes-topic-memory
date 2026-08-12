@@ -6,6 +6,7 @@
   const PAGE_SIZE = 6;
   const DETAIL_TABS = ["overview", "questions", "ask", "body", "versions", "settings"];
   const PRIMARY_VIEWS = ["home", "recall", "recent", "recycle", "detail"];
+  const TOPIC_STATE_PATHS = { archive: "/archive", restore: "/restore", trash: "/trash" };
   const numberFormat = new Intl.NumberFormat("zh-CN");
   const timeFormat = new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
@@ -26,6 +27,7 @@
     snapshot: null,
     topics: [],
     view: "home",
+    createReturnFocus: null,
     detail: {
       topicId: "",
       topic: null,
@@ -50,6 +52,9 @@
       page: 1,
       pageSize: PAGE_SIZE,
       total: 0,
+      loaded: false,
+    },
+    recycle: {
       loaded: false,
     },
   };
@@ -405,6 +410,113 @@
     setHidden(byId("topic-table-body").parentElement, topics.length === 0);
   }
 
+  function setCreateTopicOpen(open, trigger = null) {
+    const section = byId("create-topic-section");
+    if (open && trigger) {
+      state.createReturnFocus = trigger;
+    }
+    setHidden(section, !open);
+    byId("open-create-topic").setAttribute("aria-expanded", String(open));
+    if (open) {
+      window.requestAnimationFrame(() => byId("create-topic-id").focus());
+    } else {
+      byId("create-topic-form").reset();
+      setHidden(byId("create-topic-error"), true);
+      const returnFocus = state.createReturnFocus || byId("open-create-topic");
+      state.createReturnFocus = null;
+      if (state.topics.length === 0) {
+        showShellState("empty");
+      }
+      window.requestAnimationFrame(() => {
+        if (returnFocus.isConnected && !returnFocus.hidden) {
+          returnFocus.focus();
+        }
+      });
+    }
+  }
+
+  function createTopicPayload() {
+    const topicId = byId("create-topic-id").value.trim();
+    const displayName = byId("create-topic-name").value.trim();
+    const body = byId("create-topic-body").value;
+    const aliases = byId("create-topic-aliases").value
+      .split(",")
+      .map((alias) => alias.trim())
+      .filter(Boolean);
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(topicId)) {
+      throw new ApiError(400, "Topic ID 只能使用小写字母、数字和单连字符。请修正后重试。");
+    }
+    if (!displayName || !body.trim()) {
+      throw new ApiError(400, "显示名称和初始正文不能为空。请补全后重试。");
+    }
+    if (aliases.length > 16 || new Set(aliases.map((alias) => alias.toLocaleLowerCase("zh-CN"))).size !== aliases.length) {
+      throw new ApiError(400, "别名最多 16 个且不能重复。请修正后重试。");
+    }
+    return { topic_id: topicId, display_name: displayName, aliases, body };
+  }
+
+  async function createTopic(event) {
+    event.preventDefault();
+    const form = byId("create-topic-form");
+    const button = byId("create-topic-submit");
+    if (!form.reportValidity()) {
+      return;
+    }
+    let payload;
+    try {
+      payload = createTopicPayload();
+    } catch (error) {
+      byId("create-topic-error").textContent = errorMessage(error);
+      setHidden(byId("create-topic-error"), false);
+      return;
+    }
+    setHidden(byId("create-topic-error"), true);
+    setButtonLoading(button, true, "创建并核验中…", "验证并创建");
+    try {
+      await api("/api/topics", { method: "POST", body: payload });
+      const verified = await refreshCanonicalState(payload.topic_id);
+      if (!verified.topic || verified.topic.topic_id !== payload.topic_id || Number(verified.topic.version) !== 1) {
+        throw new ApiError(502, "服务端读回未确认创建结果。请刷新目录检查后再操作。");
+      }
+      form.reset();
+      setHidden(byId("create-topic-section"), true);
+      byId("open-create-topic").setAttribute("aria-expanded", "false");
+      navigateToTopic(payload.topic_id, "overview", byId("open-create-topic"));
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        byId("create-topic-error").textContent = `${errorMessage(error)} 请检查字段或刷新目录后重试。`;
+        setHidden(byId("create-topic-error"), false);
+      }
+    } finally {
+      setButtonLoading(button, false, "创建并核验中…", "验证并创建");
+    }
+  }
+
+  async function refreshCanonicalState(topicId = "", options = {}) {
+    const snapshot = await api("/api/overview");
+    renderSnapshot(snapshot);
+    if (!topicId) {
+      return { topic: null, body: null };
+    }
+    const detail = await api(`/api/topics/${encodeURIComponent(topicId)}`);
+    let body = null;
+    if (options.body) {
+      body = await api(`/api/topics/${encodeURIComponent(topicId)}/body`);
+    }
+    if (state.detail.topicId === topicId) {
+      state.detail.topic = detail.topic;
+      state.detail.body = body;
+      state.detail.versionsLoaded = false;
+      state.detail.versions = [];
+      state.detail.versionBodies = {};
+      renderTopicDetail(detail.topic);
+      if (body) {
+        renderCurrentBody(body);
+      }
+    }
+    return { topic: detail.topic, body };
+  }
+
   function populateTopicSelectors() {
     const selectors = [byId("manual-topic-select"), byId("recent-topic-filter")];
     selectors.forEach((select) => {
@@ -502,6 +614,11 @@
       ["当前版本", `v${formatCount(topic.version)}`],
       ["更新时间", formatTime(topic.updated_at)],
     ]);
+    const active = topic.state === "active";
+    setHidden(byId("topic-archive"), !active);
+    setHidden(byId("topic-restore"), active);
+    byId("topic-trash").disabled = !["active", "archived"].includes(topic.state);
+    byId("topic-replace-confirm-label").textContent = `我确认基于当前 v${formatCount(topic.version)} / 指纹 ${topic.content_fingerprint || "未载入"} 创建一个新版本。`;
     const chip = topicChip(topic.topic_id, "当前上下文");
     byId("topic-ask-context").replaceChildren(chip);
     void loadTopicOverviewActivity();
@@ -612,16 +729,145 @@
         return;
       }
       state.detail.body = payload;
-      byId("topic-body-content").textContent = String(payload.body || "");
-      setHidden(byId("topic-body-content"), false);
-      showInlineState(byId("topic-body-state"), "READY / BODY", `已读取 v${formatCount(payload.version)} / 指纹 ${payload.fingerprint || "—"}`);
-      button.textContent = "重新读取正文";
+      renderCurrentBody(payload);
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 401)) {
         showRetryState(byId("topic-body-state"), "ERROR / BODY", `${errorMessage(error)} 正文未显示，请重试。`, "重试正文", () => { void loadTopicBody(); });
       }
     } finally {
       setButtonLoading(button, false, "读取中…", state.detail.body ? "重新读取正文" : "读取当前正文");
+    }
+  }
+
+  function renderCurrentBody(payload) {
+    byId("topic-body-content").textContent = String(payload.body || "");
+    setHidden(byId("topic-body-content"), false);
+    showInlineState(byId("topic-body-state"), "READY / BODY", `已读取 v${formatCount(payload.version)} / 指纹 ${payload.fingerprint || "未提供"}`);
+    byId("load-topic-body").textContent = "重新读取正文";
+    const writable = state.detail.topic && state.detail.topic.state === "active";
+    byId("open-topic-append").disabled = !writable;
+    byId("open-topic-replace").disabled = !writable;
+    byId("topic-replace-confirm-label").textContent = `我确认基于当前 v${formatCount(payload.version)} / 指纹 ${payload.fingerprint || "未提供"} 创建一个新版本。`;
+  }
+
+  function setBodyMaintenanceOpen(kind, open) {
+    const form = byId(kind === "append" ? "topic-append-form" : "topic-replace-form");
+    const trigger = byId(kind === "append" ? "open-topic-append" : "open-topic-replace");
+    setHidden(form, !open);
+    if (open) {
+      const other = kind === "append" ? "replace" : "append";
+      setHidden(byId(`topic-${other}-form`), true);
+      if (kind === "replace" && state.detail.body) {
+        byId("topic-replace-body").value = String(state.detail.body.body || "");
+        byId("topic-replace-confirm").checked = false;
+        renderDiffPreview();
+      }
+      window.requestAnimationFrame(() => byId(`topic-${kind}-${kind === "append" ? "text" : "body"}`).focus());
+    } else {
+      form.reset();
+      setHidden(byId(`topic-${kind}-error`), true);
+      if (kind === "replace") {
+        byId("topic-replace-preview").textContent = "修改正文后显示逐行差异。";
+        byId("topic-replace-submit").disabled = true;
+      }
+      window.requestAnimationFrame(() => trigger.focus());
+    }
+  }
+
+  function renderDiffPreview() {
+    const before = String(state.detail.body && state.detail.body.body || "").split("\n");
+    const after = byId("topic-replace-body").value.split("\n");
+    let prefix = 0;
+    while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) {
+      prefix += 1;
+    }
+    let suffix = 0;
+    while (suffix < before.length - prefix && suffix < after.length - prefix && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) {
+      suffix += 1;
+    }
+    const output = [];
+    const unchangedStart = before.slice(Math.max(0, prefix - 3), prefix);
+    unchangedStart.forEach((line) => output.push(`  ${line}`));
+    before.slice(prefix, before.length - suffix).slice(0, 200).forEach((line) => output.push(`- ${line}`));
+    after.slice(prefix, after.length - suffix).slice(0, 200).forEach((line) => output.push(`+ ${line}`));
+    before.slice(before.length - suffix, before.length - suffix + 3).forEach((line) => output.push(`  ${line}`));
+    if (before.length - prefix - suffix > 200 || after.length - prefix - suffix > 200) {
+      output.push("… 差异过长；这里只显示前 200 行变更。完整正文仍会按输入提交。");
+    }
+    byId("topic-replace-preview").textContent = output.length ? output.join("\n") : "没有正文差异；不会提交。";
+    updateReplaceSubmit();
+  }
+
+  function updateReplaceSubmit() {
+    const changed = Boolean(state.detail.body) && byId("topic-replace-body").value !== String(state.detail.body.body || "") && Boolean(byId("topic-replace-body").value.trim());
+    byId("topic-replace-submit").disabled = !(changed && byId("topic-replace-confirm").checked);
+  }
+
+  async function appendTopicText(event) {
+    event.preventDefault();
+    const text = byId("topic-append-text").value;
+    const button = byId("topic-append-submit");
+    const current = state.detail.body;
+    if (!current || !text.trim()) {
+      byId("topic-append-error").textContent = "请先读取当前正文，并输入非空的最小追加内容。";
+      setHidden(byId("topic-append-error"), false);
+      return;
+    }
+    setHidden(byId("topic-append-error"), true);
+    setButtonLoading(button, true, "追加并读回中…", "追加并验证新版本");
+    try {
+      await api(`/api/topics/${encodeURIComponent(state.detail.topicId)}/append`, {
+        method: "POST",
+        body: { text, expected_version: current.version, expected_fingerprint: current.fingerprint },
+      });
+      const verified = await refreshCanonicalState(state.detail.topicId, { body: true });
+      if (!verified.body || Number(verified.body.version) !== Number(current.version) + 1 || verified.body.body !== `${current.body}${text}`) {
+        throw new ApiError(502, "服务端读回未确认追加结果。请重新读取正文后检查。");
+      }
+      setBodyMaintenanceOpen("append", false);
+      showInlineState(byId("topic-body-state"), "VERIFIED / APPENDED", `追加已读回并确认；当前为 v${formatCount(verified.body.version)}。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        byId("topic-append-error").textContent = `${errorMessage(error)} 请重新读取当前正文后重试。`;
+        setHidden(byId("topic-append-error"), false);
+      }
+    } finally {
+      setButtonLoading(button, false, "追加并读回中…", "追加并验证新版本");
+    }
+  }
+
+  async function replaceTopicBody(event) {
+    event.preventDefault();
+    const body = byId("topic-replace-body").value;
+    const button = byId("topic-replace-submit");
+    const current = state.detail.body;
+    updateReplaceSubmit();
+    if (!current || button.disabled) {
+      byId("topic-replace-error").textContent = "请提供有差异的完整正文，并确认当前版本与指纹。";
+      setHidden(byId("topic-replace-error"), false);
+      return;
+    }
+    setHidden(byId("topic-replace-error"), true);
+    setButtonLoading(button, true, "替换并读回中…", "确认完整替换");
+    try {
+      await api(`/api/topics/${encodeURIComponent(state.detail.topicId)}/replace`, {
+        method: "POST",
+        body: { body, expected_version: current.version, expected_fingerprint: current.fingerprint },
+      });
+      const verified = await refreshCanonicalState(state.detail.topicId, { body: true });
+      if (!verified.body || Number(verified.body.version) !== Number(current.version) + 1 || verified.body.body !== body) {
+        throw new ApiError(502, "服务端读回未确认完整替换。请重新读取正文后检查。");
+      }
+      setBodyMaintenanceOpen("replace", false);
+      showInlineState(byId("topic-body-state"), "VERIFIED / REPLACED", `完整替换已读回并确认；当前为 v${formatCount(verified.body.version)}。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        byId("topic-replace-error").textContent = `${errorMessage(error)} 请重新读取当前正文后重试。`;
+        setHidden(byId("topic-replace-error"), false);
+      }
+    } finally {
+      setButtonLoading(button, false, "替换并读回中…", "确认完整替换");
+      updateReplaceSubmit();
     }
   }
 
@@ -649,11 +895,19 @@
       payload.items.forEach((version) => {
         const row = create("div", "version-row");
         const label = create("strong", "", `v${formatCount(version.version)}${version.current ? " / 当前" : ""}`);
-        const fingerprint = create("code", "", version.fingerprint || "—");
-        const button = create("button", "button", "查看正文");
-        button.type = "button";
-        button.addEventListener("click", () => { void loadVersionBody(version.version, button); });
-        row.append(label, fingerprint, button);
+        const fingerprint = create("code", "", version.fingerprint || "未提供");
+        const actions = create("div", "version-actions");
+        const view = create("button", "button", "查看正文");
+        view.type = "button";
+        view.addEventListener("click", () => { void loadVersionBody(version.version, view); });
+        actions.append(view);
+        if (!version.current && state.detail.topic && state.detail.topic.state === "active") {
+          const rollback = create("button", "button button--danger", "回滚为新版本");
+          rollback.type = "button";
+          rollback.addEventListener("click", () => { void rollbackVersion(version.version, rollback); });
+          actions.append(rollback);
+        }
+        row.append(label, fingerprint, actions);
         byId("topic-version-list").append(row);
       });
       populateCompareSelectors(payload.items);
@@ -704,6 +958,95 @@
     }
   }
 
+  async function rollbackVersion(version, button) {
+    if (button.dataset.confirmed !== "true") {
+      button.dataset.confirmed = "true";
+      button.textContent = `再次确认：把 v${formatCount(version)} 写成新版本`;
+      button.focus();
+      return;
+    }
+    const topic = state.detail.topic;
+    if (!topic) {
+      return;
+    }
+    const idleLabel = `回滚 v${formatCount(version)} 为新版本`;
+    setButtonLoading(button, true, "回滚并读回中…", idleLabel);
+    try {
+      const historical = await readVersionBody(version);
+      await api(`/api/topics/${encodeURIComponent(state.detail.topicId)}/rollback`, {
+        method: "POST",
+        body: {
+          target_version: Number(version),
+          expected_version: topic.version,
+          expected_fingerprint: topic.content_fingerprint,
+        },
+      });
+      const verified = await refreshCanonicalState(state.detail.topicId, { body: true });
+      if (!verified.body || Number(verified.body.version) !== Number(topic.version) + 1 || verified.body.body !== historical.body) {
+        throw new ApiError(502, "服务端读回未确认回滚结果。请刷新版本时间线后检查。");
+      }
+      await loadVersions(1);
+      showInlineState(byId("topic-version-state"), "VERIFIED / ROLLBACK", `已从 v${formatCount(version)} 创建新的当前 v${formatCount(verified.body.version)}。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("topic-version-state"), "ERROR / ROLLBACK", `${errorMessage(error)} 请刷新当前版本后重试。`, "刷新版本", () => { void loadVersions(1); });
+      }
+    } finally {
+      delete button.dataset.confirmed;
+      setButtonLoading(button, false, "回滚并读回中…", idleLabel);
+    }
+  }
+
+  async function mutateTopicState(action, button) {
+    const topic = state.detail.topic;
+    if (!topic) {
+      return;
+    }
+    if (action === "trash" && button.dataset.confirmed !== "true") {
+      button.dataset.confirmed = "true";
+      button.textContent = "再次确认：移入回收站（仍可恢复）";
+      button.focus();
+      return;
+    }
+    const labels = {
+      archive: ["归档中…", "归档：停止隐式召回", "archived"],
+      restore: ["恢复中…", "恢复：重新允许召回", "active"],
+      trash: ["移入回收站中…", "移入回收站：可恢复", "trashed"],
+    };
+    const [loadingLabel, idleLabel, expectedState] = labels[action];
+    setButtonLoading(button, true, loadingLabel, idleLabel);
+    showInlineState(byId("topic-settings-status"), "WORKING / ONE TOPIC", `${topic.display_name} 正在执行${action === "archive" ? "归档" : action === "restore" ? "恢复" : "移入回收站"}。`);
+    try {
+      await api(`/api/topics/${encodeURIComponent(topic.topic_id)}${TOPIC_STATE_PATHS[action]}`, {
+        method: "POST",
+        body: { expected_version: topic.version, expected_fingerprint: topic.content_fingerprint },
+      });
+      if (action === "trash") {
+        const recycle = await api("/api/recycle-bin");
+        const verified = recycle.items.find((item) => item.topic_id === topic.topic_id);
+        if (!verified) {
+          throw new ApiError(502, "服务端读回未确认回收站墓碑。请刷新回收站检查。");
+        }
+        state.recycle.loaded = false;
+        await refreshCanonicalState();
+        setHash("home");
+        return;
+      }
+      const verified = await refreshCanonicalState(topic.topic_id);
+      if (!verified.topic || verified.topic.state !== expectedState) {
+        throw new ApiError(502, "服务端读回未确认状态变化。请刷新主题详情检查。");
+      }
+      showInlineState(byId("topic-settings-status"), "VERIFIED / STATE", `已读回并确认状态：${expectedState === "active" ? "活跃" : "已归档"}。`);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("topic-settings-status"), "ERROR / STATE", `${errorMessage(error)} 请刷新当前主题后重试。`, "刷新主题", () => { void refreshCanonicalState(topic.topic_id); });
+      }
+    } finally {
+      delete button.dataset.confirmed;
+      setButtonLoading(button, false, loadingLabel, idleLabel);
+    }
+  }
+
   async function compareVersions() {
     const button = byId("compare-versions");
     const versionA = byId("compare-version-a").value;
@@ -731,6 +1074,132 @@
       }
     } finally {
       setButtonLoading(button, false, "读取比较中…", "读取并比较");
+    }
+  }
+
+  async function loadRecycleBin() {
+    const refresh = byId("refresh-recycle");
+    state.recycle.loaded = false;
+    setButtonLoading(refresh, true, "刷新中…", "刷新回收站");
+    showInlineState(byId("recycle-state"), "LOADING / RECYCLE", "正在读取真实墓碑记录…");
+    clear(byId("recycle-list"));
+    try {
+      const payload = await api("/api/recycle-bin");
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      state.recycle.loaded = true;
+      if (!items.length) {
+        showInlineState(byId("recycle-state"), "EMPTY / RECYCLE", "回收站为空。移入回收站的单个主题会在这里显示并可恢复。");
+        return;
+      }
+      setHidden(byId("recycle-state"), true);
+      items.forEach(renderRecycleItem);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("recycle-state"), "ERROR / RECYCLE", `${errorMessage(error)} 请检查服务后重试。`, "重试回收站", () => { void loadRecycleBin(); });
+      }
+    } finally {
+      setButtonLoading(refresh, false, "刷新中…", "刷新回收站");
+    }
+  }
+
+  function renderRecycleItem(item) {
+    const card = create("article", "recycle-item");
+    const heading = create("div", "recycle-item__heading");
+    const title = create("h3", "", item.display_name);
+    const identity = create("code", "", item.topic_id);
+    heading.append(title, identity);
+    const metadata = create("p", "section-meta", `移入时间 ${formatTime(item.trashed_at)} / 原状态 ${item.prior_state === "archived" ? "已归档" : "活跃"}`);
+    const actions = create("div", "future-actions");
+    const restore = create("button", "button", "恢复主题：保留全部版本");
+    restore.type = "button";
+    restore.addEventListener("click", () => { void restoreRecycledTopic(item, restore); });
+    const prepare = create("button", "button button--danger", "准备永久删除");
+    prepare.type = "button";
+    const form = create("form", "delete-confirmation");
+    form.hidden = true;
+    const confirmationId = `delete-confirmation-${item.topic_id}`;
+    const label = create("label", "", `输入完整显示名称“${item.display_name}”以启用永久删除`);
+    label.htmlFor = confirmationId;
+    const confirmation = create("input");
+    confirmation.id = confirmationId;
+    confirmation.name = "confirmation";
+    confirmation.autocomplete = "off";
+    const help = create("p", "field-help", "永久删除会移除正文、版本、缓存、提案与证据文件，仅保留不含正文的最小审计记录。此操作不可恢复。");
+    const button = create("button", "button button--danger", "永久删除：不可恢复");
+    button.type = "submit";
+    button.disabled = true;
+    confirmation.addEventListener("input", () => {
+      const matches = confirmation.value === item.display_name;
+      button.disabled = !matches;
+    });
+    prepare.addEventListener("click", () => {
+      form.hidden = false;
+      window.requestAnimationFrame(() => confirmation.focus());
+    });
+    form.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        form.hidden = true;
+        confirmation.value = "";
+        button.disabled = true;
+        prepare.focus();
+      }
+    });
+    form.addEventListener("submit", (event) => { void deleteRecycledTopic(event, item, confirmation, button); });
+    form.append(label, confirmation, help, button);
+    actions.append(restore, prepare);
+    card.append(heading, metadata, actions, form);
+    byId("recycle-list").append(card);
+  }
+
+  async function restoreRecycledTopic(item, button) {
+    setButtonLoading(button, true, "恢复并读回中…", "恢复主题：保留全部版本");
+    try {
+      await api(`/api/recycle-bin/${encodeURIComponent(item.topic_id)}/restore`, {
+        method: "POST",
+        body: { trashed_at: item.trashed_at },
+      });
+      const verified = await refreshCanonicalState(item.topic_id);
+      if (!verified.topic || verified.topic.topic_id !== item.topic_id) {
+        throw new ApiError(502, "服务端读回未确认恢复结果。请刷新目录检查。");
+      }
+      await loadRecycleBin();
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("recycle-state"), "ERROR / RESTORE", `${errorMessage(error)} 请刷新回收站后重试。`, "刷新回收站", () => { void loadRecycleBin(); });
+      }
+    } finally {
+      setButtonLoading(button, false, "恢复并读回中…", "恢复主题：保留全部版本");
+    }
+  }
+
+  async function deleteRecycledTopic(event, item, confirmation, button) {
+    event.preventDefault();
+    const matches = confirmation.value === item.display_name;
+    button.disabled = !matches;
+    if (!matches) {
+      confirmation.focus();
+      return;
+    }
+    setButtonLoading(button, true, "永久删除并核验中…", "永久删除：不可恢复");
+    try {
+      await api(`/api/recycle-bin/${encodeURIComponent(item.topic_id)}/delete`, {
+        method: "POST",
+        body: { trashed_at: item.trashed_at, confirmation: confirmation.value },
+      });
+      const readback = await api("/api/recycle-bin");
+      if (readback.items.some((candidate) => candidate.topic_id === item.topic_id)) {
+        throw new ApiError(502, "服务端读回仍包含该墓碑。请勿重复提交并刷新检查。");
+      }
+      await refreshCanonicalState();
+      await loadRecycleBin();
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        showRetryState(byId("recycle-state"), "ERROR / DELETE", `${errorMessage(error)} 未确认删除；请刷新回收站检查后再重试。`, "刷新回收站", () => { void loadRecycleBin(); });
+      }
+    } finally {
+      setButtonLoading(button, false, "永久删除并核验中…", "永久删除：不可恢复");
+      button.disabled = confirmation.value !== item.display_name;
     }
   }
 
@@ -985,7 +1454,7 @@
     const list = create("dl", "metadata-grid");
     entries.forEach(([label, value]) => {
       const item = create("div", "metadata-item");
-      item.append(create("dt", "", label), create("dd", "", value ?? "—"));
+      item.append(create("dt", "", label), create("dd", "", value ?? "未提供"));
       list.append(item);
     });
     container.replaceChildren(...list.childNodes);
@@ -1027,7 +1496,6 @@
     actions.append(button);
     element.append(actions);
   }
-
   function switchView(viewName) {
     const next = PRIMARY_VIEWS.includes(viewName) ? viewName : "home";
     const leavingDetail = state.view === "detail" && next !== "detail";
@@ -1093,11 +1561,15 @@
     switchView(route.view);
     if (route.view === "recent" && !state.recent.loaded) {
       await loadRecentQuestions(1);
+    } else if (route.view === "recycle" && !state.recycle.loaded) {
+      await loadRecycleBin();
     }
     if (route.view === "recall") {
       window.requestAnimationFrame(() => byId("recall-title").focus());
     } else if (route.view === "recent") {
       window.requestAnimationFrame(() => byId("questions-title").focus());
+    } else if (route.view === "recycle") {
+      window.requestAnimationFrame(() => byId("recycle-title").focus());
     }
   }
 
@@ -1202,6 +1674,13 @@
   byId("topic-search").addEventListener("input", renderCatalog);
   byId("topic-status-filter").addEventListener("change", renderCatalog);
   byId("topic-sort").addEventListener("change", renderCatalog);
+  byId("open-create-topic").addEventListener("click", () => { setCreateTopicOpen(true, byId("open-create-topic")); });
+  byId("open-create-empty").addEventListener("click", () => {
+    showShellState("ready");
+    setCreateTopicOpen(true, byId("open-create-empty"));
+  });
+  byId("close-create-topic").addEventListener("click", () => { setCreateTopicOpen(false); });
+  byId("create-topic-form").addEventListener("submit", (event) => { void createTopic(event); });
   byId("close-topic-detail").addEventListener("click", closeTopicDetail);
   byId("retry-topic-detail").addEventListener("click", () => {
     state.detail.topic = null;
@@ -1211,6 +1690,18 @@
     state.detail.body = null;
     void loadTopicBody();
   });
+  byId("open-topic-append").addEventListener("click", () => { setBodyMaintenanceOpen("append", true); });
+  byId("close-topic-append").addEventListener("click", () => { setBodyMaintenanceOpen("append", false); });
+  byId("topic-append-form").addEventListener("submit", (event) => { void appendTopicText(event); });
+  byId("open-topic-replace").addEventListener("click", () => { setBodyMaintenanceOpen("replace", true); });
+  byId("close-topic-replace").addEventListener("click", () => { setBodyMaintenanceOpen("replace", false); });
+  byId("topic-replace-body").addEventListener("input", renderDiffPreview);
+  byId("topic-replace-confirm").addEventListener("change", updateReplaceSubmit);
+  byId("topic-replace-form").addEventListener("submit", (event) => { void replaceTopicBody(event); });
+  byId("topic-archive").addEventListener("click", () => { void mutateTopicState("archive", byId("topic-archive")); });
+  byId("topic-restore").addEventListener("click", () => { void mutateTopicState("restore", byId("topic-restore")); });
+  byId("topic-trash").addEventListener("click", () => { void mutateTopicState("trash", byId("topic-trash")); });
+  byId("refresh-recycle").addEventListener("click", () => { void loadRecycleBin(); });
   byId("compare-versions").addEventListener("click", () => { void compareVersions(); });
   byId("topic-ask-form").addEventListener("submit", continueAsking);
   byId("recall-form").addEventListener("submit", (event) => { void submitRecall(event); });
@@ -1254,9 +1745,34 @@
   });
   window.addEventListener("hashchange", () => { void routeFromHash({ replaceInvalid: true }); });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && state.view === "detail") {
+    if (event.key !== "Escape") {
+      return;
+    }
+    if (!byId("create-topic-section").hidden) {
       event.preventDefault();
-      closeTopicDetail();
+      setCreateTopicOpen(false);
+    } else if (!byId("topic-append-form").hidden) {
+      event.preventDefault();
+      setBodyMaintenanceOpen("append", false);
+    } else if (!byId("topic-replace-form").hidden) {
+      event.preventDefault();
+      setBodyMaintenanceOpen("replace", false);
+    } else if (byId("topic-trash").dataset.confirmed === "true") {
+      event.preventDefault();
+      delete byId("topic-trash").dataset.confirmed;
+      byId("topic-trash").textContent = "移入回收站：可恢复";
+      byId("topic-trash").focus();
+    } else {
+      const rollback = [...document.querySelectorAll("#topic-version-list button")].find((button) => button.dataset.confirmed === "true");
+      if (rollback) {
+        event.preventDefault();
+        delete rollback.dataset.confirmed;
+        rollback.textContent = "回滚为新版本";
+        rollback.focus();
+      } else if (state.view === "detail") {
+        event.preventDefault();
+        closeTopicDetail();
+      }
     }
   });
 

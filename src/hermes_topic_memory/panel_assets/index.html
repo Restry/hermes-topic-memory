@@ -53,16 +53,16 @@
         </div>
         <div id="loading-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">LOADING / API SNAPSHOT</span><p>正在读取唯一的概览快照…</p><div class="skeleton-lines" aria-hidden="true"><span></span><span></span><span></span></div></div>
         <div id="error-state" class="state-panel state-panel--error" role="alert" hidden><span class="state-kicker">ERROR / OVERVIEW</span><h3>无法读取记忆资产</h3><p id="error-message">请检查服务状态和会话权限，然后重试。</p><div class="state-actions"><button id="retry-overview" class="button button--primary" type="button">重试概览</button><button id="reset-session" class="button button--quiet" type="button">重新输入令牌</button></div></div>
-        <div id="empty-state" class="state-panel" hidden><span class="state-kicker">EMPTY / FIRST TOPIC</span><h3>尚无可管理的主题</h3><p>先通过 CLI 创建规范主题；写入后重新载入，此处会显示版本、问题历史与有效缓存。</p><button id="refresh-empty" class="button button--quiet" type="button">重新载入</button></div>
+        <div id="empty-state" class="state-panel" hidden><span class="state-kicker">EMPTY / FIRST TOPIC</span><h3>尚无可管理的主题</h3><p>直接创建首个规范主题；成功后目录会从服务端读回版本、指纹和状态。</p><div class="state-actions"><button id="open-create-empty" class="button button--primary" type="button">创建首个主题</button><button id="refresh-empty" class="button button--quiet" type="button">重新载入</button></div></div>
 
         <div id="dashboard-data" hidden>
           <section aria-labelledby="kpi-title">
             <div class="section-heading"><div><p class="section-index">// SIGNALS</p><h3 id="kpi-title">关键指标</h3></div><p id="secondary-counts" class="section-meta"></p></div>
             <div id="kpi-strip" class="kpi-strip">
-              <article class="kpi"><span>活跃主题</span><strong id="kpi-active">—</strong><small>当前可召回</small></article>
-              <article class="kpi"><span>历史提问</span><strong id="kpi-total">—</strong><small>独立于 QA 缓存</small></article>
-              <article class="kpi"><span>有效缓存</span><strong id="kpi-cache">—</strong><small>匹配当前版本</small></article>
-              <article class="kpi"><span>最近 30 天</span><strong id="kpi-30d">—</strong><small>北京时间</small></article>
+              <article class="kpi"><span>活跃主题</span><strong id="kpi-active">待载入</strong><small>当前可召回</small></article>
+              <article class="kpi"><span>历史提问</span><strong id="kpi-total">待载入</strong><small>独立于 QA 缓存</small></article>
+              <article class="kpi"><span>有效缓存</span><strong id="kpi-cache">待载入</strong><small>匹配当前版本</small></article>
+              <article class="kpi"><span>最近 30 天</span><strong id="kpi-30d">待载入</strong><small>北京时间</small></article>
             </div>
           </section>
           <div class="analytics-layout">
@@ -82,12 +82,24 @@
             <ol id="recent-list" class="activity-list"></ol><p id="recent-empty" class="inline-empty" hidden>还没有提问历史。通过 Hermes、Panel 或 CLI 完成召回后，活动会出现在这里。</p>
           </section>
           <section id="topic-catalog" class="data-panel catalog-panel" aria-labelledby="catalog-title">
-            <div class="section-heading catalog-heading"><div><p class="section-index">// CATALOG</p><h3 id="catalog-title">主题目录</h3></div><p id="catalog-count" class="section-meta" aria-live="polite"></p></div>
+            <div class="section-heading catalog-heading"><div><p class="section-index">// CATALOG</p><h3 id="catalog-title">主题目录</h3></div><div class="catalog-heading-actions"><p id="catalog-count" class="section-meta" aria-live="polite"></p><button id="open-create-topic" class="button button--primary" type="button" aria-expanded="false" aria-controls="create-topic-section">创建新主题</button></div></div>
             <div class="catalog-controls">
               <div class="control control--search"><label for="topic-search">搜索主题</label><input id="topic-search" type="search" autocomplete="off" placeholder="名称、ID 或别名"></div>
               <div class="control"><label for="topic-status-filter">状态</label><select id="topic-status-filter"><option value="all">全部</option><option value="active">活跃</option><option value="archived">已归档</option></select></div>
               <div class="control"><label for="topic-sort">排序</label><select id="topic-sort"><option value="question-desc">提问数：高到低</option><option value="updated-desc">更新时间：新到旧</option><option value="version-desc">版本：高到低</option><option value="title-asc">名称：A 到 Z</option></select></div>
             </div>
+            <section id="create-topic-section" class="maintenance-section" aria-labelledby="create-topic-title" hidden>
+              <div class="section-heading"><div><p class="section-index">// CREATE / ONE TOPIC</p><h3 id="create-topic-title">创建新主题</h3></div><button id="close-create-topic" class="button button--quiet" type="button">取消创建</button></div>
+              <p class="field-help">一次只创建一个主题。所有字段验证通过后才会提交；创建成功后从服务端重新读取规范状态。</p>
+              <form id="create-topic-form" class="maintenance-form" novalidate>
+                <div class="control"><label for="create-topic-id">Topic ID</label><input id="create-topic-id" name="topic_id" required maxlength="100" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" autocomplete="off" placeholder="例如 project-atlas"><p class="field-help">仅小写字母、数字和单连字符；例如 <code>project-atlas</code>。</p></div>
+                <div class="control"><label for="create-topic-name">显示名称</label><input id="create-topic-name" name="display_name" required maxlength="200" autocomplete="off" placeholder="例如 Project Atlas"><p class="field-help">示例：<code>Project Atlas</code>；不能与现有 ID、名称或别名冲突。</p></div>
+                <div class="control"><label for="create-topic-aliases">别名</label><input id="create-topic-aliases" name="aliases" maxlength="1200" autocomplete="off" placeholder="例如 atlas, 阿特拉斯"><p class="field-help">使用英文逗号分隔，最多 16 个；示例：<code>atlas, 阿特拉斯</code>。</p></div>
+                <div class="control maintenance-form__wide"><label for="create-topic-body">初始规范正文</label><textarea id="create-topic-body" name="body" rows="9" required maxlength="2000000" placeholder="# Project Atlas&#10;&#10;在这里写入首个可验证事实。"></textarea><p class="field-help">真实示例：Markdown 标题、空行和事实正文；不能只输入空白。</p></div>
+                <p id="create-topic-error" class="field-error maintenance-form__wide" role="alert" hidden></p>
+                <div class="form-actions maintenance-form__wide"><button id="create-topic-submit" class="button button--primary" type="submit">验证并创建</button></div>
+              </form>
+            </section>
             <div class="table-scroll catalog-table-wrap"><table class="catalog-table"><caption class="visually-hidden">主题目录；可按名称、ID、别名和状态筛选</caption><thead><tr><th scope="col" data-field="display_name">主题</th><th scope="col" data-field="question_count">提问</th><th scope="col" data-field="active_cache_count">缓存</th><th scope="col" data-field="version">版本</th><th scope="col" data-field="updated_at">更新时间</th><th scope="col" data-field="status">状态</th></tr></thead><tbody id="topic-table-body"></tbody></table></div>
             <p id="catalog-empty" class="inline-empty" hidden>没有匹配的主题。清除搜索或切换状态筛选。</p>
           </section>
@@ -113,9 +125,30 @@
           <section id="topic-overview-panel" class="detail-panel" role="tabpanel" data-detail-panel="overview"><div id="topic-overview-grid" class="metadata-grid"></div><section class="subsection"><div class="section-heading"><div><p class="section-index">// RECENT ACTIVITY</p><h3>近期参与记录</h3></div></div><div id="topic-overview-activity"></div></section></section>
           <section id="topic-questions-panel" class="detail-panel" role="tabpanel" data-detail-panel="questions" hidden><div class="section-heading"><div><p class="section-index">// QUESTIONS</p><h3>涉及此主题的提问</h3></div><p id="topic-question-count" class="section-meta"></p></div><div id="topic-question-state" class="state-panel compact-state" role="status"></div><div id="topic-question-list" class="query-list"></div><div id="topic-question-pagination" class="pagination"></div></section>
           <section id="topic-ask-panel" class="detail-panel" role="tabpanel" data-detail-panel="ask" hidden><p class="section-index">// CONTINUE ASKING</p><h3>从当前主题继续</h3><div id="topic-ask-context" class="topic-context"></div><p class="field-help">当前主题仅作为建议起点。提交原问题后，Agent 仍会独立规划，可添加其他必需主题，也可能依据问题判断不选当前主题。</p><form id="topic-ask-form" class="question-form"><label for="topic-ask-question">问题</label><textarea id="topic-ask-question" rows="4" required placeholder="输入需要跨主题推理的问题"></textarea><button id="topic-ask-submit" class="button button--primary" type="submit">交给 Agent 规划</button></form></section>
-          <section id="topic-body-panel" class="detail-panel" role="tabpanel" data-detail-panel="body" hidden><div class="section-heading"><div><p class="section-index">// CANONICAL BODY</p><h3>规范正文</h3></div><button id="load-topic-body" class="button" type="button">读取当前正文</button></div><p class="field-help">正文仅在此处明确操作后读取；不会随目录或详情预取。</p><div id="topic-body-state" class="state-panel compact-state">尚未读取正文。</div><pre id="topic-body-content" class="body-viewer" tabindex="0" hidden></pre><div class="future-actions"><button class="button" type="button" disabled title="Task 11 开放">追加（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">编辑（Task 11）</button></div></section>
-          <section id="topic-versions-panel" class="detail-panel" role="tabpanel" data-detail-panel="versions" hidden><div class="section-heading"><div><p class="section-index">// VERSIONS</p><h3>版本时间线</h3></div><p id="topic-version-count" class="section-meta"></p></div><div id="topic-version-state" class="state-panel compact-state" role="status"></div><div id="topic-version-list" class="version-list"></div><div id="topic-version-pagination" class="pagination"></div><section class="version-inspector"><h3>版本正文</h3><pre id="topic-version-body" class="body-viewer" tabindex="0">选择“查看正文”后才会读取该版本。</pre></section><section class="version-inspector"><h3>版本比较</h3><div class="compare-controls"><div class="control"><label for="compare-version-a">版本 A</label><select id="compare-version-a"></select></div><div class="control"><label for="compare-version-b">版本 B</label><select id="compare-version-b"></select></div><button id="compare-versions" class="button" type="button">读取并比较</button></div><div id="topic-version-compare" class="compare-grid"></div></section><button class="button" type="button" disabled title="Task 11 开放">回滚（Task 11）</button></section>
-          <section id="topic-settings-panel" class="detail-panel" role="tabpanel" data-detail-panel="settings" hidden><p class="section-index">// SETTINGS</p><h3>主题元数据与维护</h3><div id="topic-settings-metadata" class="metadata-grid"></div><div class="future-actions"><button class="button" type="button" disabled title="Task 11 开放">编辑名称与别名（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">归档（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">移入回收站（Task 11）</button></div><p class="field-help">本任务只提供真实只读状态；维护操作尚未开放，不会显示虚假成功。</p></section>
+          <section id="topic-body-panel" class="detail-panel" role="tabpanel" data-detail-panel="body" hidden>
+            <div class="section-heading"><div><p class="section-index">// CANONICAL BODY</p><h3>规范正文</h3></div><button id="load-topic-body" class="button" type="button">读取当前正文</button></div>
+            <p class="field-help">正文仅在此处明确操作后读取；不会随目录或详情预取。</p>
+            <div id="topic-body-state" class="state-panel compact-state" role="status" aria-live="polite">尚未读取正文。</div>
+            <pre id="topic-body-content" class="body-viewer" tabindex="0" hidden></pre>
+            <div class="future-actions"><button id="open-topic-append" class="button" type="button">仅追加最小文本</button><button id="open-topic-replace" class="button" type="button">完整替换正文</button></div>
+            <form id="topic-append-form" class="maintenance-section" hidden novalidate>
+              <div class="section-heading"><div><p class="section-index">// MINIMAL APPEND</p><h3>仅追加最小文本</h3></div><button id="close-topic-append" class="button button--quiet" type="button">取消追加</button></div>
+              <label for="topic-append-text">追加内容</label><textarea id="topic-append-text" rows="5" maxlength="65536" required placeholder="例如：&#10;- 2026-08-12：新增一条经过核实的事实。"></textarea>
+              <p class="field-help">原正文不会被重写。重复片段会被服务端拒绝；提交前会绑定当前版本与指纹。</p>
+              <p id="topic-append-error" class="field-error" role="alert" hidden></p>
+              <div class="form-actions"><button id="topic-append-submit" class="button button--primary" type="submit">追加并验证新版本</button></div>
+            </form>
+            <form id="topic-replace-form" class="maintenance-section" hidden novalidate>
+              <div class="section-heading"><div><p class="section-index">// INTENTIONAL FULL REPLACE</p><h3>完整替换正文</h3></div><button id="close-topic-replace" class="button button--quiet" type="button">取消替换</button></div>
+              <label for="topic-replace-body">完整新正文</label><textarea id="topic-replace-body" rows="12" maxlength="2000000" required></textarea>
+              <section class="diff-section" aria-labelledby="topic-replace-preview-title"><h3 id="topic-replace-preview-title">可读差异预览</h3><pre id="topic-replace-preview" class="diff-preview">修改正文后显示逐行差异。</pre></section>
+              <label class="check-label" for="topic-replace-confirm"><input id="topic-replace-confirm" type="checkbox"><span id="topic-replace-confirm-label">确认将基于当前版本与指纹创建一个新版本。</span></label>
+              <p id="topic-replace-error" class="field-error" role="alert" hidden></p>
+              <div class="form-actions"><button id="topic-replace-submit" class="button button--primary" type="submit" disabled>确认完整替换</button></div>
+            </form>
+          </section>
+          <section id="topic-versions-panel" class="detail-panel" role="tabpanel" data-detail-panel="versions" hidden><div class="section-heading"><div><p class="section-index">// VERSIONS</p><h3>版本时间线</h3></div><p id="topic-version-count" class="section-meta"></p></div><p class="field-help">回滚会把所选历史正文写成一个新的当前版本；不会删除或覆盖任何历史版本。</p><div id="topic-version-state" class="state-panel compact-state" role="status" aria-live="polite"></div><div id="topic-version-list" class="version-list"></div><div id="topic-version-pagination" class="pagination"></div><section class="version-inspector"><h3>版本正文</h3><pre id="topic-version-body" class="body-viewer" tabindex="0">选择“查看正文”后才会读取该版本。</pre></section><section class="version-inspector"><h3>版本比较</h3><div class="compare-controls"><div class="control"><label for="compare-version-a">版本 A</label><select id="compare-version-a"></select></div><div class="control"><label for="compare-version-b">版本 B</label><select id="compare-version-b"></select></div><button id="compare-versions" class="button" type="button">读取并比较</button></div><div id="topic-version-compare" class="compare-grid"></div></section></section>
+          <section id="topic-settings-panel" class="detail-panel" role="tabpanel" data-detail-panel="settings" hidden><p class="section-index">// SETTINGS</p><h3>主题状态维护</h3><div id="topic-settings-metadata" class="metadata-grid"></div><div id="topic-settings-status" class="state-panel compact-state" role="status" aria-live="polite">选择一个与当前状态匹配的单主题操作。</div><div class="maintenance-actions"><section><h3>归档 / 恢复</h3><p class="field-help">归档后不参与隐式召回；仍保留正文与版本，可在此恢复。</p><button id="topic-archive" class="button" type="button">归档：停止隐式召回</button><button id="topic-restore" class="button" type="button" hidden>恢复：重新允许召回</button></section><section class="danger-zone"><h3>移入回收站</h3><p class="field-help">主题会从目录移除，但正文、版本和相关资产仍可恢复。永久删除只能在回收站中执行。</p><button id="topic-trash" class="button button--danger" type="button">移入回收站：可恢复</button></section></div></section>
         </div>
       </section>
 
@@ -129,7 +162,7 @@
         </form>
         <div id="recall-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">READY / REAL QUERY</span><h3>等待问题</h3><p>提交后将显示 Agent 的实际选择理由、逐主题结果和最终综合；这里不会生成示例结果。</p></div>
         <section id="recall-output" hidden>
-          <div class="run-identity"><div><span>当前 Query ID</span><code id="recall-query-id">—</code></div><div><span>上次 Query ID</span><code id="recall-previous-query-id">—</code></div><button id="rerun-recall" class="button" type="button">按当前版本重跑</button></div>
+          <div class="run-identity"><div><span>当前 Query ID</span><code id="recall-query-id">待运行</code></div><div><span>上次 Query ID</span><code id="recall-previous-query-id">暂无</code></div><button id="rerun-recall" class="button" type="button">按当前版本重跑</button></div>
           <section class="subsection"><div class="section-heading"><div><p class="section-index">// AGENT PLAN</p><h3>所选主题与理由</h3></div><p id="recall-plan-mode" class="section-meta"></p></div><div id="recall-plan" class="chip-list"></div></section>
           <section class="subsection"><div class="section-heading"><div><p class="section-index">// TOPIC RESULTS</p><h3>逐主题执行</h3></div></div><div id="recall-topic-results" class="result-grid"></div></section>
           <section id="recall-final" class="synthesis-panel"><p class="section-index">// ATTRIBUTED SYNTHESIS</p><h3>最终综合</h3><p id="recall-final-source" class="section-meta"></p><div id="recall-final-answer" class="answer-text"></div></section>
@@ -154,7 +187,7 @@
         <div id="recent-pagination" class="pagination"></div>
       </section>
 
-      <section class="view-panel teaching-panel" data-panel="recycle" aria-labelledby="recycle-title" hidden><p class="section-index">// RECYCLE BIN</p><h2 id="recycle-title">回收站</h2><p>恢复与永久删除属于后续安全写入任务；此处不提供无保护的破坏性操作。</p></section>
+      <section id="recycle-view" class="view-panel" data-panel="recycle" aria-labelledby="recycle-title" hidden><div class="view-heading"><div><p class="section-index">// RECYCLE BIN</p><h2 id="recycle-title" tabindex="-1">回收站</h2><p class="snapshot-status">恢复为可逆操作；永久删除不可恢复且必须精确输入显示名称。</p></div><button id="refresh-recycle" class="button button--quiet" type="button">刷新回收站</button></div><div id="recycle-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">LOADING / RECYCLE</span><p>打开本页后读取真实墓碑记录。</p></div><div id="recycle-list" class="recycle-list"></div></section>
     </div>
   </main>
   <footer class="product-footer"><span>HERMES TOPIC MEMORY</span><span>PRIVATE METADATA / SESSION AUTH</span></footer>

@@ -287,6 +287,85 @@ def test_task10_visual_corrections_remove_numbered_scaffolding_and_side_stripes(
     assert ".state-panel--error" in css
 
 
+def test_task11_dom_exposes_safe_topic_maintenance_controls() -> None:
+    html = _asset_text("index.html")
+    parser = _ContractParser()
+    parser.feed(html)
+
+    assert {
+        "open-create-topic",
+        "create-topic-section",
+        "create-topic-form",
+        "create-topic-id",
+        "create-topic-name",
+        "create-topic-aliases",
+        "create-topic-body",
+        "create-topic-submit",
+        "topic-append-form",
+        "topic-append-text",
+        "topic-append-submit",
+        "topic-replace-form",
+        "topic-replace-body",
+        "topic-replace-preview",
+        "topic-replace-confirm",
+        "topic-replace-submit",
+        "topic-settings-status",
+        "topic-archive",
+        "topic-restore",
+        "topic-trash",
+        "recycle-view",
+        "recycle-list",
+        "recycle-state",
+    } <= parser.ids
+    assert {
+        "create-topic-id",
+        "create-topic-name",
+        "create-topic-aliases",
+        "create-topic-body",
+        "topic-append-text",
+        "topic-replace-body",
+        "topic-replace-confirm",
+    } <= parser.label_targets
+    assert "创建新主题" in html
+    assert "仅追加最小文本" in html
+    assert "完整替换" in html
+    assert "创建一个新版本" in html
+    assert "移入回收站" in html
+    assert "永久删除" in html
+    assert ">—<" not in html
+
+
+def test_task11_script_validates_mutations_readbacks_and_exact_delete_confirmation() -> None:
+    script = _asset_text("app.js")
+
+    for contract in (
+        'api("/api/topics", { method: "POST"',
+        "/append",
+        "/replace",
+        "/rollback",
+        "/archive",
+        "/restore",
+        "/trash",
+        "/api/recycle-bin",
+        "/delete",
+        "renderDiffPreview",
+        "refreshCanonicalState",
+        "loadRecycleBin",
+        "confirmation.value === item.display_name",
+        "button.disabled = !matches",
+        "expected_version",
+        "expected_fingerprint",
+        "try",
+        "catch",
+        "finally",
+    ):
+        assert contract in script
+    assert "window.confirm" not in script
+    assert "innerHTML" not in script
+    assert "localStorage" not in script
+    assert "console." not in script
+
+
 @pytest.mark.parametrize(
     ("path", "content_type"),
     (
