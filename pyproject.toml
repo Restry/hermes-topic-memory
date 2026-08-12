@@ -20,6 +20,9 @@ hermes-topic-memory-install = "hermes_topic_memory.install:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+hermes_topic_memory = ["panel_assets/*.html", "panel_assets/*.css", "panel_assets/*.js"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = ["src"]

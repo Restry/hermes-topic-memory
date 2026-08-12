@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import resources
 from pathlib import Path
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from .panel_app import PanelApplication, PanelResponse
 
@@ -12,6 +15,16 @@ DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8080
 PANEL_AUTH_TOKEN_ENV = "HERMES_TOPIC_MEMORY_PANEL_TOKEN"
 _MAX_REQUEST_BODY = 64 * 1024
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+    "form-action 'self'; object-src 'none'"
+)
+_STATIC_ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
+    "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
 
 
 class TopicMemoryPanelServer(ThreadingHTTPServer):
@@ -56,6 +69,11 @@ class TopicMemoryPanelHandler(BaseHTTPRequestHandler):
         return
 
     def _handle_request(self) -> None:
+        if self.command == "GET":
+            asset = _asset_response(urlsplit(self.path).path)
+            if asset is not None:
+                self._send_response(asset)
+                return
         body_or_error = self._read_body()
         if isinstance(body_or_error, PanelResponse):
             self._send_response(body_or_error)
@@ -90,8 +108,34 @@ class TopicMemoryPanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(response.body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", _CONTENT_SECURITY_POLICY)
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
         self.end_headers()
         self.wfile.write(response.body)
+
+
+@lru_cache(maxsize=len(_STATIC_ASSETS) + 1)
+def _asset_response(path: str) -> PanelResponse | None:
+    if path == "/favicon.ico":
+        return PanelResponse(status=204, body=b"", content_type="image/x-icon")
+    asset = _STATIC_ASSETS.get(path)
+    if asset is None:
+        return None
+    filename, content_type = asset
+    try:
+        body = (
+            resources.files("hermes_topic_memory")
+            .joinpath("panel_assets", filename)
+            .read_bytes()
+        )
+    except OSError:
+        return _transport_error(500, "asset_unavailable", "Panel asset unavailable.")
+    return PanelResponse(status=200, body=body, content_type=content_type)
 
 
 def create_panel_server(
