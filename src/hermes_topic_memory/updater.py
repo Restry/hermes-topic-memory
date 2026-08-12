@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator, Literal, Protocol, runtime_checkable
+from typing import Callable, Iterator, Literal, Protocol, runtime_checkable
 
 from .evidence import EvidenceLedger, EvidenceRecord
 from .models import TopicMemory
@@ -52,6 +52,7 @@ class EvidenceUpdatePipeline:
         ledger: EvidenceLedger,
         updater: TopicUpdater,
         max_body_chars: int = 200_000,
+        replace_topic: Callable[[TopicMemory, str], TopicMemory] | None = None,
     ) -> None:
         if max_body_chars < 1:
             raise ValueError("maximum body size must be positive")
@@ -59,6 +60,7 @@ class EvidenceUpdatePipeline:
         self.ledger = ledger
         self.updater = updater
         self.max_body_chars = max_body_chars
+        self.replace_topic = replace_topic or self._replace_topic
         self.audit_dir = store.root / "update-proposals"
 
     def process(
@@ -86,7 +88,7 @@ class EvidenceUpdatePipeline:
             return result
 
         self._validate_update(proposal, memory, evidence)
-        updated = self.store.update_topic(topic_id, proposal.proposed_body or "")
+        updated = self.replace_topic(memory, proposal.proposed_body or "")
         result = UpdateResult(
             status="updated",
             topic_id=topic_id,
@@ -97,6 +99,14 @@ class EvidenceUpdatePipeline:
         )
         self._append_audit(proposal, result)
         return result
+
+    def _replace_topic(self, memory: TopicMemory, body: str) -> TopicMemory:
+        return self.store.update_topic(
+            memory.metadata.topic_id,
+            body,
+            expected_version=memory.metadata.version,
+            expected_fingerprint=memory.metadata.content_fingerprint,
+        )
 
     @staticmethod
     def _validate_common(proposal: UpdateProposal, topic_id: str) -> None:

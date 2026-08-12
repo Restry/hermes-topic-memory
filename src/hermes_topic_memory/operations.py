@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from .evidence import EvidenceLedger, EvidenceRecord
 from .models import TopicMemory
@@ -26,6 +27,7 @@ def apply_evidence_update(
     body: str,
     evidence_ids: tuple[str, ...],
     reason: str,
+    replace_topic: Callable[[TopicMemory, str], TopicMemory] | None = None,
 ) -> UpdateResult:
     """Apply a complete replacement after the core pipeline validates its evidence."""
     proposal = UpdateProposal(
@@ -39,4 +41,5 @@ def apply_evidence_update(
         store=store,
         ledger=ledger,
         updater=_ExplicitUpdater(proposal),
+        replace_topic=replace_topic,
     ).process(topic_id, evidence_ids)

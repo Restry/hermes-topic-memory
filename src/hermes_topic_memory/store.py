@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator
 
-from .models import TopicMemory, TopicMetadata
+from .models import TopicMemory, TopicMetadata, TopicState
 
 _TOPIC_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -31,6 +31,14 @@ class TopicExistsError(TopicStoreError):
 
 class TopicCorruptionError(TopicStoreError):
     """Raised when persisted metadata does not match canonical text."""
+
+
+class ConcurrentTopicUpdateError(TopicStoreError):
+    """Raised when optimistic topic preconditions no longer match."""
+
+
+class TopicStateError(TopicStoreError):
+    """Raised when a canonical write targets a read-only lifecycle state."""
 
 
 class FileTopicStore:
@@ -87,11 +95,32 @@ class FileTopicStore:
         with self._lock(topic_id, require_existing=True):
             return self._read_unlocked(topic_id)
 
-    def update_topic(self, topic_id: str, body: str) -> TopicMemory:
+    def update_topic(
+        self,
+        topic_id: str,
+        body: str,
+        *,
+        expected_version: int | None = None,
+        expected_fingerprint: str | None = None,
+    ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         self._validate_body(body)
         with self._lock(topic_id, require_existing=True):
             current = self._read_unlocked(topic_id)
+            if (
+                expected_version is not None
+                and current.metadata.version != expected_version
+            ) or (
+                expected_fingerprint is not None
+                and current.metadata.content_fingerprint != expected_fingerprint
+            ):
+                raise ConcurrentTopicUpdateError(
+                    f"topic changed concurrently: {topic_id}"
+                )
+            if current.metadata.state != "active":
+                raise TopicStateError(
+                    f"topic is read-only in state {current.metadata.state}: {topic_id}"
+                )
             if current.body == body:
                 raise ValueError("replacement body must differ from current body")
             history_path = self._version_path(topic_id, current.metadata.version)
@@ -109,6 +138,33 @@ class FileTopicStore:
             self._atomic_write(self._memory_path(topic_id), body.encode("utf-8"))
             self._write_metadata(topic_id, metadata)
             return TopicMemory(metadata=metadata, body=body)
+
+    def set_topic_state(
+        self,
+        topic_id: str,
+        state: TopicState,
+        *,
+        expected_version: int | None = None,
+        expected_state: TopicState | None = None,
+    ) -> TopicMemory:
+        self._validate_topic_id(topic_id)
+        if state not in ("active", "archived", "trashed"):
+            raise ValueError(f"invalid topic state: {state!r}")
+        with self._lock(topic_id, require_existing=True):
+            current = self._read_unlocked(topic_id)
+            if (
+                expected_version is not None
+                and current.metadata.version != expected_version
+            ) or (
+                expected_state is not None
+                and current.metadata.state != expected_state
+            ):
+                raise ConcurrentTopicUpdateError(
+                    f"topic changed concurrently: {topic_id}"
+                )
+            metadata = replace(current.metadata, state=state, updated_at=_utc_now())
+            self._write_metadata(topic_id, metadata)
+            return TopicMemory(metadata=metadata, body=current.body)
 
     def read_version(self, topic_id: str, version: int) -> str:
         if version < 1:

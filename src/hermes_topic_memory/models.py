@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+TopicState = Literal["active", "archived", "trashed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +16,7 @@ class TopicMetadata:
     created_at: str
     updated_at: str
     source_policy: str
+    state: TopicState = "active"
     source_relative_path: str | None = None
     source_sha256: str | None = None
     source_bytes: int | None = None
@@ -31,6 +34,7 @@ class TopicMetadata:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "source_policy": self.source_policy,
+            "state": self.state,
         }
         optional = {
             "source_relative_path": self.source_relative_path,
@@ -54,6 +58,7 @@ class TopicMetadata:
             created_at=str(value["created_at"]),
             updated_at=str(value["updated_at"]),
             source_policy=str(value["source_policy"]),
+            state=_topic_state(value.get("state", "active")),
             source_relative_path=_optional_str(value.get("source_relative_path")),
             source_sha256=_optional_str(value.get("source_sha256")),
             source_bytes=_optional_int(value.get("source_bytes")),
@@ -68,6 +73,12 @@ class TopicMemory:
     metadata: TopicMetadata
     body: str
 
+
+
+def _topic_state(value: Any) -> TopicState:
+    if value not in ("active", "archived", "trashed"):
+        raise ValueError(f"invalid topic state: {value!r}")
+    return value
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)

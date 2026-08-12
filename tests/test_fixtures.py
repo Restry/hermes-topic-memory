@@ -38,6 +38,7 @@ def test_each_fixture_is_versioned_sanitized_canonical_text() -> None:
         assert memory.metadata.topic_id == topic_id
         assert memory.metadata.version >= 2
         assert memory.metadata.source_policy == "synthetic-fixture-only"
+        assert memory.metadata.state == "active"
         assert memory.metadata.content_fingerprint == hashlib.sha256(
             body.encode("utf-8")
         ).hexdigest()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -11,13 +10,12 @@ from .cache import QuestionCache
 from .dashboard import generate_dashboard
 from .engine import RecallEngine
 from .multi_recall import MultiRecallEngine, ReaderCapsuleSynthesizer, TopicSelection
-from .evidence import EvidenceLedger
-from .operations import apply_evidence_update
 from .importer import import_markdown_directory
 from .reader import OpenAICompatibleReader, Reader
 from .query_history import QueryHistoryStore
 from .router import TopicRegistry
 from .store import FileTopicStore
+from .topic_admin import TopicAdminService
 from .validation import validate_data_root
 
 
@@ -117,30 +115,14 @@ def _load_registry_value(data_root: Path) -> dict:
 
 
 def _init_topic(data_root: Path, args: argparse.Namespace) -> dict:
-    body = args.body_file.read_text(encoding="utf-8")
-    registry_path = _registry_path(data_root)
-    if registry_path.exists():
-        registry_value = _load_registry_value(data_root)
-    else:
-        registry_value = {"topics": []}
-    topic = FileTopicStore(data_root).create_topic(
+    topic = TopicAdminService(data_root).create_topic(
         args.topic_id,
-        body,
-        display_name=args.display_name or args.topic_id,
-        aliases=tuple(args.alias),
+        args.display_name or args.topic_id,
+        tuple(args.alias),
+        args.body_file.read_text(encoding="utf-8"),
+        chat_ids=tuple(args.chat_id),
+        make_default=args.default,
     )
-    registry_value["topics"].append(
-        {
-            "topic_id": args.topic_id,
-            "display_name": args.display_name or args.topic_id,
-            "aliases": list(args.alias),
-            "chat_ids": list(args.chat_id),
-        }
-    )
-    if args.default:
-        registry_value["default_topic"] = args.topic_id
-    TopicRegistry.from_dict(registry_value)
-    _atomic_json_write(registry_path, registry_value)
     return {"status": "created", "topic_id": args.topic_id, "version": topic.metadata.version}
 
 
@@ -256,11 +238,9 @@ def _recall_multi(data_root: Path, args: argparse.Namespace, reader: Reader | No
 def _update(data_root: Path, args: argparse.Namespace) -> dict:
     registry = TopicRegistry.from_file(_registry_path(data_root))
     topic_id = registry.resolve_name(args.topic, context="update topic")
-    result = apply_evidence_update(
-        store=FileTopicStore(data_root),
-        ledger=EvidenceLedger(data_root),
-        topic_id=topic_id,
-        body=args.body_file.read_text(encoding="utf-8"),
+    result = TopicAdminService(data_root).evidence_backed_edit(
+        topic_id,
+        args.body_file.read_text(encoding="utf-8"),
         evidence_ids=tuple(args.evidence_id),
         reason=args.reason,
     )
@@ -275,7 +255,7 @@ def _update(data_root: Path, args: argparse.Namespace) -> dict:
 def _rollback(data_root: Path, args: argparse.Namespace) -> dict:
     registry = TopicRegistry.from_file(_registry_path(data_root))
     topic_id = registry.resolve_name(args.topic, context="rollback topic")
-    memory = FileTopicStore(data_root).rollback_topic(topic_id, args.version)
+    memory = TopicAdminService(data_root).rollback(topic_id, args.version)
     return {"status": "rolled_back", "topic_id": topic_id, "version": memory.metadata.version}
 
 
@@ -297,21 +277,6 @@ def _reader_from_environment() -> OpenAICompatibleReader:
         api_key=os.environ.get("HERMES_TOPIC_MEMORY_API_KEY"),
     )
 
-
-def _atomic_json_write(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

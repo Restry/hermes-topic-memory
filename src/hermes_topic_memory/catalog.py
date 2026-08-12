@@ -35,7 +35,7 @@ class TopicSummary:
     aliases: tuple[str, ...]
     version: int
     updated_at: str
-    status: Literal["active"]
+    status: Literal["active", "archived"]
     question_count: int
     active_cache_count: int
     source_relative_path: str
@@ -118,7 +118,14 @@ class TopicCatalog:
         cache = QuestionCache(self.data_root)
         topics: list[TopicSummary] = []
         for config in registry.topics:
+            if config.state == "trashed":
+                continue
             metadata = self._read_metadata(config.topic_id)
+            if metadata.state != config.state:
+                raise TopicCorruptionError(
+                    f"registry and metadata state differ: {config.topic_id}"
+                )
+
             current_cache_count = sum(
                 record.topic_version == metadata.version
                 for record in cache.records(config.topic_id)
@@ -131,7 +138,7 @@ class TopicCatalog:
                     aliases=config.aliases,
                     version=metadata.version,
                     updated_at=metadata.updated_at,
-                    status="active",
+                    status=config.state,
                     question_count=topic_question_counts[config.topic_id],
                     active_cache_count=current_cache_count,
                     source_relative_path=_safe_source_relative_path(config, metadata),
@@ -146,7 +153,7 @@ class TopicCatalog:
 
         active_cache_count = sum(topic.active_cache_count for topic in topics)
         return CatalogSnapshot(
-            active_topic_count=len(topics),
+            active_topic_count=sum(topic.status == "active" for topic in topics),
             total_question_count=len(query_records),
             active_cache_count=active_cache_count,
             questions_last_30_days=sum(item.question_count for item in daily_questions),
@@ -155,7 +162,9 @@ class TopicCatalog:
         )
 
     def _validate_topic_directories(self, registry: TopicRegistry) -> None:
-        registered = {topic.topic_id for topic in registry.topics}
+        registered = {
+            topic.topic_id for topic in registry.topics if topic.state != "trashed"
+        }
         topics_dir = self.data_root / "topics"
         actual = (
             {

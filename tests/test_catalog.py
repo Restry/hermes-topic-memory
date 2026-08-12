@@ -205,6 +205,25 @@ def test_catalog_public_dict_has_no_bodies_or_absolute_private_paths(
     assert all("source_relative_path" not in topic for topic in public["topics"])
 
 
+def test_catalog_counts_active_topics_and_reports_archived_status(
+    catalog_data: Path,
+) -> None:
+    registry_path = catalog_data / "topic-registry.json"
+    value = json.loads(registry_path.read_text(encoding="utf-8"))
+    value["topics"][1]["state"] = "archived"
+    registry_path.write_text(json.dumps(value), encoding="utf-8")
+    FileTopicStore(catalog_data).set_topic_state(
+        "beta", "archived", expected_state="active"
+    )
+
+    snapshot = TopicCatalog(catalog_data).snapshot(now=_FIXED_NOW)
+
+    assert snapshot.active_topic_count == 2
+    assert snapshot.topic("alpha").status == "active"
+    assert snapshot.topic("beta").status == "archived"
+
+
+
 def _append_query(
     history: QueryHistoryStore,
     *,

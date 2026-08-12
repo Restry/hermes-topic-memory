@@ -193,3 +193,41 @@ def test_one_conflicting_name_remains_registry_ambiguity_not_multi_topic() -> No
         topics.mentioned_topics("what does Shared say?")
     with pytest.raises(AmbiguousRegistryError, match="ambiguous"):
         topics.mentioned_topic("what does Shared say?")
+
+
+def test_archived_topics_are_explicit_only_and_trashed_topics_never_route() -> None:
+    topics = TopicRegistry.from_dict(
+        {
+            "topics": [
+                {
+                    "topic_id": "active",
+                    "display_name": "Active",
+                    "aliases": [],
+                    "chat_ids": [],
+                    "state": "active",
+                },
+                {
+                    "topic_id": "archive",
+                    "display_name": "Archive",
+                    "aliases": ["old"],
+                    "chat_ids": ["archived-chat"],
+                    "state": "archived",
+                },
+                {
+                    "topic_id": "trash",
+                    "display_name": "Trash",
+                    "aliases": [],
+                    "chat_ids": [],
+                    "state": "trashed",
+                },
+            ],
+            "default_topic": "archive",
+        }
+    )
+
+    assert topics.route(explicit_topic="old").topic_id == "archive"
+    assert topics.mentioned_topics("Archive and Active") == ("active",)
+    with pytest.raises(TopicRoutingError, match="unknown explicit topic"):
+        topics.route(explicit_topic="trash")
+    with pytest.raises(TopicRoutingError, match="no topic context"):
+        topics.route(chat_id="archived-chat")

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .models import TopicState
+
 _TOPIC_REFERENCE_MARKERS = (
     " topic",
     "topic ",
@@ -41,6 +43,7 @@ class TopicConfig:
     aliases: tuple[str, ...]
     chat_ids: tuple[str, ...]
     source_relative_path: str | None = None
+    state: TopicState = "active"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,50 +66,23 @@ class TopicRegistry:
         *,
         default_topic: str | None = None,
     ) -> None:
-        if not topics:
-            raise ValueError("registry must contain at least one topic")
         self._topics = {topic.topic_id: topic for topic in topics}
         if len(self._topics) != len(topics):
             raise AmbiguousRegistryError("duplicate topic id")
+        if any(
+            topic.state not in ("active", "archived", "trashed") for topic in topics
+        ):
+            raise ValueError("registry contains an invalid topic state")
 
-        self._names: dict[str, str] = {}
-        for topic in topics:
-            self._bind(self._names, _normalize_name(topic.topic_id), topic.topic_id, "name")
-        display_topics: dict[str, set[str]] = {}
-        for topic in topics:
-            display_name = _normalize_name(topic.display_name)
-            if not display_name:
-                raise ValueError(f"empty display name for topic: {topic.topic_id}")
-            display_topics.setdefault(display_name, set()).add(topic.topic_id)
-        self._ambiguous_names: dict[str, tuple[str, ...]] = {}
-        for display_name, topic_ids in display_topics.items():
-            existing = self._names.get(display_name)
-            if existing is not None and topic_ids != {existing}:
-                other = next(
-                    topic_id for topic_id in sorted(topic_ids) if topic_id != existing
-                )
-                raise AmbiguousRegistryError(
-                    f"ambiguous display name {display_name!r}: {existing!r} and {other!r}"
-                )
-            if existing is not None:
-                continue
-            if len(topic_ids) == 1:
-                self._names[display_name] = next(iter(topic_ids))
-            else:
-                self._ambiguous_names[display_name] = tuple(sorted(topic_ids))
-        for topic in topics:
-            for alias in topic.aliases:
-                normalized = _normalize_name(alias)
-                if not normalized:
-                    raise ValueError(f"empty alias for topic: {topic.topic_id}")
-                if normalized in self._ambiguous_names:
-                    raise AmbiguousRegistryError(
-                        f"ambiguous alias {normalized!r}: conflicts with duplicate display name"
-                    )
-                self._bind(self._names, normalized, topic.topic_id, "alias")
+        visible_topics = tuple(topic for topic in topics if topic.state != "trashed")
+        self._names, self._ambiguous_names = _build_name_indexes(visible_topics)
+        active_topics = tuple(topic for topic in topics if topic.state == "active")
+        self._implicit_names, self._implicit_ambiguous_names = _build_name_indexes(
+            active_topics
+        )
 
         self._chat_ids: dict[str, str] = {}
-        for topic in topics:
+        for topic in active_topics:
             for chat_id in topic.chat_ids:
                 normalized = _normalize_chat_id(chat_id)
                 if not normalized:
@@ -138,6 +114,7 @@ class TopicRegistry:
                     aliases=_string_tuple(raw.get("aliases", ()), "aliases"),
                     chat_ids=_string_tuple(raw.get("chat_ids", ()), "chat_ids"),
                     source_relative_path=_optional_text(raw.get("source_relative_path")),
+                    state=_topic_state(raw.get("state", "active")),
                 )
             )
         default = value.get("default_topic")
@@ -173,12 +150,12 @@ class TopicRegistry:
         normalized_query = _normalize_name(query)
         candidates = [
             _NameMatch(start, end, name, (topic_id,))
-            for name, topic_id in self._names.items()
+            for name, topic_id in self._implicit_names.items()
             for start, end in _query_name_spans(normalized_query, name)
         ]
         candidates.extend(
             _NameMatch(start, end, name, topic_ids)
-            for name, topic_ids in self._ambiguous_names.items()
+            for name, topic_ids in self._implicit_ambiguous_names.items()
             for start, end in _query_name_spans(normalized_query, name)
         )
         candidates.sort(
@@ -240,12 +217,15 @@ class TopicRegistry:
             if topic_id is not None:
                 return RouteDecision(topic_id, "chat_id")
         if default_topic is not None:
-            return RouteDecision(
-                self.resolve_name(default_topic, context="default topic"), "default"
-            )
-        if self._default_topic is not None:
+            topic_id = self.resolve_name(default_topic, context="default topic")
+            if self._topics[topic_id].state == "active":
+                return RouteDecision(topic_id, "default")
+        if (
+            self._default_topic is not None
+            and self._topics[self._default_topic].state == "active"
+        ):
             return RouteDecision(self._default_topic, "default")
-        if "global" in self._topics:
+        if "global" in self._topics and self._topics["global"].state == "active":
             return RouteDecision("global", "global")
         raise TopicRoutingError("no topic context and no global fallback")
 
@@ -258,6 +238,45 @@ class TopicRegistry:
             )
         mapping[key] = topic_id
 
+
+
+def _build_name_indexes(
+    topics: tuple[TopicConfig, ...],
+) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:
+    names: dict[str, str] = {}
+    for topic in topics:
+        TopicRegistry._bind(names, _normalize_name(topic.topic_id), topic.topic_id, "name")
+    display_topics: dict[str, set[str]] = {}
+    for topic in topics:
+        display_name = _normalize_name(topic.display_name)
+        if not display_name:
+            raise ValueError(f"empty display name for topic: {topic.topic_id}")
+        display_topics.setdefault(display_name, set()).add(topic.topic_id)
+    ambiguous: dict[str, tuple[str, ...]] = {}
+    for display_name, topic_ids in display_topics.items():
+        existing = names.get(display_name)
+        if existing is not None and topic_ids != {existing}:
+            other = next(topic_id for topic_id in sorted(topic_ids) if topic_id != existing)
+            raise AmbiguousRegistryError(
+                f"ambiguous display name {display_name!r}: {existing!r} and {other!r}"
+            )
+        if existing is not None:
+            continue
+        if len(topic_ids) == 1:
+            names[display_name] = next(iter(topic_ids))
+        else:
+            ambiguous[display_name] = tuple(sorted(topic_ids))
+    for topic in topics:
+        for alias in topic.aliases:
+            normalized = _normalize_name(alias)
+            if not normalized:
+                raise ValueError(f"empty alias for topic: {topic.topic_id}")
+            if normalized in ambiguous:
+                raise AmbiguousRegistryError(
+                    f"ambiguous alias {normalized!r}: conflicts with duplicate display name"
+                )
+            TopicRegistry._bind(names, normalized, topic.topic_id, "alias")
+    return names, ambiguous
 
 def _normalize_name(value: str) -> str:
     return value.strip().casefold()
@@ -304,4 +323,10 @@ def _optional_text(value: Any) -> str | None:
         return None
     if not isinstance(value, str):
         raise ValueError("source_relative_path must be a string")
+    return value
+
+
+def _topic_state(value: Any) -> TopicState:
+    if value not in ("active", "archived", "trashed"):
+        raise ValueError(f"invalid topic state: {value!r}")
     return value
