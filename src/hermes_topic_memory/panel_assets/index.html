@@ -11,17 +11,13 @@
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要内容</a>
-
   <header class="product-header">
     <div>
       <p class="eyebrow">HERMES / TOPIC MEMORY</p>
       <h1>主题记忆控制台</h1>
       <p class="product-summary">理解记忆资产，检查召回决策，维护规范主题事实。</p>
     </div>
-    <div class="privacy-mark" aria-label="私有控制台">
-      <span class="status-dot status-dot--ok" aria-hidden="true"></span>
-      PRIVATE / AUTHENTICATED
-    </div>
+    <div class="privacy-mark" aria-label="私有控制台"><span class="status-dot status-dot--ok" aria-hidden="true"></span>PRIVATE / AUTHENTICATED</div>
   </header>
 
   <nav id="primary-navigation" class="primary-navigation" aria-label="主导航">
@@ -34,7 +30,7 @@
   <main id="main-content">
     <section id="session-gate" class="session-gate" aria-labelledby="session-title">
       <div class="gate-copy">
-        <p class="section-index">SESSION / 01</p>
+        <p class="section-index">// SESSION</p>
         <h2 id="session-title">连接私有数据</h2>
         <p>所有 API 都需要访问令牌。令牌只保存在当前浏览器会话中；关闭标签页后失效，界面不会显示或记录令牌。</p>
       </div>
@@ -52,46 +48,16 @@
     <div id="panel-shell" hidden>
       <section id="home-view" class="view-panel" data-panel="home" aria-labelledby="home-title">
         <div class="view-heading">
-          <div>
-            <p class="section-index">ESTATE / OVERVIEW</p>
-            <h2 id="home-title">记忆资产总览</h2>
-            <p id="snapshot-status" class="snapshot-status">已鉴权快照</p>
-          </div>
-          <div class="view-actions">
-            <button id="refresh-overview" class="button button--quiet" type="button">刷新快照</button>
-            <button id="clear-session" class="button button--quiet" type="button">清除会话</button>
-          </div>
+          <div><p class="section-index">// ESTATE OVERVIEW</p><h2 id="home-title">记忆资产总览</h2><p id="snapshot-status" class="snapshot-status">已鉴权快照</p></div>
+          <div class="view-actions"><button id="refresh-overview" class="button button--quiet" type="button">刷新快照</button><button id="clear-session" class="button button--quiet" type="button">清除会话</button></div>
         </div>
-
-        <div id="loading-state" class="state-panel" role="status" aria-live="polite">
-          <span class="state-kicker">LOADING / API SNAPSHOT</span>
-          <p>正在读取唯一的概览快照…</p>
-          <div class="skeleton-lines" aria-hidden="true"><span></span><span></span><span></span></div>
-        </div>
-
-        <div id="error-state" class="state-panel state-panel--error" role="alert" hidden>
-          <span class="state-kicker">ERROR / OVERVIEW</span>
-          <h3>无法读取记忆资产</h3>
-          <p id="error-message">请检查服务状态和会话权限，然后重试。</p>
-          <div class="state-actions">
-            <button id="retry-overview" class="button button--primary" type="button">重试概览</button>
-            <button id="reset-session" class="button button--quiet" type="button">重新输入令牌</button>
-          </div>
-        </div>
-
-        <div id="empty-state" class="state-panel" hidden>
-          <span class="state-kicker">EMPTY / FIRST TOPIC</span>
-          <h3>尚无可管理的主题</h3>
-          <p>先通过 CLI 创建规范主题；写入后重新载入，此处会显示版本、问题历史与有效缓存。</p>
-          <button id="refresh-empty" class="button button--quiet" type="button">重新载入</button>
-        </div>
+        <div id="loading-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">LOADING / API SNAPSHOT</span><p>正在读取唯一的概览快照…</p><div class="skeleton-lines" aria-hidden="true"><span></span><span></span><span></span></div></div>
+        <div id="error-state" class="state-panel state-panel--error" role="alert" hidden><span class="state-kicker">ERROR / OVERVIEW</span><h3>无法读取记忆资产</h3><p id="error-message">请检查服务状态和会话权限，然后重试。</p><div class="state-actions"><button id="retry-overview" class="button button--primary" type="button">重试概览</button><button id="reset-session" class="button button--quiet" type="button">重新输入令牌</button></div></div>
+        <div id="empty-state" class="state-panel" hidden><span class="state-kicker">EMPTY / FIRST TOPIC</span><h3>尚无可管理的主题</h3><p>先通过 CLI 创建规范主题；写入后重新载入，此处会显示版本、问题历史与有效缓存。</p><button id="refresh-empty" class="button button--quiet" type="button">重新载入</button></div>
 
         <div id="dashboard-data" hidden>
           <section aria-labelledby="kpi-title">
-            <div class="section-heading">
-              <div><p class="section-index">01 / SIGNALS</p><h3 id="kpi-title">关键指标</h3></div>
-              <p id="secondary-counts" class="section-meta"></p>
-            </div>
+            <div class="section-heading"><div><p class="section-index">// SIGNALS</p><h3 id="kpi-title">关键指标</h3></div><p id="secondary-counts" class="section-meta"></p></div>
             <div id="kpi-strip" class="kpi-strip">
               <article class="kpi"><span>活跃主题</span><strong id="kpi-active">—</strong><small>当前可召回</small></article>
               <article class="kpi"><span>历史提问</span><strong id="kpi-total">—</strong><small>独立于 QA 缓存</small></article>
@@ -99,121 +65,98 @@
               <article class="kpi"><span>最近 30 天</span><strong id="kpi-30d">—</strong><small>北京时间</small></article>
             </div>
           </section>
-
           <div class="analytics-layout">
             <section class="data-panel activity-panel" aria-labelledby="activity-title">
-              <div class="section-heading">
-                <div><p class="section-index">02 / ACTIVITY</p><h3 id="activity-title">30 天提问活动</h3></div>
-                <p id="activity-summary" class="section-meta"></p>
-              </div>
-              <svg id="activity-chart" class="chart" viewBox="0 0 720 260" role="img" aria-labelledby="activity-chart-title activity-chart-desc">
-                <title id="activity-chart-title">最近 30 天每日提问数量</title>
-                <desc id="activity-chart-desc">加载后提供活动趋势摘要；详细数值见下方数据表。</desc>
-              </svg>
-              <details class="data-fallback">
-                <summary>查看每日数据表</summary>
-                <div class="table-scroll">
-                  <table id="activity-table">
-                    <caption>最近 30 天每日提问数量，按北京时间统计</caption>
-                    <thead><tr><th scope="col">日期</th><th scope="col">提问数</th></tr></thead>
-                    <tbody id="activity-table-body"></tbody>
-                  </table>
-                </div>
-              </details>
+              <div class="section-heading"><div><p class="section-index">// ACTIVITY</p><h3 id="activity-title">30 天提问活动</h3></div><p id="activity-summary" class="section-meta"></p></div>
+              <svg id="activity-chart" class="chart" viewBox="0 0 720 260" role="img" aria-labelledby="activity-chart-title activity-chart-desc"><title id="activity-chart-title">最近 30 天每日提问数量</title><desc id="activity-chart-desc">加载后提供活动趋势摘要；详细数值见下方数据表。</desc></svg>
+              <details class="data-fallback"><summary>查看每日数据表</summary><div class="table-scroll"><table id="activity-table"><caption>最近 30 天每日提问数量，按北京时间统计</caption><thead><tr><th scope="col">日期</th><th scope="col">提问数</th></tr></thead><tbody id="activity-table-body"></tbody></table></div></details>
             </section>
-
             <section class="data-panel distribution-panel" aria-labelledby="distribution-title">
-              <div class="section-heading">
-                <div><p class="section-index">03 / DISTRIBUTION</p><h3 id="distribution-title">主题提问分布</h3></div>
-                <p id="distribution-summary" class="section-meta"></p>
-              </div>
-              <svg id="topic-distribution" class="chart chart--distribution" viewBox="0 0 560 320" role="img" aria-labelledby="distribution-chart-title distribution-chart-desc">
-                <title id="distribution-chart-title">按历史提问数量排序的主题分布</title>
-                <desc id="distribution-chart-desc">加载后展示提问最多的主题；详细数值见下方数据表。</desc>
-              </svg>
-              <details class="data-fallback">
-                <summary>查看主题分布表</summary>
-                <div class="table-scroll">
-                  <table id="distribution-table">
-                    <caption>各主题历史提问数量</caption>
-                    <thead><tr><th scope="col">主题</th><th scope="col">提问数</th></tr></thead>
-                    <tbody id="distribution-table-body"></tbody>
-                  </table>
-                </div>
-              </details>
+              <div class="section-heading"><div><p class="section-index">// DISTRIBUTION</p><h3 id="distribution-title">主题提问分布</h3></div><p id="distribution-summary" class="section-meta"></p></div>
+              <svg id="topic-distribution" class="chart chart--distribution" viewBox="0 0 560 320" role="img" aria-labelledby="distribution-chart-title distribution-chart-desc"><title id="distribution-chart-title">按历史提问数量排序的主题分布</title><desc id="distribution-chart-desc">加载后展示提问最多的主题；详细数值见下方数据表。</desc></svg>
+              <details class="data-fallback"><summary>查看主题分布表</summary><div class="table-scroll"><table id="distribution-table"><caption>各主题历史提问数量</caption><thead><tr><th scope="col">主题</th><th scope="col">提问数</th></tr></thead><tbody id="distribution-table-body"></tbody></table></div></details>
             </section>
           </div>
-
           <section id="recent-activity" class="data-panel" aria-labelledby="recent-title">
-            <div class="section-heading">
-              <div><p class="section-index">04 / RECENT</p><h3 id="recent-title">最近活动</h3></div>
-              <p class="section-meta">仅显示鉴权后的提问摘要</p>
-            </div>
-            <ol id="recent-list" class="activity-list"></ol>
-            <p id="recent-empty" class="inline-empty" hidden>还没有提问历史。通过 Hermes、Panel 或 CLI 完成召回后，活动会出现在这里。</p>
+            <div class="section-heading"><div><p class="section-index">// RECENT</p><h3 id="recent-title">最近活动</h3></div><p class="section-meta">仅显示鉴权后的提问摘要</p></div>
+            <ol id="recent-list" class="activity-list"></ol><p id="recent-empty" class="inline-empty" hidden>还没有提问历史。通过 Hermes、Panel 或 CLI 完成召回后，活动会出现在这里。</p>
           </section>
-
           <section id="topic-catalog" class="data-panel catalog-panel" aria-labelledby="catalog-title">
-            <div class="section-heading catalog-heading">
-              <div><p class="section-index">05 / CATALOG</p><h3 id="catalog-title">主题目录</h3></div>
-              <p id="catalog-count" class="section-meta" aria-live="polite"></p>
-            </div>
+            <div class="section-heading catalog-heading"><div><p class="section-index">// CATALOG</p><h3 id="catalog-title">主题目录</h3></div><p id="catalog-count" class="section-meta" aria-live="polite"></p></div>
             <div class="catalog-controls">
-              <div class="control control--search">
-                <label for="topic-search">搜索主题</label>
-                <input id="topic-search" type="search" autocomplete="off" placeholder="名称、ID 或别名">
-              </div>
-              <div class="control">
-                <label for="topic-status-filter">状态</label>
-                <select id="topic-status-filter">
-                  <option value="all">全部</option>
-                  <option value="active">活跃</option>
-                  <option value="archived">已归档</option>
-                </select>
-              </div>
-              <div class="control">
-                <label for="topic-sort">排序</label>
-                <select id="topic-sort">
-                  <option value="question-desc">提问数：高到低</option>
-                  <option value="updated-desc">更新时间：新到旧</option>
-                  <option value="version-desc">版本：高到低</option>
-                  <option value="title-asc">名称：A 到 Z</option>
-                </select>
-              </div>
+              <div class="control control--search"><label for="topic-search">搜索主题</label><input id="topic-search" type="search" autocomplete="off" placeholder="名称、ID 或别名"></div>
+              <div class="control"><label for="topic-status-filter">状态</label><select id="topic-status-filter"><option value="all">全部</option><option value="active">活跃</option><option value="archived">已归档</option></select></div>
+              <div class="control"><label for="topic-sort">排序</label><select id="topic-sort"><option value="question-desc">提问数：高到低</option><option value="updated-desc">更新时间：新到旧</option><option value="version-desc">版本：高到低</option><option value="title-asc">名称：A 到 Z</option></select></div>
             </div>
-            <div class="table-scroll catalog-table-wrap">
-              <table class="catalog-table">
-                <caption class="visually-hidden">主题目录；可按名称、ID、别名和状态筛选</caption>
-                <thead>
-                  <tr>
-                    <th scope="col" data-field="display_name">主题</th>
-                    <th scope="col" data-field="question_count">提问</th>
-                    <th scope="col" data-field="active_cache_count">缓存</th>
-                    <th scope="col" data-field="version">版本</th>
-                    <th scope="col" data-field="updated_at">更新时间</th>
-                    <th scope="col" data-field="status">状态</th>
-                  </tr>
-                </thead>
-                <tbody id="topic-table-body"></tbody>
-              </table>
-            </div>
+            <div class="table-scroll catalog-table-wrap"><table class="catalog-table"><caption class="visually-hidden">主题目录；可按名称、ID、别名和状态筛选</caption><thead><tr><th scope="col" data-field="display_name">主题</th><th scope="col" data-field="question_count">提问</th><th scope="col" data-field="active_cache_count">缓存</th><th scope="col" data-field="version">版本</th><th scope="col" data-field="updated_at">更新时间</th><th scope="col" data-field="status">状态</th></tr></thead><tbody id="topic-table-body"></tbody></table></div>
             <p id="catalog-empty" class="inline-empty" hidden>没有匹配的主题。清除搜索或切换状态筛选。</p>
           </section>
         </div>
       </section>
 
-      <section class="view-panel teaching-panel" data-panel="recall" aria-labelledby="recall-title" hidden>
-        <p class="section-index">NEXT / RECALL LAB</p><h2 id="recall-title">多主题召回</h2><p>召回实验室将在后续界面任务中开放。本页不会伪造 Agent 选择或执行结果。</p>
+      <section id="topic-detail-view" class="view-panel" data-panel="detail" aria-labelledby="topic-detail-title" hidden>
+        <div class="view-heading">
+          <div><p class="section-index">// TOPIC DETAIL</p><h2 id="topic-detail-title" tabindex="-1">主题详情</h2><p id="topic-detail-subtitle" class="snapshot-status"></p></div>
+          <button id="close-topic-detail" class="button button--quiet" type="button">返回主题目录</button>
+        </div>
+        <div id="topic-detail-loading" class="state-panel" role="status" hidden><span class="state-kicker">LOADING / TOPIC</span><p>正在读取主题元数据…</p></div>
+        <div id="topic-detail-error" class="state-panel state-panel--error" role="alert" hidden><span class="state-kicker">ERROR / TOPIC</span><h3>无法读取主题</h3><p id="topic-detail-error-message"></p><button id="retry-topic-detail" class="button" type="button">重试主题详情</button></div>
+        <div id="topic-detail-content" hidden>
+          <div id="topic-detail-tabs" class="detail-tabs" role="tablist" aria-label="主题详情分区">
+            <button class="detail-tab is-active" type="button" role="tab" data-detail-tab="overview" aria-controls="topic-overview-panel" aria-selected="true">概览</button>
+            <button class="detail-tab" type="button" role="tab" data-detail-tab="questions" aria-controls="topic-questions-panel" aria-selected="false">提问记录</button>
+            <button class="detail-tab" type="button" role="tab" data-detail-tab="ask" aria-controls="topic-ask-panel" aria-selected="false">继续提问</button>
+            <button class="detail-tab" type="button" role="tab" data-detail-tab="body" aria-controls="topic-body-panel" aria-selected="false">记忆正文</button>
+            <button class="detail-tab" type="button" role="tab" data-detail-tab="versions" aria-controls="topic-versions-panel" aria-selected="false">版本</button>
+            <button class="detail-tab" type="button" role="tab" data-detail-tab="settings" aria-controls="topic-settings-panel" aria-selected="false">设置</button>
+          </div>
+          <section id="topic-overview-panel" class="detail-panel" role="tabpanel" data-detail-panel="overview"><div id="topic-overview-grid" class="metadata-grid"></div><section class="subsection"><div class="section-heading"><div><p class="section-index">// RECENT ACTIVITY</p><h3>近期参与记录</h3></div></div><div id="topic-overview-activity"></div></section></section>
+          <section id="topic-questions-panel" class="detail-panel" role="tabpanel" data-detail-panel="questions" hidden><div class="section-heading"><div><p class="section-index">// QUESTIONS</p><h3>涉及此主题的提问</h3></div><p id="topic-question-count" class="section-meta"></p></div><div id="topic-question-state" class="state-panel compact-state" role="status"></div><div id="topic-question-list" class="query-list"></div><div id="topic-question-pagination" class="pagination"></div></section>
+          <section id="topic-ask-panel" class="detail-panel" role="tabpanel" data-detail-panel="ask" hidden><p class="section-index">// CONTINUE ASKING</p><h3>从当前主题继续</h3><div id="topic-ask-context" class="topic-context"></div><p class="field-help">当前主题仅作为建议起点。提交原问题后，Agent 仍会独立规划，可添加其他必需主题，也可能依据问题判断不选当前主题。</p><form id="topic-ask-form" class="question-form"><label for="topic-ask-question">问题</label><textarea id="topic-ask-question" rows="4" required placeholder="输入需要跨主题推理的问题"></textarea><button id="topic-ask-submit" class="button button--primary" type="submit">交给 Agent 规划</button></form></section>
+          <section id="topic-body-panel" class="detail-panel" role="tabpanel" data-detail-panel="body" hidden><div class="section-heading"><div><p class="section-index">// CANONICAL BODY</p><h3>规范正文</h3></div><button id="load-topic-body" class="button" type="button">读取当前正文</button></div><p class="field-help">正文仅在此处明确操作后读取；不会随目录或详情预取。</p><div id="topic-body-state" class="state-panel compact-state">尚未读取正文。</div><pre id="topic-body-content" class="body-viewer" tabindex="0" hidden></pre><div class="future-actions"><button class="button" type="button" disabled title="Task 11 开放">追加（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">编辑（Task 11）</button></div></section>
+          <section id="topic-versions-panel" class="detail-panel" role="tabpanel" data-detail-panel="versions" hidden><div class="section-heading"><div><p class="section-index">// VERSIONS</p><h3>版本时间线</h3></div><p id="topic-version-count" class="section-meta"></p></div><div id="topic-version-state" class="state-panel compact-state" role="status"></div><div id="topic-version-list" class="version-list"></div><div id="topic-version-pagination" class="pagination"></div><section class="version-inspector"><h3>版本正文</h3><pre id="topic-version-body" class="body-viewer" tabindex="0">选择“查看正文”后才会读取该版本。</pre></section><section class="version-inspector"><h3>版本比较</h3><div class="compare-controls"><div class="control"><label for="compare-version-a">版本 A</label><select id="compare-version-a"></select></div><div class="control"><label for="compare-version-b">版本 B</label><select id="compare-version-b"></select></div><button id="compare-versions" class="button" type="button">读取并比较</button></div><div id="topic-version-compare" class="compare-grid"></div></section><button class="button" type="button" disabled title="Task 11 开放">回滚（Task 11）</button></section>
+          <section id="topic-settings-panel" class="detail-panel" role="tabpanel" data-detail-panel="settings" hidden><p class="section-index">// SETTINGS</p><h3>主题元数据与维护</h3><div id="topic-settings-metadata" class="metadata-grid"></div><div class="future-actions"><button class="button" type="button" disabled title="Task 11 开放">编辑名称与别名（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">归档（Task 11）</button><button class="button" type="button" disabled title="Task 11 开放">移入回收站（Task 11）</button></div><p class="field-help">本任务只提供真实只读状态；维护操作尚未开放，不会显示虚假成功。</p></section>
+        </div>
       </section>
-      <section class="view-panel teaching-panel" data-panel="recent" aria-labelledby="questions-title" hidden>
-        <p class="section-index">NEXT / QUERY HISTORY</p><h2 id="questions-title">最近提问</h2><p>全局筛选和分页将在后续界面任务中开放；首页只提供真实概览摘要。</p>
+
+      <section id="recall-view" class="view-panel" data-panel="recall" aria-labelledby="recall-title" hidden>
+        <div class="view-heading"><div><p class="section-index">// RECALL LAB</p><h2 id="recall-title" tabindex="-1">多主题召回</h2><p class="snapshot-status">Agent 规划、逐主题证据与归因综合</p></div></div>
+        <form id="recall-form" class="recall-form">
+          <div class="control"><label for="recall-question">问题</label><textarea id="recall-question" rows="5" required placeholder="询问一个需要主题记忆回答的问题"></textarea></div>
+          <div id="recall-examples" class="example-strip" aria-label="示例问题"><span>试一个真实路径：</span><button class="text-button" type="button" data-example="比较两个相关主题最近记录的事实。">比较相关主题</button><button class="text-button" type="button" data-example="这个主题最近一次更新说明了什么？">检查近期更新</button><button class="text-button" type="button" data-example="哪些主题共同支持这个结论？">检查来源归因</button></div>
+          <div class="manual-panel"><label class="check-label" for="manual-override"><input id="manual-override" type="checkbox">手动主题覆盖 <strong>仅测试</strong></label><p class="field-help">开启后绕过 Agent 规划。仅可选择 1–8 个不重复主题，用于验证固定范围。</p><div id="manual-controls" hidden><label for="manual-topic-select">测试主题（按住 Command/Ctrl 多选）</label><select id="manual-topic-select" multiple size="6" aria-describedby="manual-topic-help"></select><p id="manual-topic-help" class="field-help">必须选择 1–8 个主题。</p></div></div>
+          <div class="form-actions"><button id="recall-submit" class="button button--primary" type="submit">运行召回</button></div>
+        </form>
+        <div id="recall-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">READY / REAL QUERY</span><h3>等待问题</h3><p>提交后将显示 Agent 的实际选择理由、逐主题结果和最终综合；这里不会生成示例结果。</p></div>
+        <section id="recall-output" hidden>
+          <div class="run-identity"><div><span>当前 Query ID</span><code id="recall-query-id">—</code></div><div><span>上次 Query ID</span><code id="recall-previous-query-id">—</code></div><button id="rerun-recall" class="button" type="button">按当前版本重跑</button></div>
+          <section class="subsection"><div class="section-heading"><div><p class="section-index">// AGENT PLAN</p><h3>所选主题与理由</h3></div><p id="recall-plan-mode" class="section-meta"></p></div><div id="recall-plan" class="chip-list"></div></section>
+          <section class="subsection"><div class="section-heading"><div><p class="section-index">// TOPIC RESULTS</p><h3>逐主题执行</h3></div></div><div id="recall-topic-results" class="result-grid"></div></section>
+          <section id="recall-final" class="synthesis-panel"><p class="section-index">// ATTRIBUTED SYNTHESIS</p><h3>最终综合</h3><p id="recall-final-source" class="section-meta"></p><div id="recall-final-answer" class="answer-text"></div></section>
+          <section class="latency-panel"><h3>真实延迟</h3><dl id="recall-latency" class="latency-grid"></dl></section>
+        </section>
       </section>
-      <section class="view-panel teaching-panel" data-panel="recycle" aria-labelledby="recycle-title" hidden>
-        <p class="section-index">NEXT / RECYCLE BIN</p><h2 id="recycle-title">回收站</h2><p>恢复与永久删除操作将在安全写入任务中开放，此处不会提供无保护的破坏性操作。</p>
+
+      <section id="recent-view" class="view-panel" data-panel="recent" aria-labelledby="questions-title" hidden>
+        <div class="view-heading"><div><p class="section-index">// QUERY HISTORY</p><h2 id="questions-title" tabindex="-1">最近提问</h2><p class="snapshot-status">全局、分页、只读历史</p></div></div>
+        <form id="recent-filters" class="filter-grid">
+          <div class="control"><label for="recent-topic-filter">主题</label><select id="recent-topic-filter"><option value="">全部主题</option></select></div>
+          <div class="control"><label for="recent-scope-filter">范围</label><select id="recent-scope-filter"><option value="">单主题与多主题</option><option value="single">单主题</option><option value="multi">多主题</option></select></div>
+          <div class="control"><label for="recent-cache-filter">缓存</label><select id="recent-cache-filter"><option value="">命中与未命中</option><option value="hit">命中</option><option value="miss">未命中</option></select></div>
+          <div class="control"><label for="recent-status-filter">状态</label><select id="recent-status-filter"><option value="">全部状态</option><option value="answered">已回答</option><option value="no_fact">无事实</option><option value="error">错误</option></select></div>
+          <div class="control"><label for="recent-source-filter">来源</label><select id="recent-source-filter"><option value="">全部来源</option><option value="hermes">Hermes</option><option value="panel">Panel</option><option value="cli">CLI</option></select></div>
+          <div class="control"><label for="recent-date-from">起始日期</label><input id="recent-date-from" type="date"></div>
+          <div class="control"><label for="recent-date-to">结束日期</label><input id="recent-date-to" type="date"></div>
+          <div class="filter-actions"><button id="apply-recent-filters" class="button button--primary" type="submit">应用筛选</button><button id="reset-recent-filters" class="button button--quiet" type="button">清除</button></div>
+        </form>
+        <div id="recent-question-state" class="state-panel" role="status" aria-live="polite"><span class="state-kicker">LOADING / HISTORY</span><p>打开本页后读取历史。</p></div>
+        <div id="recent-question-list" class="query-list"></div>
+        <div id="recent-pagination" class="pagination"></div>
       </section>
+
+      <section class="view-panel teaching-panel" data-panel="recycle" aria-labelledby="recycle-title" hidden><p class="section-index">// RECYCLE BIN</p><h2 id="recycle-title">回收站</h2><p>恢复与永久删除属于后续安全写入任务；此处不提供无保护的破坏性操作。</p></section>
     </div>
   </main>
-
   <footer class="product-footer"><span>HERMES TOPIC MEMORY</span><span>PRIVATE METADATA / SESSION AUTH</span></footer>
 </body>
 </html>

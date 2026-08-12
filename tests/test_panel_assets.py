@@ -169,7 +169,7 @@ def test_styles_define_approved_tokens_states_motion_and_mobile_layout() -> None
 def test_app_uses_one_authenticated_overview_snapshot_and_safe_dom_updates() -> None:
     script = _asset_text("app.js")
 
-    assert script.count('fetch("/api/overview"') == 1
+    assert script.count("fetch(path, request)") == 1
     assert "Authorization" in script
     assert "sessionStorage" in script
     assert "localStorage" not in script
@@ -179,6 +179,112 @@ def test_app_uses_one_authenticated_overview_snapshot_and_safe_dom_updates() -> 
     assert "catch" in script
     assert "finally" in script
     assert "console." not in script
+
+
+def test_task10_dom_exposes_integrated_detail_recall_and_history_views() -> None:
+    html = _asset_text("index.html")
+    parser = _ContractParser()
+    parser.feed(html)
+
+    assert {
+        "topic-detail-view",
+        "close-topic-detail",
+        "topic-detail-tabs",
+        "topic-overview-panel",
+        "topic-questions-panel",
+        "topic-ask-panel",
+        "topic-body-panel",
+        "topic-versions-panel",
+        "topic-settings-panel",
+        "load-topic-body",
+        "topic-body-content",
+        "topic-version-list",
+        "topic-version-body",
+        "topic-version-compare",
+        "recall-view",
+        "recall-form",
+        "recall-question",
+        "recall-examples",
+        "manual-override",
+        "manual-topic-select",
+        "recall-plan",
+        "recall-topic-results",
+        "recall-final",
+        "recall-query-id",
+        "recall-previous-query-id",
+        "recent-view",
+        "recent-filters",
+        "recent-topic-filter",
+        "recent-scope-filter",
+        "recent-cache-filter",
+        "recent-status-filter",
+        "recent-source-filter",
+        "recent-date-from",
+        "recent-date-to",
+        "recent-question-list",
+        "recent-pagination",
+    } <= parser.ids
+    assert {
+        "recall-question",
+        "manual-override",
+        "manual-topic-select",
+        "recent-topic-filter",
+        "recent-scope-filter",
+        "recent-cache-filter",
+        "recent-status-filter",
+        "recent-source-filter",
+        "recent-date-from",
+        "recent-date-to",
+    } <= parser.label_targets
+    assert "仅测试" in html
+    assert "Agent" in html
+
+
+def test_task10_script_uses_real_api_paths_lazy_body_and_recoverable_actions() -> None:
+    script = _asset_text("app.js")
+
+    assert script.count("const state = {") == 1
+    assert script.count("async function api(") == 1
+    for contract in (
+        "/api/topics/",
+        "/questions?",
+        "/body",
+        "/versions?",
+        "/api/questions?",
+        "/api/recall/run",
+        "/api/recall/rerun/",
+        "loadTopicBody",
+        "loadVersionBody",
+        "submitRecall",
+        "rerunRecall",
+        "loadRecentQuestions",
+        'event.key === "Escape"',
+        "returnFocus",
+    ):
+        assert contract in script
+    assert "Promise.all" not in script
+    assert "innerHTML" not in script
+    assert "localStorage" not in script
+    assert "console." not in script
+
+
+def test_task10_visual_corrections_remove_numbered_scaffolding_and_side_stripes() -> None:
+    html = _asset_text("index.html")
+    css = _asset_text("styles.css")
+
+    for marker in (
+        "SESSION / 01",
+        "01 / SIGNALS",
+        "02 / ACTIVITY",
+        "03 / DISTRIBUTION",
+        "04 / RECENT",
+        "05 / CATALOG",
+    ):
+        assert marker not in html
+    assert "border-left: 3px" not in css
+    assert ".kpi::before" in css
+    assert "width: 2px" in css
+    assert ".state-panel--error" in css
 
 
 @pytest.mark.parametrize(
