@@ -15,7 +15,12 @@ from typing import Any, Callable, Iterator
 from .evidence import EvidenceLedger
 from .models import TopicMemory, TopicMetadata, TopicState
 from .operations import apply_evidence_update as run_evidence_update
-from .router import TopicRegistry
+from .router import (
+    TopicConfig,
+    TopicRegistry,
+    normalize_repo_url,
+    normalize_workspace_path,
+)
 from .store import ConcurrentTopicUpdateError, FileTopicStore, TopicNotFoundError
 from .updater import UpdateResult
 
@@ -73,16 +78,15 @@ class TopicAdminService:
         body: str,
         *,
         chat_ids: tuple[str, ...] = (),
+        repo_urls: tuple[str, ...] = (),
+        workspace_paths: tuple[str, ...] = (),
         make_default: bool = False,
     ) -> TopicMemory:
         self._validate_topic_id(topic_id)
         self._validate_topic_names(display_name, aliases)
         if not isinstance(body, str) or not body:
             raise ValueError("topic body must be non-empty text")
-        if not isinstance(chat_ids, tuple) or not all(
-            isinstance(chat_id, str) and chat_id.strip() for chat_id in chat_ids
-        ):
-            raise ValueError("chat ids must be non-empty strings")
+        contexts = self._normalize_contexts(chat_ids, repo_urls, workspace_paths)
 
         with self._locked():
             registry = self._load_registry()
@@ -91,7 +95,7 @@ class TopicAdminService:
                 "topic_id": topic_id,
                 "display_name": display_name,
                 "aliases": list(aliases),
-                "chat_ids": list(chat_ids),
+                **{key: list(values) for key, values in contexts.items()},
                 "state": "active",
             }
             candidate = self._copy_json(registry)
@@ -118,6 +122,95 @@ class TopicAdminService:
                     "create", topic_id, created.metadata.version, "active"
                 )
             return created
+
+    def update_topic(
+        self,
+        topic_id: str,
+        *,
+        chat_ids: tuple[str, ...] | None = None,
+        repo_urls: tuple[str, ...] | None = None,
+        workspace_paths: tuple[str, ...] | None = None,
+    ) -> TopicConfig:
+        """Replace supplied context bindings while preserving all other fields."""
+        self._validate_topic_id(topic_id)
+        contexts = self._normalize_contexts(chat_ids, repo_urls, workspace_paths)
+        with self._locked():
+            return self._update_context_locked(topic_id, contexts, append=False)
+
+    def bind_context(
+        self,
+        topic_id: str,
+        *,
+        chat_id: str | None = None,
+        repo_url: str | None = None,
+        workspace_path: str | None = None,
+    ) -> TopicConfig:
+        """Add context bindings idempotently under the data-root mutation lock."""
+        self._validate_topic_id(topic_id)
+        if chat_id is None and repo_url is None and workspace_path is None:
+            raise ValueError("at least one context binding is required")
+        contexts = self._normalize_contexts(
+            (chat_id,) if chat_id is not None else None,
+            (repo_url,) if repo_url is not None else None,
+            (workspace_path,) if workspace_path is not None else None,
+        )
+        with self._locked():
+            return self._update_context_locked(topic_id, contexts, append=True)
+
+    def _update_context_locked(
+        self, topic_id: str, contexts: dict[str, tuple[str, ...]], *, append: bool
+    ) -> TopicConfig:
+        registry = self._load_registry()
+        item = self._registered_item(registry, topic_id)
+        self._require_state(item, ("active",))
+        current = self.store.get_topic(topic_id)
+        candidate = self._copy_json(registry)
+        updated = self._registered_item(candidate, topic_id)
+        existing = next(
+            config for config in TopicRegistry.from_dict(registry).topics
+            if config.topic_id == topic_id
+        )
+        for field, values in contexts.items():
+            prior = getattr(existing, field) if append else ()
+            updated[field] = list(dict.fromkeys((*prior, *values)))
+        self._validate_registry(candidate)
+        result = next(
+            config for config in TopicRegistry.from_dict(candidate).topics
+            if config.topic_id == topic_id
+        )
+        if candidate == registry:
+            return result
+        with self._transaction((self._registry_path, self._operations_audit_path)):
+            self._write_registry(candidate)
+            self._failpoint("after_registry_write")
+            self._append_operation_audit(
+                "bind_context" if append else "update_context",
+                topic_id,
+                current.metadata.version,
+                current.metadata.state,
+            )
+        return result
+
+    @staticmethod
+    def _normalize_contexts(
+        chat_ids: tuple[str, ...] | None,
+        repo_urls: tuple[str, ...] | None,
+        workspace_paths: tuple[str, ...] | None,
+    ) -> dict[str, tuple[str, ...]]:
+        contexts: dict[str, tuple[str, ...]] = {}
+        for field, values, normalize in (
+            ("chat_ids", chat_ids, str.strip),
+            ("repo_urls", repo_urls, normalize_repo_url),
+            ("workspace_paths", workspace_paths, normalize_workspace_path),
+        ):
+            if values is None:
+                continue
+            if not isinstance(values, tuple) or not all(
+                isinstance(value, str) and value.strip() for value in values
+            ):
+                raise ValueError(f"{field} must be non-empty strings")
+            contexts[field] = tuple(dict.fromkeys(normalize(value) for value in values))
+        return contexts
 
     def archive(
         self,

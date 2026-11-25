@@ -7,7 +7,7 @@ from .store import FileTopicStore
 
 
 def validate_data_root(data_root: str | Path) -> int:
-    """Validate registry entries against canonical topic directories and bodies."""
+    """Validate context bindings, registry entries, and canonical topic bodies."""
     root = Path(data_root)
     registry = TopicRegistry.from_file(root / "topic-registry.json")
     store = FileTopicStore(root)

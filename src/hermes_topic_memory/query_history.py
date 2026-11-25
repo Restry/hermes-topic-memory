@@ -25,7 +25,7 @@ _MAX_SELECTED_TOPICS = 8
 
 QueryStatus = Literal["answered", "no_fact", "error"]
 TopicResultSource = Literal["cache", "reader", "failure"]
-QuerySource = Literal["hermes", "panel", "cli"]
+QuerySource = Literal["hermes", "panel", "cli", "mcp", "rest"]
 
 
 class QueryHistoryError(RuntimeError):
@@ -147,7 +147,7 @@ class QueryRecord:
             )
         object.__setattr__(self, "selection_reasons", MappingProxyType(reasons))
 
-        if self.source not in {"hermes", "panel", "cli"}:
+        if self.source not in {"hermes", "panel", "cli", "mcp", "rest"}:
             raise ValueError(f"invalid query source: {self.source!r}")
         if self.session_ref is not None:
             _validate_bounded_text(

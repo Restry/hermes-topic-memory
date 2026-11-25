@@ -30,9 +30,16 @@ class EvidenceRecord:
     user_text: str
     assistant_text: str
     created_at: str
+    source_agent: str | None = None
+    source_session: str | None = None
+    idempotency_key: str | None = None
+    fact: str | None = None
+    reason: str | None = None
+    topic_version: int | None = None
+    topic_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "evidence_id": self.evidence_id,
             "topic_id": self.topic_id,
             "session_id": self.session_id,
@@ -40,6 +47,18 @@ class EvidenceRecord:
             "assistant_text": self.assistant_text,
             "created_at": self.created_at,
         }
+        if self.source_agent is not None:
+            value.update(
+                source_agent=self.source_agent,
+                source_session=self.source_session,
+                idempotency_key=self.idempotency_key,
+                fact=self.fact,
+                reason=self.reason,
+                timestamp=self.created_at,
+                topic_version=self.topic_version,
+                topic_fingerprint=self.topic_fingerprint,
+            )
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> EvidenceRecord:
@@ -50,6 +69,13 @@ class EvidenceRecord:
             user_text=str(value["user_text"]),
             assistant_text=str(value["assistant_text"]),
             created_at=str(value["created_at"]),
+            source_agent=value.get("source_agent"),
+            source_session=value.get("source_session"),
+            idempotency_key=value.get("idempotency_key"),
+            fact=value.get("fact"),
+            reason=value.get("reason"),
+            topic_version=value.get("topic_version"),
+            topic_fingerprint=value.get("topic_fingerprint"),
         )
 
 
@@ -58,7 +84,7 @@ class EvidenceLedger:
         self.root = Path(root)
         self.topics_dir = self.root / "topics"
         self._by_id: dict[str, EvidenceRecord] = {}
-        self._loaded_paths: set[Path] = set()
+        self._loaded_paths: dict[Path, tuple[int, int]] = {}
 
     def append_turn(
         self,
@@ -81,7 +107,45 @@ class EvidenceLedger:
             assistant_text=assistant_text,
             created_at=_utc_now(),
         )
-        path = topic_dir / "evidence.jsonl"
+        return self._append(record)
+
+    def append_remember(
+        self,
+        topic_id: str,
+        fact: str,
+        *,
+        source_agent: str,
+        source_session: str | None,
+        idempotency_key: str | None,
+        reason: str | None,
+        topic_version: int,
+        topic_fingerprint: str,
+        created_at: str | None = None,
+    ) -> EvidenceRecord:
+        self._validate_topic_id(topic_id)
+        if not (self.topics_dir / topic_id).is_dir():
+            raise EvidenceNotFoundError(f"canonical topic does not exist: {topic_id}")
+        return self._append(
+            EvidenceRecord(
+                evidence_id=uuid.uuid4().hex,
+                topic_id=topic_id,
+                session_id=source_session or source_agent,
+                user_text=fact,
+                assistant_text="",
+                created_at=created_at or _utc_now(),
+                source_agent=source_agent,
+                source_session=source_session,
+                idempotency_key=idempotency_key,
+                fact=fact,
+                reason=reason,
+                topic_version=topic_version,
+                topic_fingerprint=topic_fingerprint,
+            )
+        )
+
+    def _append(self, record: EvidenceRecord) -> EvidenceRecord:
+        topic_id = record.topic_id
+        path = self.topics_dir / topic_id / "evidence.jsonl"
         payload = json.dumps(
             record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8") + b"\n"
@@ -129,9 +193,13 @@ class EvidenceLedger:
                 self._load_path(topic_dir / "evidence.jsonl")
 
     def _load_path(self, path: Path) -> None:
-        if path in self._loaded_paths:
+        if not path.is_file():
             return
-        if path.is_file():
+        with self._lock(path.parent.name):
+            stat = path.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+            if self._loaded_paths.get(path) == signature:
+                return
             with path.open(encoding="utf-8") as evidence_file:
                 for line_number, line in enumerate(evidence_file, start=1):
                     if not line.strip():
@@ -146,7 +214,7 @@ class EvidenceLedger:
                     if existing is not None and existing != record:
                         raise EvidenceError(f"duplicate evidence id: {record.evidence_id}")
                     self._by_id[record.evidence_id] = record
-        self._loaded_paths.add(path)
+            self._loaded_paths[path] = signature
 
     @contextmanager
     def _lock(self, topic_id: str) -> Iterator[None]:

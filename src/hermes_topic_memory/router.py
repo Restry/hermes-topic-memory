@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import posixpath
+import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .models import TopicState
 
@@ -44,6 +47,8 @@ class TopicConfig:
     chat_ids: tuple[str, ...]
     source_relative_path: str | None = None
     state: TopicState = "active"
+    repo_urls: tuple[str, ...] = ()
+    workspace_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +71,16 @@ class TopicRegistry:
         *,
         default_topic: str | None = None,
     ) -> None:
+        topics = tuple(
+            replace(
+                topic,
+                repo_urls=tuple(normalize_repo_url(repo) for repo in topic.repo_urls),
+                workspace_paths=tuple(
+                    normalize_workspace_path(path) for path in topic.workspace_paths
+                ),
+            )
+            for topic in topics
+        )
         self._topics = {topic.topic_id: topic for topic in topics}
         if len(self._topics) != len(topics):
             raise AmbiguousRegistryError("duplicate topic id")
@@ -82,12 +97,18 @@ class TopicRegistry:
         )
 
         self._chat_ids: dict[str, str] = {}
+        self._repo_urls: dict[str, str] = {}
+        self._workspace_paths: dict[str, str] = {}
         for topic in active_topics:
             for chat_id in topic.chat_ids:
                 normalized = _normalize_chat_id(chat_id)
                 if not normalized:
                     raise ValueError(f"empty chat id for topic: {topic.topic_id}")
                 self._bind(self._chat_ids, normalized, topic.topic_id, "chat id")
+            for repo in topic.repo_urls:
+                self._bind(self._repo_urls, repo, topic.topic_id, "repository")
+            for path in topic.workspace_paths:
+                self._bind(self._workspace_paths, path, topic.topic_id, "workspace path")
 
         self._default_topic = (
             self.resolve_name(default_topic, context="registry default")
@@ -115,6 +136,10 @@ class TopicRegistry:
                     chat_ids=_string_tuple(raw.get("chat_ids", ()), "chat_ids"),
                     source_relative_path=_optional_text(raw.get("source_relative_path")),
                     state=_topic_state(raw.get("state", "active")),
+                    repo_urls=_string_tuple(raw.get("repo_urls", ()), "repo_urls"),
+                    workspace_paths=_string_tuple(
+                        raw.get("workspace_paths", ()), "workspace_paths"
+                    ),
                 )
             )
         default = value.get("default_topic")
@@ -200,6 +225,41 @@ class TopicRegistry:
         if any(marker in normalized_query for marker in _TOPIC_REFERENCE_MARKERS):
             raise TopicRoutingError("query mentions an unknown topic")
         return None
+
+    def route_context(
+        self,
+        *,
+        explicit_topic: str | None = None,
+        chat_id: str | None = None,
+        repo: str | None = None,
+        workspace_path: str | None = None,
+        query: str | None = None,
+    ) -> RouteDecision:
+        if explicit_topic is not None:
+            return self.route(explicit_topic=explicit_topic)
+        if chat_id is not None:
+            topic_id = self._chat_ids.get(_normalize_chat_id(chat_id))
+            if topic_id is not None:
+                return RouteDecision(topic_id, "chat_id")
+        if repo is not None:
+            topic_id = self._repo_urls.get(normalize_repo_url(repo))
+            if topic_id is not None:
+                return RouteDecision(topic_id, "repo")
+        if workspace_path is not None:
+            path = normalize_workspace_path(workspace_path)
+            matches = (
+                prefix
+                for prefix in self._workspace_paths
+                if path == prefix or path.startswith(prefix.rstrip("/") + "/")
+            )
+            prefix = max(matches, key=len, default=None)
+            if prefix is not None:
+                return RouteDecision(self._workspace_paths[prefix], "workspace_path")
+        if query is not None:
+            topic_id = self.mentioned_topic(query)
+            if topic_id is not None:
+                return RouteDecision(topic_id, "query")
+        return self.route()
 
     def route(
         self,
@@ -304,6 +364,59 @@ def _query_name_spans(query: str, name: str) -> Iterator[tuple[int, int]]:
         if left_bound and right_bound:
             yield index, end
         start = index + 1
+
+
+def normalize_repo_url(value: str) -> str:
+    """Canonicalize repository remotes without accessing the network."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("repository must be non-empty text")
+    remote = value.strip()
+    if any(character.isspace() for character in remote):
+        raise ValueError("repository must not contain whitespace")
+    if "://" in remote:
+        parsed = urlsplit(remote)
+        if (
+            parsed.scheme.casefold() not in {"https", "http", "ssh", "git"}
+            or not parsed.hostname
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"invalid repository: {value!r}")
+        host = parsed.hostname.casefold()
+        port = parsed.port
+        if port is not None and port != {
+            "https": 443, "http": 80, "ssh": 22, "git": 9418
+        }[parsed.scheme.casefold()]:
+            host += f":{port}"
+        path = parsed.path
+    else:
+        scp = re.fullmatch(r"(?:[^/@:]+@)?([^/:]+):(.+)", remote)
+        if scp is not None:
+            host, path = scp.groups()
+            host = host.casefold()
+        else:
+            parts = remote.split("/", 1)
+            if len(parts) == 2 and ("." in parts[0] or parts[0] == "localhost"):
+                host, path = parts
+                host = host.casefold()
+            else:
+                host, path = "github.com", remote
+    path = path.strip("/").casefold()
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"repository requires an owner and name: {value!r}")
+    if any(character in path for character in "?#\\"):
+        raise ValueError(f"invalid repository: {value!r}")
+    return path if host == "github.com" else f"{host}/{path}"
+
+
+def normalize_workspace_path(value: str) -> str:
+    """Normalize lexical directory paths without requiring them to exist."""
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError("workspace path must be non-empty text")
+    return posixpath.normpath(value.strip())
 
 
 def _normalize_chat_id(value: str) -> str:

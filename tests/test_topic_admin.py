@@ -10,6 +10,7 @@ from hermes_topic_memory.models import TopicMetadata
 from hermes_topic_memory.router import TopicRegistry, TopicRoutingError
 from hermes_topic_memory.store import FileTopicStore
 from hermes_topic_memory.topic_admin import TopicAdminError, TopicAdminService
+from hermes_topic_memory.validation import validate_data_root
 
 
 def _registry(root: Path) -> dict:
@@ -368,3 +369,191 @@ def test_archived_topic_is_explicit_read_only_but_not_implicit(tmp_path: Path) -
             expected_fingerprint=memory.metadata.content_fingerprint,
         )
     assert captured.value.code == "invalid_state"
+
+
+def test_create_update_and_bind_persist_normalized_contexts(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    created = admin.create_topic(
+        "alpha", "Alpha", ("a",), "canonical body",
+        chat_ids=(" chat-first ",),
+        repo_urls=("https://GitHub.com/Owner/Repo.git/",),
+        workspace_paths=("/work/alpha/",),
+        make_default=True,
+    )
+    item = _registry(root)["topics"][0]
+    assert item["repo_urls"] == ["owner/repo"]
+    assert item["workspace_paths"] == ["/work/alpha"]
+    assert item["chat_ids"] == ["chat-first"]
+
+    updated = admin.update_topic("alpha", repo_urls=("Another/Repo.git",))
+    assert updated.repo_urls == ("another/repo",)
+    assert updated.workspace_paths == ("/work/alpha",)
+    bound = admin.bind_context(
+        "alpha", chat_id="chat-second", repo_url="git@github.com:THIRD/REPO.git",
+        workspace_path="/work/second/",
+    )
+    assert bound.chat_ids == ("chat-first", "chat-second")
+    assert bound.repo_urls == ("another/repo", "third/repo")
+    assert bound.workspace_paths == ("/work/alpha", "/work/second")
+    before = _files(root)
+    assert admin.bind_context("alpha", repo_url="https://github.com/Third/Repo.git/") == bound
+    assert _files(root) == before
+
+    registry = TopicRegistry.from_file(root / "topic-registry.json")
+    assert registry.topics[0] == bound
+    assert registry.route_context(repo="third/repo").topic_id == "alpha"
+    assert registry.route_context(chat_id="chat-second").topic_id == "alpha"
+    assert registry.route_context(workspace_path="/work/second/subdir").topic_id == "alpha"
+    assert FileTopicStore(root).get_topic("alpha") == created
+    assert _registry(root)["default_topic"] == "alpha"
+    assert validate_data_root(root) == 1
+
+
+def test_context_update_can_clear_fields_and_preserves_legacy_registry_data(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic("alpha", "Alpha", ("a",), "body")
+    value = _registry(root)
+    item = value["topics"][0]
+    item.pop("repo_urls")
+    item.pop("workspace_paths")
+    item["source_relative_path"] = "source/alpha.md"
+    item["custom_field"] = {"keep": True}
+    value["custom_root"] = ["keep"]
+    (root / "topic-registry.json").write_text(json.dumps(value), encoding="utf-8")
+
+    bound = admin.bind_context("alpha", repo_url="OWNER/REPO", workspace_path="/work/")
+    assert bound.repo_urls == ("owner/repo",)
+    assert bound.workspace_paths == ("/work",)
+    cleared = admin.update_topic("alpha", repo_urls=(), chat_ids=())
+    assert cleared.repo_urls == cleared.chat_ids == ()
+    assert cleared.workspace_paths == ("/work",)
+    persisted = _registry(root)
+    assert persisted["custom_root"] == ["keep"]
+    assert persisted["topics"][0]["source_relative_path"] == "source/alpha.md"
+    assert persisted["topics"][0]["custom_field"] == {"keep": True}
+    assert persisted["topics"][0]["aliases"] == ["a"]
+
+
+@pytest.mark.parametrize("operation", ["create", "update", "bind"])
+@pytest.mark.parametrize("context", ["repo", "workspace", "chat"])
+def test_context_conflicts_fail_atomically(
+    tmp_path: Path, operation: str, context: str
+) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic(
+        "alpha", "Alpha", (), "alpha body", chat_ids=("shared-chat",),
+        repo_urls=("Owner/Repo",), workspace_paths=("/work/alpha/",),
+    )
+    if operation != "create":
+        admin.create_topic("beta", "Beta", (), "beta body")
+    before = _files(root)
+    fields = {
+        "repo": {"repo_urls": ("git@github.com:OWNER/REPO.git",)},
+        "workspace": {"workspace_paths": ("/work/alpha",)},
+        "chat": {"chat_ids": (" shared-chat ",)},
+    }[context]
+    scalar = {
+        "repo": {"repo_url": "https://github.com/owner/repo.git/"},
+        "workspace": {"workspace_path": "/work/alpha"},
+        "chat": {"chat_id": "shared-chat"},
+    }[context]
+
+    with pytest.raises(TopicAdminError) as captured:
+        if operation == "create":
+            admin.create_topic("beta", "Beta", (), "beta body", **fields)
+        elif operation == "update":
+            admin.update_topic("beta", **fields)
+        else:
+            admin.bind_context("beta", **scalar)
+    assert captured.value.code == "alias_conflict"
+    assert _files(root) == before
+
+
+def test_context_bindings_survive_archive_restore_trash_and_restore(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic(
+        "alpha", "Alpha", (), "body", repo_urls=("Owner/Repo",),
+        workspace_paths=("/work/alpha/",), make_default=True,
+    )
+    original = _registry(root)["topics"][0]
+    admin.archive("alpha", expected_version=1)
+    archived = TopicRegistry.from_file(root / "topic-registry.json")
+    assert archived.topics[0].repo_urls == ("owner/repo",)
+    with pytest.raises(TopicRoutingError, match="no topic context"):
+        archived.route_context(repo="owner/repo", workspace_path="/work/alpha/src")
+    with pytest.raises(TopicAdminError) as captured:
+        admin.bind_context("alpha", repo_url="other/repo")
+    assert captured.value.code == "invalid_state"
+    admin.restore("alpha")
+    assert _registry(root)["topics"][0] == original
+    admin.trash("alpha", expected_version=1)
+    assert _registry(root)["topics"] == []
+    tombstone = json.loads(
+        (root / "recycle-bin/alpha/tombstone.json").read_text(encoding="utf-8")
+    )
+    assert tombstone["prior_registry_item"] == original
+    admin.restore_from_trash("alpha")
+    assert _registry(root)["topics"][0] == original
+    assert _registry(root)["default_topic"] == "alpha"
+    assert validate_data_root(root) == 1
+
+
+def test_restore_rejects_context_reassigned_after_trash_without_writes(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic("alpha", "Alpha", (), "body", repo_urls=("owner/repo",))
+    admin.trash("alpha", expected_version=1)
+    admin.create_topic("beta", "Beta", (), "body", repo_urls=("Owner/Repo.git",))
+    before = _files(root)
+
+    with pytest.raises(TopicAdminError) as captured:
+        admin.restore_from_trash("alpha")
+    assert captured.value.code == "alias_conflict"
+    assert _files(root) == before
+
+
+def test_context_mutation_rolls_back_registry_when_write_fails(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic("alpha", "Alpha", (), "body")
+    before = _files(root)
+
+    def fail(stage: str) -> None:
+        if stage == "after_registry_write":
+            raise RuntimeError("injected write failure")
+
+    failing = TopicAdminService(root, failure_injector=fail)
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        failing.bind_context("alpha", repo_url="owner/repo")
+    assert _files(root) == before
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"repo_urls": ["git@github.com:OWNER/REPO.git"]},
+        {"workspace_paths": ["/work/alpha/"]},
+        {"repo_urls": [""]},
+        {"workspace_paths": [" "]},
+    ],
+)
+def test_validate_data_root_checks_context_binding_errors(
+    tmp_path: Path, replacement: dict[str, object]
+) -> None:
+    root = tmp_path / "data"
+    admin = TopicAdminService(root)
+    admin.create_topic(
+        "alpha", "Alpha", (), "body", repo_urls=("owner/repo",),
+        workspace_paths=("/work/alpha",),
+    )
+    admin.create_topic("beta", "Beta", (), "body")
+    value = _registry(root)
+    value["topics"][1].update(replacement)
+    (root / "topic-registry.json").write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        validate_data_root(root)

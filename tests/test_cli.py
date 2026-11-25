@@ -230,3 +230,55 @@ def test_cli_recall_multi_uses_paired_topics_and_returns_structured_json(
             ],
             reader=reader,
         )
+
+
+def test_cli_context_binding_remember_and_recall(tmp_path: Path, capsys) -> None:
+    data_root = tmp_path / "data"
+    body_file = tmp_path / "alpha.md"
+    body_file.write_text("# Alpha\n\nOriginal fact.\n", encoding="utf-8")
+    base = ["--data-root", str(data_root)]
+    invoke(
+        capsys,
+        base + [
+            "init", "alpha", "--alias", "a", "--body-file", str(body_file),
+            "--repo-url", "https://github.com/Owner/Alpha.git/",
+        ],
+    )
+    bound = invoke(
+        capsys,
+        base + ["bind", "a", "--workspace-path", "/work/alpha/"],
+    )
+    assert bound["topic_id"] == "alpha"
+    assert bound["workspace_paths"] == ["/work/alpha"]
+    fact = "The project uses Python 3.11."
+    written = invoke(
+        capsys,
+        base + [
+            "remember", fact, "--repo", "git@github.com:owner/alpha.git",
+            "--source-agent", "codex", "--source-session", "session-1",
+            "--idempotency-key", "fact-1",
+        ],
+    )
+    assert written["status"] == "remembered"
+    assert written["topic_version"] == 2
+    duplicate = invoke(
+        capsys,
+        base + [
+            "remember", fact, "--workspace-path", "/work/alpha/src",
+            "--idempotency-key", "fact-1",
+        ],
+    )
+    assert duplicate["status"] == "duplicate"
+    assert duplicate["evidence_id"] == written["evidence_id"]
+    memory = FileTopicStore(data_root).get_topic("alpha")
+    assert memory.metadata.version == 2
+    assert memory.body.count(fact) == 1
+    assert "codex]" in memory.body
+    recalled = invoke(
+        capsys,
+        base + ["recall", "what is current?", "--workspace-path", "/work/alpha/src"],
+        reader=FixedReader(),
+    )
+    assert recalled["topic_id"] == "alpha"
+    assert recalled["topic_version"] == 2
+    assert recalled["answer"] == "grounded CLI answer"

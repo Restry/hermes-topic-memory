@@ -3,11 +3,10 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Iterator, Literal, Protocol, runtime_checkable
+from typing import Callable, Literal, Protocol, runtime_checkable
 
 from .evidence import EvidenceLedger, EvidenceRecord
 from .models import TopicMemory
@@ -147,8 +146,6 @@ class EvidenceUpdatePipeline:
     def _append_audit(
         self, proposal: UpdateProposal, result: UpdateResult
     ) -> None:
-        self.audit_dir.mkdir(parents=True, exist_ok=True)
-        path = self.audit_dir / f"{proposal.topic_id}.jsonl"
         record = {
             "action": proposal.action,
             "topic_id": proposal.topic_id,
@@ -160,10 +157,19 @@ class EvidenceUpdatePipeline:
             "current_version": result.current_version,
             "created_at": _utc_now(),
         }
-        payload = json.dumps(
-            record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8") + b"\n"
-        with self._audit_lock(proposal.topic_id):
+        append_update_audit(self.store.root, proposal.topic_id, record)
+
+
+def append_update_audit(root: Path, topic_id: str, record: dict[str, object]) -> None:
+    audit_dir = root / "update-proposals"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / f"{topic_id}.jsonl"
+    payload = json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    with (audit_dir / f".{topic_id}.lock").open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
             descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
             try:
                 written = os.write(descriptor, payload)
@@ -172,16 +178,8 @@ class EvidenceUpdatePipeline:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-
-    @contextmanager
-    def _audit_lock(self, topic_id: str) -> Iterator[None]:
-        lock_path = self.audit_dir / f".{topic_id}.lock"
-        with lock_path.open("a+b") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _utc_now() -> str:

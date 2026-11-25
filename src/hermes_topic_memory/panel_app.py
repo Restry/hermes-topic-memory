@@ -22,6 +22,8 @@ from .core_memory import (
 )
 from .catalog import TopicCatalog
 from .engine import RecallEngine
+from .mcp_protocol import McpProtocol
+from .memory_service import MemoryService, MemoryServiceError
 from .multi_recall import (
     MultiRecallEngine,
     MultiRecallResult,
@@ -68,6 +70,8 @@ class PanelApplication:
         "core_memory",
         "data_root",
         "history",
+        "memory_service",
+        "mcp",
         "store",
     )
 
@@ -89,6 +93,8 @@ class PanelApplication:
         self.history = QueryHistoryStore(self.data_root)
         self.admin = TopicAdminService(self.data_root)
         self.core_memory = CoreMemoryService(self.data_root)
+        self.memory_service = MemoryService(self.data_root, reader)
+        self.mcp = McpProtocol(self.memory_service)
 
     def dispatch(
         self,
@@ -104,6 +110,14 @@ class PanelApplication:
         is_mutation = _is_topic_mutation_target(method, target)
         try:
             path, params = _parse_target(target)
+            if path == ("mcp",):
+                _reject_params(params, set())
+                if method.upper() != "POST":
+                    return _error_response(405, "method_not_allowed", "Method not allowed.")
+                status, result = self.mcp.dispatch(body)
+                return PanelResponse(status, b"") if result is None else _json_response(status, result)
+            if path[:2] == ("api", "v1"):
+                return self._dispatch_service(method.upper(), path, params, body)
             payload = _parse_json_body(body)
             request_method = method.upper()
             if request_method == "GET":
@@ -142,6 +156,35 @@ class PanelApplication:
         supplied = authorization[len(prefix) :] if has_bearer_prefix else ""
         matches = secrets.compare_digest(supplied, self._auth_token)
         return has_bearer_prefix and matches
+
+    def _dispatch_service(
+        self,
+        method: str,
+        path: tuple[str, ...],
+        params: dict[str, str],
+        body: bytes,
+    ) -> PanelResponse:
+        _reject_params(params, set())
+        routes = {
+            ("api", "v1", "whoami"): ("GET", "whoami"),
+            ("api", "v1", "topics"): ("GET", "list_topics"),
+            ("api", "v1", "recall"): ("POST", "recall"),
+            ("api", "v1", "remember"): ("POST", "remember"),
+            ("api", "v1", "topics", "bind"): ("POST", "bind_topic"),
+        }
+        route = routes.get(path)
+        if route is None:
+            raise _ResourceNotFound
+        if method != route[0]:
+            return _error_response(405, "method_not_allowed", "Method not allowed.")
+        payload = _parse_json_body(body)
+        if method == "GET" and payload is not None:
+            raise _RequestError("invalid_request", "GET requests do not accept arguments.")
+        try:
+            result = self.memory_service.call(route[1], payload or {}, source="rest")
+            return _json_response(200, result)
+        except MemoryServiceError as error:
+            return _json_response(error.status, {"error": error.to_dict()})
 
     def _dispatch_get(
         self, path: tuple[str, ...], params: dict[str, str]

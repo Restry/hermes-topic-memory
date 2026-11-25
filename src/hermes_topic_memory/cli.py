@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
@@ -13,6 +14,7 @@ from .multi_recall import MultiRecallEngine, ReaderCapsuleSynthesizer, TopicSele
 from .importer import import_markdown_directory
 from .reader import OpenAICompatibleReader, Reader
 from .query_history import QueryHistoryStore
+from .remember import RememberService
 from .router import TopicRegistry
 from .store import FileTopicStore
 from .topic_admin import TopicAdminService
@@ -29,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     initialize.add_argument("--display-name")
     initialize.add_argument("--alias", action="append", default=[])
     initialize.add_argument("--chat-id", action="append", default=[])
+    initialize.add_argument("--repo-url", action="append", default=[])
+    initialize.add_argument("--workspace-path", action="append", default=[])
     initialize.add_argument("--body-file", required=True, type=Path)
     initialize.add_argument("--default", action="store_true")
 
@@ -38,6 +42,29 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("query")
     recall.add_argument("--topic")
     recall.add_argument("--chat-id")
+    recall.add_argument("--repo")
+    recall.add_argument("--workspace-path")
+
+    remember = subparsers.add_parser("remember", help="Append an explicit fact to a topic")
+    remember.add_argument("fact")
+    remember.add_argument("--topic")
+    remember.add_argument("--chat-id")
+    remember.add_argument("--repo")
+    remember.add_argument("--workspace-path")
+    remember.add_argument("--source-agent", default="unknown")
+    remember.add_argument("--source-session")
+    remember.add_argument("--idempotency-key")
+    remember.add_argument("--reason")
+
+    bind = subparsers.add_parser("bind", help="Bind agent context to a topic")
+    bind.add_argument("topic")
+    bind.add_argument("--chat-id")
+    bind.add_argument("--repo-url")
+    bind.add_argument("--workspace-path")
+
+    serve = subparsers.add_parser("serve", help="Serve the Panel, MCP, and REST APIs")
+    serve.add_argument("--bind", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8080)
 
     recall_multi = subparsers.add_parser(
         "recall-multi", help="Recall independently from one to eight selected topics"
@@ -75,12 +102,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None, *, reader: Reader | None = None) -> int:
     args = build_parser().parse_args(argv)
     data_root = args.data_root.expanduser().resolve()
+    if args.command == "serve":
+        from .panel_server import serve_panel
+
+        serve_panel(
+            data_root, reader or _reader_from_environment(), host=args.bind, port=args.port
+        )
+        return 0
     if args.command == "init":
         result = _init_topic(data_root, args)
     elif args.command == "topics":
         result = _topics(data_root)
     elif args.command == "recall":
         result = _recall(data_root, args, reader)
+    elif args.command == "remember":
+        result = _remember(data_root, args)
+    elif args.command == "bind":
+        result = _bind(data_root, args)
     elif args.command == "recall-multi":
         result = _recall_multi(data_root, args, reader)
     elif args.command == "update":
@@ -121,6 +159,8 @@ def _init_topic(data_root: Path, args: argparse.Namespace) -> dict:
         tuple(args.alias),
         args.body_file.read_text(encoding="utf-8"),
         chat_ids=tuple(args.chat_id),
+        repo_urls=tuple(args.repo_url),
+        workspace_paths=tuple(args.workspace_path),
         make_default=args.default,
     )
     return {"status": "created", "topic_id": args.topic_id, "version": topic.metadata.version}
@@ -139,6 +179,8 @@ def _topics(data_root: Path) -> dict:
                 "display_name": config.display_name,
                 "aliases": list(config.aliases),
                 "chat_ids": list(config.chat_ids),
+                "repo_urls": list(config.repo_urls),
+                "workspace_paths": list(config.workspace_paths),
                 "version": memory.metadata.version,
                 "source_relative_path": config.source_relative_path,
             }
@@ -148,7 +190,13 @@ def _topics(data_root: Path) -> dict:
 
 def _recall(data_root: Path, args: argparse.Namespace, reader: Reader | None) -> dict:
     registry = TopicRegistry.from_file(_registry_path(data_root))
-    decision = registry.route(explicit_topic=args.topic, chat_id=args.chat_id)
+    decision = registry.route_context(
+        explicit_topic=args.topic,
+        chat_id=args.chat_id,
+        repo=args.repo,
+        workspace_path=args.workspace_path,
+        query=args.query,
+    )
     active_reader = reader or _reader_from_environment()
     result = RecallEngine(
         store=FileTopicStore(data_root),
@@ -168,6 +216,37 @@ def _recall(data_root: Path, args: argparse.Namespace, reader: Reader | None) ->
             "attempts": result.failure.attempts,
         }
     return response
+
+
+def _remember(data_root: Path, args: argparse.Namespace) -> dict:
+    registry = TopicRegistry.from_file(_registry_path(data_root))
+    decision = registry.route_context(
+        explicit_topic=args.topic,
+        chat_id=args.chat_id,
+        repo=args.repo,
+        workspace_path=args.workspace_path,
+    )
+    result = RememberService(data_root).remember(
+        decision.topic_id,
+        args.fact,
+        source_agent=args.source_agent,
+        source_session=args.source_session,
+        idempotency_key=args.idempotency_key,
+        reason=args.reason,
+    )
+    return asdict(result)
+
+
+def _bind(data_root: Path, args: argparse.Namespace) -> dict:
+    registry = TopicRegistry.from_file(_registry_path(data_root))
+    topic_id = registry.resolve_name(args.topic)
+    config = TopicAdminService(data_root).bind_context(
+        topic_id,
+        chat_id=args.chat_id,
+        repo_url=args.repo_url,
+        workspace_path=args.workspace_path,
+    )
+    return {"status": "bound", **asdict(config)}
 
 
 def _recall_multi(data_root: Path, args: argparse.Namespace, reader: Reader | None) -> dict:
