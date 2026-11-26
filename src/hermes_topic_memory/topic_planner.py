@@ -37,6 +37,7 @@ class TopicPlanner:
                 "topic_id": topic.topic_id,
                 "display_name": topic.display_name,
                 "aliases": list(topic.aliases),
+                **({"summary": topic.summary} if topic.summary else {}),
             }
             for topic in registry.topics
             if topic.state != "trashed"

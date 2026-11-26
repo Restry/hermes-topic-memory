@@ -168,7 +168,7 @@ class MultiRecallEngine:
     ) -> MultiRecallResult:
         started_ns = time.perf_counter_ns()
         _validate_text(question, "question", maximum=_MAX_QUESTION_CHARS)
-        if source not in {"hermes", "panel", "cli"}:
+        if source not in {"hermes", "panel", "cli", "mcp", "rest"}:
             raise ValueError(f"invalid query source: {source!r}")
         if session_ref is not None:
             _validate_text(session_ref, "session reference", maximum=1_024)

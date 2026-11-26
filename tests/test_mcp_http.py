@@ -122,7 +122,7 @@ def test_initialize_notification_and_tool_discovery(service: _RunningService) ->
     status, response = service.rpc("tools/list")
     assert status == 200
     tools = {item["name"]: item for item in response["result"]["tools"]}
-    assert set(tools) == {"whoami", "recall", "remember", "list_topics", "bind_topic"}
+    assert set(tools) == {"whoami", "recall", "remember", "list_topics", "bind_topic", "dream"}
     assert tools["recall"]["inputSchema"]["required"] == ["query"]
     assert tools["remember"]["inputSchema"]["required"] == ["fact"]
     assert tools["bind_topic"]["inputSchema"]["required"] == ["topic"]
@@ -223,7 +223,7 @@ def test_remember_routes_context_and_deduplicates_across_transports(service: _Ru
     assert recalled["source"] == "reader"
 
 
-@pytest.mark.parametrize("path,method", [("/mcp", "POST"), ("/api/v1/whoami", "GET"), ("/api/v1/topics", "GET"), ("/api/v1/recall", "POST"), ("/api/v1/remember", "POST"), ("/api/v1/topics/bind", "POST")])
+@pytest.mark.parametrize("path,method", [("/mcp", "POST"), ("/api/v1/whoami", "GET"), ("/api/v1/topics", "GET"), ("/api/v1/recall", "POST"), ("/api/v1/remember", "POST"), ("/api/v1/topics/bind", "POST"), ("/api/v1/dream", "POST")])
 def test_every_service_endpoint_requires_bearer_auth(service: _RunningService, path: str, method: str) -> None:
     for token in (None, "wrong-token"):
         status, response = service.request(method, path, raw=b"private malformed body", token=token)

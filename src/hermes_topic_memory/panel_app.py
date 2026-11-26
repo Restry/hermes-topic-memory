@@ -171,6 +171,7 @@ class PanelApplication:
             ("api", "v1", "recall"): ("POST", "recall"),
             ("api", "v1", "remember"): ("POST", "remember"),
             ("api", "v1", "topics", "bind"): ("POST", "bind_topic"),
+            ("api", "v1", "dream"): ("POST", "dream"),
         }
         route = routes.get(path)
         if route is None:

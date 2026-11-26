@@ -7,12 +7,27 @@ from typing import Any
 
 from .cache import QuestionCache
 from .core_memory import CoreMemoryService
+from .dream import DreamConsolidator
 from .engine import RecallEngine, RecallFailure, RecallResult
+from .multi_recall import (
+    MultiRecallEngine,
+    MultiRecallResult,
+    ReaderCapsuleSynthesizer,
+    TopicSelection,
+)
 from .query_history import QueryHistoryStore, QueryRecord, QuerySource, TopicQueryResult
+from .reader import Reader
 from .remember import RememberService
-from .router import TopicConfig, TopicRegistry, TopicRoutingError
+from .router import (
+    MultiTopicRequiredError,
+    RouteDecision,
+    TopicConfig,
+    TopicRegistry,
+    TopicRoutingError,
+)
 from .store import FileTopicStore, TopicNotFoundError, TopicStateError
 from .topic_admin import TopicAdminError, TopicAdminService
+from .topic_planner import PlanningError, TopicPlanner
 
 
 class MemoryServiceError(RuntimeError):
@@ -33,7 +48,7 @@ _TOOL_DEFINITIONS = (
     ("whoami", "Read the shared Core / WhoAmI memory.", {}, ()),
     (
         "recall",
-        "Route context to a topic and recall a capsule of at most 200 characters.",
+        "Recall a capsule of at most 200 characters. Context fields are optional; when omitted, the server automatically routes via the lightweight topic catalog.",
         {"query": {**_TEXT, "maxLength": 4096}, **_CONTEXT},
         ("query",),
     ),
@@ -57,6 +72,16 @@ _TOOL_DEFINITIONS = (
         {"topic": _TEXT, "chat_id": _TEXT, "repo_url": _TEXT, "workspace_path": _TEXT},
         ("topic",),
     ),
+    (
+        "dream",
+        "Run offline memory consolidation (merge duplicates, resolve contradictions, prune noise, refresh catalog summaries).",
+        {
+            "topic": _TEXT,
+            "dry_run": {"type": "boolean"},
+            "force": {"type": "boolean"},
+        },
+        (),
+    ),
 )
 
 
@@ -79,7 +104,7 @@ def tool_definitions() -> list[dict[str, Any]]:
 class MemoryService:
     """One implementation shared by the MCP tools and versioned REST routes."""
 
-    def __init__(self, data_root: str | Path, reader: object) -> None:
+    def __init__(self, data_root: str | Path, reader: Reader) -> None:
         self.root = Path(data_root)
         self.reader = reader
         self.store = FileTopicStore(self.root)
@@ -87,6 +112,7 @@ class MemoryService:
         self.admin = TopicAdminService(self.root)
         self.core = CoreMemoryService(self.root)
         self.remember_service = RememberService(self.root)
+        self.dream_consolidator = DreamConsolidator(self.root, reader)
 
     def call(self, name: str, arguments: Any, *, source: QuerySource) -> dict[str, Any]:
         definition = next((item for item in _TOOL_DEFINITIONS if item[0] == name), None)
@@ -133,6 +159,17 @@ class MemoryService:
                     reason=arguments.get("reason"),
                 )
                 return asdict(result)
+            if name == "dream":
+                dry_run = bool(arguments.get("dry_run", False))
+                force = bool(arguments.get("force", False))
+                if "topic" in arguments:
+                    topic_id = self._registry().resolve_name(arguments["topic"])
+                    return self.dream_consolidator.dream_topic(
+                        topic_id, dry_run=dry_run, force=force
+                    ).to_dict()
+                return self.dream_consolidator.dream_all(
+                    dry_run=dry_run, force=force
+                ).to_dict()
             return self._recall(arguments, source=source)
         except MemoryServiceError:
             raise
@@ -162,6 +199,7 @@ class MemoryService:
             "chat_ids": list(topic.chat_ids),
             "repo_urls": list(topic.repo_urls),
             "workspace_paths": list(topic.workspace_paths),
+            "summary": topic.summary,
             "state": topic.state,
             "version": self.store.get_topic(topic.topic_id).metadata.version,
         }
@@ -169,13 +207,19 @@ class MemoryService:
     def _recall(self, arguments: dict[str, Any], *, source: QuerySource) -> dict[str, Any]:
         started = time.perf_counter_ns()
         question = arguments["query"]
-        decision = self._registry().route_context(
-            explicit_topic=arguments.get("topic"),
-            chat_id=arguments.get("chat_id"),
-            repo=arguments.get("repo"),
-            workspace_path=arguments.get("workspace_path"),
-            query=question,
+        registry = self._registry()
+        decision, multi_selections, multi_route_source = self._resolve_recall_target(
+            registry, arguments, question
         )
+        if multi_selections is not None:
+            return self._recall_multi(
+                registry=registry,
+                question=question,
+                selections=multi_selections,
+                route_source=multi_route_source,
+                source=source,
+            )
+        assert decision is not None
         topic = self.store.get_topic(decision.topic_id)
         try:
             result = RecallEngine(
@@ -226,10 +270,112 @@ class MemoryService:
             response["error"] = {"code": "recall_failed", "message": "Recall could not be completed."}
         return response
 
+    def _resolve_recall_target(
+        self,
+        registry: TopicRegistry,
+        arguments: dict[str, Any],
+        question: str,
+    ) -> tuple[RouteDecision | None, tuple[TopicSelection, ...] | None, str]:
+        explicit_topic = arguments.get("topic")
+        if explicit_topic is not None:
+            return registry.route(explicit_topic=explicit_topic), None, "explicit"
+
+        # Try deterministic context bindings first (chat_id -> repo -> workspace_path).
+        if any(arguments.get(k) is not None for k in ("chat_id", "repo", "workspace_path")):
+            try:
+                bound = registry.route_context(
+                    chat_id=arguments.get("chat_id"),
+                    repo=arguments.get("repo"),
+                    workspace_path=arguments.get("workspace_path"),
+                )
+                if bound.source in {"chat_id", "repo", "workspace_path"}:
+                    return bound, None, bound.source
+            except TopicRoutingError:
+                pass
+
+        # Next check explicit topic mentions inside the question.
+        try:
+            mentioned = registry.mentioned_topic(question)
+        except MultiTopicRequiredError as error:
+            selections = tuple(
+                TopicSelection(tid, "query_multi") for tid in error.topic_ids[:8]
+            )
+            return None, selections, "query_multi"
+        if mentioned is not None:
+            return RouteDecision(mentioned, "query"), None, "query"
+
+        # No context matched: automatically route via the lightweight topic catalog.
+        try:
+            plan = TopicPlanner(registry=registry, model=self.reader).plan(question)
+            if len(plan.selections) == 1:
+                return RouteDecision(plan.selections[0].topic_id, "catalog_planner"), None, "catalog_planner"
+            return None, plan.selections, "catalog_planner"
+        except PlanningError:
+            pass
+
+        return registry.route(), None, "default"
+
+    def _recall_multi(
+        self,
+        *,
+        registry: TopicRegistry,
+        question: str,
+        selections: tuple[TopicSelection, ...],
+        route_source: str,
+        source: QuerySource,
+    ) -> dict[str, Any]:
+        recall_engine = RecallEngine(
+            store=self.store, cache=QuestionCache(self.root), reader=self.reader
+        )
+        multi_engine = MultiRecallEngine(
+            recall_engine=recall_engine,
+            registry=registry,
+            synthesizer=ReaderCapsuleSynthesizer(self.reader),  # type: ignore[arg-type]
+            query_history=self.history,
+        )
+        result: MultiRecallResult = multi_engine.recall_multi(
+            question=question,
+            selections=selections,
+            source=source,
+        )
+        has_error = result.failure is not None or any(r.status == "error" for r in result.topic_results)
+        if result.final_answer is not None:
+            status = "answered"
+        elif has_error:
+            status = "error"
+        else:
+            status = "no_fact"
+        response: dict[str, Any] = {
+            "capsule": result.final_answer,
+            "topic_id": result.topic_results[0].topic_id if result.topic_results else None,
+            "topic_version": result.topic_results[0].topic_version if result.topic_results else None,
+            "selected_topics": [
+                {
+                    "topic_id": item.topic_id,
+                    "topic_version": item.topic_version,
+                    "status": item.status,
+                    "source": item.source,
+                }
+                for item in result.topic_results
+            ],
+            "source": result.synthesis_source,
+            "status": status,
+            "route_source": route_source,
+            "query_id": result.query_id,
+        }
+        if status == "error":
+            response["error"] = {"code": "recall_failed", "message": "Recall could not be completed."}
+        return response
+
 
 def _validate_arguments(value: Any, properties: dict[str, Any], required: tuple[str, ...]) -> None:
     if not isinstance(value, dict) or not set(value).issubset(properties) or not set(required).issubset(value):
         raise MemoryServiceError("invalid_request", "Invalid tool arguments.")
-    for name, text in value.items():
-        if not isinstance(text, str) or not text.strip() or len(text) > properties[name].get("maxLength", 2_000_000):
+    for name, item in value.items():
+        schema = properties[name]
+        if schema.get("type") == "boolean":
+            if not isinstance(item, bool):
+                raise MemoryServiceError("invalid_request", "Invalid tool arguments.")
+            continue
+        if not isinstance(item, str) or not item.strip() or len(item) > schema.get("maxLength", 2_000_000):
             raise MemoryServiceError("invalid_request", "Invalid tool arguments.")

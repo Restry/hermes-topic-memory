@@ -9,6 +9,7 @@ from typing import Sequence
 
 from .cache import QuestionCache
 from .dashboard import generate_dashboard
+from .dream import DreamConsolidator
 from .engine import RecallEngine
 from .multi_recall import MultiRecallEngine, ReaderCapsuleSynthesizer, TopicSelection
 from .importer import import_markdown_directory
@@ -96,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard", help="Generate a self-contained metadata dashboard"
     )
     dashboard.add_argument("--output", required=True, type=Path)
+
+    dream = subparsers.add_parser(
+        "dream", help="Run offline dream consolidation for one topic or all active topics"
+    )
+    dream.add_argument("--topic", help="Single topic id, display name, or alias")
+    dream.add_argument("--dry-run", action="store_true", help="Preview consolidation diff without writing")
+    dream.add_argument("--force", action="store_true", help="Consolidate even if no new evidence arrived")
     return parser
 
 
@@ -131,6 +139,8 @@ def main(argv: Sequence[str] | None = None, *, reader: Reader | None = None) -> 
         ).to_dict()
     elif args.command == "dashboard":
         result = generate_dashboard(data_root, args.output).to_dict()
+    elif args.command == "dream":
+        result = _dream(data_root, args, reader)
     else:
         result = _validate(data_root)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -340,6 +350,18 @@ def _rollback(data_root: Path, args: argparse.Namespace) -> dict:
 
 def _validate(data_root: Path) -> dict:
     return {"status": "valid", "topics": validate_data_root(data_root)}
+
+
+def _dream(data_root: Path, args: argparse.Namespace, reader: Reader | None) -> dict:
+    model = reader or _reader_from_environment()
+    consolidator = DreamConsolidator(data_root, model)
+    if args.topic:
+        registry = TopicRegistry.from_file(_registry_path(data_root))
+        topic_id = registry.resolve_name(args.topic, context="dream topic")
+        return consolidator.dream_topic(
+            topic_id, dry_run=args.dry_run, force=args.force
+        ).to_dict()
+    return consolidator.dream_all(dry_run=args.dry_run, force=args.force).to_dict()
 
 
 def _reader_from_environment() -> OpenAICompatibleReader:

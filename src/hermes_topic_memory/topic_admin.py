@@ -157,6 +157,42 @@ class TopicAdminService:
         with self._locked():
             return self._update_context_locked(topic_id, contexts, append=True)
 
+    def update_summary(self, topic_id: str, summary: str) -> TopicConfig:
+        """Persist a short one-line catalog summary for a topic."""
+        self._validate_topic_id(topic_id)
+        if not isinstance(summary, str):
+            raise ValueError("summary must be a string")
+        cleaned = " ".join(summary.split())
+        if len(cleaned) > 200:
+            raise ValueError("summary must be at most 200 characters")
+        with self._locked():
+            registry = self._load_registry()
+            item = self._registered_item(registry, topic_id)
+            self._require_state(item, ("active",))
+            current = self.store.get_topic(topic_id)
+            candidate = self._copy_json(registry)
+            updated = self._registered_item(candidate, topic_id)
+            if cleaned:
+                updated["summary"] = cleaned
+            else:
+                updated.pop("summary", None)
+            self._validate_registry(candidate)
+            result = next(
+                config for config in TopicRegistry.from_dict(candidate).topics
+                if config.topic_id == topic_id
+            )
+            if candidate == registry:
+                return result
+            with self._transaction((self._registry_path, self._operations_audit_path)):
+                self._write_registry(candidate)
+                self._append_operation_audit(
+                    "update_summary",
+                    topic_id,
+                    current.metadata.version,
+                    current.metadata.state,
+                )
+            return result
+
     def _update_context_locked(
         self, topic_id: str, contexts: dict[str, tuple[str, ...]], *, append: bool
     ) -> TopicConfig:

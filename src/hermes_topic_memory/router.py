@@ -49,6 +49,7 @@ class TopicConfig:
     state: TopicState = "active"
     repo_urls: tuple[str, ...] = ()
     workspace_paths: tuple[str, ...] = ()
+    summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +141,7 @@ class TopicRegistry:
                     workspace_paths=_string_tuple(
                         raw.get("workspace_paths", ()), "workspace_paths"
                     ),
+                    summary=_optional_text(raw.get("summary")) or "",
                 )
             )
         default = value.get("default_topic")
