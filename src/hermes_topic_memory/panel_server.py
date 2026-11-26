@@ -29,6 +29,7 @@ _STATIC_ASSETS = {
     "/studio/": ("studio_assets", "index.html", "text/html; charset=utf-8"),
     "/studio/styles.css": ("studio_assets", "styles.css", "text/css; charset=utf-8"),
     "/studio/app.js": ("studio_assets", "app.js", "text/javascript; charset=utf-8"),
+    "/llms.txt": ("studio_assets", "llms.txt", "text/plain; charset=utf-8"),
 }
 
 

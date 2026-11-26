@@ -89,6 +89,16 @@ def test_wx_sso_end_to_end_and_studio_ui(tmp_path: Path) -> None:
         assert r_fb.status == 200
         assert "Topic Memory" in body_fb
 
+        # 2b. Public /llms.txt is readable without auth and documents exact MCP tools
+        conn.request("GET", "/llms.txt")
+        r_llms = conn.getresponse()
+        llms_txt = r_llms.read().decode("utf-8")
+        assert r_llms.status == 200
+        assert "text/plain" in (r_llms.getheader("Content-Type") or "")
+        for tool in ("whoami", "recall", "remember", "list_topics", "bind_topic", "dream"):
+            assert f"`{tool}`" in llms_txt
+        assert "TOPIC_MEMORY_TOKEN" in llms_txt
+
         # 3. Callback exchanges code with HMAC + mints htm_session cookie
         cb_path = f"/api/sso/callback?code=one-time-code&state={state}&iss=https://wx.mvp.restry.cn"
         conn.request("GET", cb_path, headers={"Cookie": tx_cookie})

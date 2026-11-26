@@ -1,0 +1,131 @@
+# Topic Memory (Hermes Topic Memory) — Agent Integration Guide
+
+> Cloud-hosted, topic-isolated long-term memory service for AI agents (Hermes, Pi Agent / OMP, OpenCode, Codex, Claude Code).
+> Transport: MCP Streamable HTTP (`POST /mcp`, JSON-RPC 2.0) and REST API (`/api/v1/*`).
+> Auth: `Authorization: Bearer <TOPIC_MEMORY_TOKEN>` (obtain the token from the owner; never hardcode or log it).
+
+## Endpoints
+
+- Base URL: `https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn`
+- MCP Endpoint: `POST /mcp` (Stateless JSON-RPC 2.0, `Content-Type: application/json`, `Authorization: Bearer <TOKEN>`)
+- REST Endpoints:
+  - `GET /api/v1/whoami` — read shared Core / WhoAmI profile
+  - `GET /api/v1/topics` — list active topics, bindings, versions, and summaries
+  - `POST /api/v1/recall` — recall a high-density capsule (<= 200 chars)
+  - `POST /api/v1/remember` — persist a durable fact with provenance & idempotency
+  - `POST /api/v1/bind` — bind a `chat_id`, `repo_url`, or `workspace_path` to an existing topic
+  - `POST /api/v1/dream` — consolidate a topic (`dry_run: true` recommended before applying)
+- Human Studio UI: `/` (WeChat Gateway SSO protected)
+- This guide: `GET /llms.txt` (public, no auth required)
+
+## MCP Tools (Exact Schema)
+
+All tools are discovered via `tools/list` on `POST /mcp` (`protocolVersion: "2024-11-05"`):
+
+1. `whoami`
+   - Args: `{}`
+   - Use at session start to load owner identity, preferences, and global constraints.
+
+2. `recall`
+   - Required: `query` (string, max 4096 chars)
+   - Optional context: `topic`, `chat_id`, `repo`, `workspace_path`
+   - Auto-routing: Context fields are optional. If omitted, the server scans the lightweight topic catalog and automatically routes to the matching topic(s), then returns a <= 200-char capsule grounded in the full topic body.
+
+3. `remember`
+   - Required: `fact` (string)
+   - Optional context: `topic`, `chat_id`, `repo`, `workspace_path`
+   - Optional provenance: `source_agent` (e.g. `"hermes"`, `"omp"`, `"opencode"`, `"codex"`), `source_session`, `idempotency_key`, `reason`
+   - Fail-closed rule: Writes require an authoritative topic match (either explicit `topic` or a bound `chat_id` / `repo` / `workspace_path`). If no binding exists, the write is rejected instead of guessing.
+
+4. `list_topics`
+   - Args: `{}`
+   - Returns active topics with `topic_id`, `display_name`, `version`, `summary`, and current bindings (`chat_ids`, `repo_urls`, `workspace_paths`).
+
+5. `bind_topic`
+   - Required: `topic` (topic_id or alias)
+   - Optional: `chat_id`, `repo_url`, `workspace_path`
+   - One-time setup so future `remember` / `recall` calls from a repo or workspace auto-route without passing `topic`.
+
+6. `dream`
+   - Optional: `topic` (string), `dry_run` (boolean, default `false`), `force` (boolean)
+   - Consolidates duplicates, resolves contradictions, prunes noise, and refreshes catalog summaries. Always preview with `dry_run: true` first before committing.
+
+## Client Configuration Snippets
+
+Set environment variable `TOPIC_MEMORY_TOKEN` (never commit tokens into git).
+
+### Pi Agent (`omp`) — `~/.omp/agent/mcp.json`
+```json
+{
+  "mcpServers": {
+    "topic-memory": {
+      "type": "http",
+      "url": "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TOPIC_MEMORY_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+### OpenCode — `opencode.json`
+```json
+{
+  "mcp": {
+    "topic-memory": {
+      "type": "remote",
+      "url": "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:TOPIC_MEMORY_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+### Codex — `~/.codex/config.toml`
+```toml
+[mcp_servers.topic_memory]
+url = "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp"
+bearer_token_env_var = "TOPIC_MEMORY_TOKEN"
+```
+
+### Hermes Agent — `~/.hermes/config.yaml`
+```yaml
+mcp_servers:
+  topic_memory:
+    url: "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp"
+    headers:
+      Authorization: "Bearer ${TOPIC_MEMORY_TOKEN}"
+```
+
+## Agent Operating Rules (Recommended System Prompt Snippet)
+
+- **Start of task**: Call `whoami` if you need user preferences, and call `recall` before asking the user to repeat prior project decisions or architecture context.
+- **Pass context when available**: Always pass `repo` (git remote URL, preferred — works across machines) and/or `workspace_path` when inside a code repository, or `chat_id` when inside a group chat.
+- **First-time repo binding**: If `remember` fails with an unbound-topic error in a known project repo, call `list_topics` to confirm the matching topic and ask the user (or follow project policy) before calling `bind_topic`.
+- **When to call `remember`**: Save durable architectural decisions, production constraints, verified root causes, and user preferences. Do NOT save transient debug logs, unverified guesses, or secrets/API keys. Always include `source_agent` and an `idempotency_key` on retries.
+- **Never store credentials**: Never write API keys, passwords, tokens, cookies, or private keys into `fact`.
+
+## Quick Smoke Test (curl)
+
+```bash
+# 1. Initialize MCP handshake
+curl -fsS -X POST "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp" \
+  -H "Authorization: Bearer $TOPIC_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}'
+
+# 2. List tools
+curl -fsS -X POST "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp" \
+  -H "Authorization: Bearer $TOPIC_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+
+# 3. Context-free recall (no topic required)
+curl -fsS -X POST "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/api/v1/recall" \
+  -H "Authorization: Bearer $TOPIC_MEMORY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"你的问题"}'
+```
