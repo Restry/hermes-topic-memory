@@ -301,6 +301,8 @@ class MemoryService:
                 TopicSelection(tid, "query_multi") for tid in error.topic_ids[:8]
             )
             return None, selections, "query_multi"
+        except TopicRoutingError:
+            mentioned = None
         if mentioned is not None:
             return RouteDecision(mentioned, "query"), None, "query"
 
