@@ -356,6 +356,9 @@ class PanelApplication:
         if path == ("api", "dreams"):
             _reject_params(params, {"limit"})
             return _json_response(200, {"items": self._dream_reports(params)})
+        if path == ("api", "runtime"):
+            _reject_params(params, set())
+            return _json_response(200, self._runtime_info())
         if path == ("api", "recycle-bin"):
             _reject_params(params, set())
             return _json_response(200, {"items": self._recycle_items()})
@@ -710,6 +713,25 @@ class PanelApplication:
             ),
         )
 
+    def _runtime_info(self) -> dict[str, Any]:
+        raw_endpoint = getattr(self._reader, "endpoint", None)
+        safe_endpoint: str | None = None
+        if isinstance(raw_endpoint, str) and raw_endpoint.strip():
+            parts = urlsplit(raw_endpoint.strip())
+            if parts.scheme and parts.netloc:
+                safe_endpoint = f"{parts.scheme}://{parts.netloc}{parts.path}"
+            else:
+                safe_endpoint = raw_endpoint.strip()
+        model = getattr(self._reader, "model", None)
+        return {
+            "reader_model": str(model) if isinstance(model, str) and model else "unknown",
+            "reader_endpoint": safe_endpoint or "in-process",
+            "ui_mode": self.ui_mode,
+            "sso_enabled": self.wx_sso is not None,
+            "sso_gateway": self.wx_sso.config.issuer if self.wx_sso is not None else None,
+            "allowed_openids_count": len(self.wx_sso.config.allowed_openids) if self.wx_sso is not None else 0,
+        }
+
     def _dream_reports(self, params: dict[str, str]) -> list[dict[str, Any]]:
         limit = _positive_integer(params["limit"], "limit") if "limit" in params else 30
         limit = min(limit, 100)
@@ -718,7 +740,9 @@ class PanelApplication:
             return []
         items: list[dict[str, Any]] = []
         for path in sorted(reports_dir.glob("*.jsonl")):
-            for line in path.read_text(encoding="utf-8").splitlines():
+            if path.name.startswith("."):
+                continue
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if not line:
                     continue

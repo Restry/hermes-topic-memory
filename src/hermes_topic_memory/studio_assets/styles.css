@@ -13,12 +13,26 @@
   --radius: 10px;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.45) transparent;
+}
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.65);
+}
 html, body {
   margin: 0; padding: 0; height: 100%;
   background: var(--bg); color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
-  font-size: 14px; line-height: 1.5;
+  font-size: 14px; line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
 }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
@@ -79,6 +93,10 @@ html, body {
 .badge-green { background: #ecfdf5; color: var(--green); }
 .badge-purple { background: #f5f3ff; color: var(--purple); }
 .badge-gray { background: #f1f5f9; color: #475569; }
+.endpoint-badge {
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500;
+}
 
 .stat-pill {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 10px;

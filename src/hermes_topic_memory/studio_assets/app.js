@@ -80,10 +80,17 @@
   }
 
   async function refreshAll() {
-    const [overview, topicsRes] = await Promise.all([
+    const [overview, topicsRes, runtime] = await Promise.all([
       api("/api/overview"),
       api("/api/v1/topics"),
+      api("/api/runtime").catch(() => null),
     ]);
+    if (runtime) {
+      $("runtime-model-badge").textContent = "模型: " + (runtime.reader_model || "-");
+      const ep = runtime.reader_endpoint || "-";
+      $("runtime-endpoint-badge").textContent = ep.replace(/^https?:\/\//, "");
+      $("runtime-endpoint-badge").title = "Endpoint: " + ep + (runtime.allowed_openids_count ? " · 白名单已锁 (" + runtime.allowed_openids_count + "人)" : "");
+    }
     const ov = overview.overview || overview;
     const topics = topicsRes.topics || [];
     state.topics = topics;
@@ -221,7 +228,7 @@
   async function refreshLogs() {
     try {
       const [qRes, dRes] = await Promise.all([
-        api("/api/questions?limit=20"),
+        api("/api/questions?page_size=20"),
         api("/api/dreams?limit=20"),
       ]);
       const qWrap = $("log-questions");
