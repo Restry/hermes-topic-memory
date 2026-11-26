@@ -35,6 +35,7 @@ from .router import TopicRegistry
 from .store import FileTopicStore, TopicNotFoundError
 from .topic_planner import PlanningError, TopicPlan, TopicPlanner
 from .topic_admin import TopicAdminError, TopicAdminService
+from .wx_sso import WxGatewaySso, WxSsoError
 
 _TOPIC_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MAX_PAGE_SIZE = 100
@@ -47,6 +48,7 @@ class PanelResponse:
     status: int
     body: bytes
     content_type: str = "application/json; charset=utf-8"
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 class _RequestError(ValueError):
@@ -73,9 +75,19 @@ class PanelApplication:
         "memory_service",
         "mcp",
         "store",
+        "ui_mode",
+        "wx_sso",
     )
 
-    def __init__(self, data_root: str | Path, reader: object, auth_token: str) -> None:
+    def __init__(
+        self,
+        data_root: str | Path,
+        reader: object,
+        auth_token: str,
+        *,
+        wx_sso: WxGatewaySso | None = None,
+        ui_mode: str = "auto",
+    ) -> None:
         root_input = Path(data_root).expanduser()
         if root_input.is_symlink():
             raise ValueError("data root must not be a symlink")
@@ -89,11 +101,13 @@ class PanelApplication:
             raise ValueError("Panel auth token must be non-empty single-line text")
         self._reader = reader
         self._auth_token = auth_token
+        self.wx_sso = wx_sso
+        self.ui_mode = "studio" if (ui_mode == "studio" or (ui_mode == "auto" and wx_sso is not None)) else "classic"
         self.store = FileTopicStore(self.data_root)
         self.history = QueryHistoryStore(self.data_root)
         self.admin = TopicAdminService(self.data_root)
         self.core_memory = CoreMemoryService(self.data_root)
-        self.memory_service = MemoryService(self.data_root, reader)
+        self.memory_service = MemoryService(self.data_root, reader)  # type: ignore[arg-type]
         self.mcp = McpProtocol(self.memory_service)
 
     def dispatch(
@@ -104,6 +118,20 @@ class PanelApplication:
         headers: Mapping[str, str] | None = None,
         body: bytes = b"",
     ) -> PanelResponse:
+        request_method = method.upper()
+        raw_path = urlsplit(target).path
+        # Public auth/SSO endpoints (no Bearer/session required).
+        if raw_path == "/api/auth/me":
+            if request_method != "GET":
+                return _error_response(405, "method_not_allowed", "Method not allowed.")
+            return self._auth_me(headers)
+        if raw_path.startswith("/api/sso/"):
+            try:
+                sso_path, sso_params = _parse_target(target)
+            except _RequestError as error:
+                return _error_response(400, error.code, error.message)
+            return self._dispatch_sso(request_method, sso_path, sso_params, headers)
+
         if not self._is_authorized(headers):
             return _error_response(401, "unauthorized", "Authentication required.")
 
@@ -112,14 +140,13 @@ class PanelApplication:
             path, params = _parse_target(target)
             if path == ("mcp",):
                 _reject_params(params, set())
-                if method.upper() != "POST":
+                if request_method != "POST":
                     return _error_response(405, "method_not_allowed", "Method not allowed.")
                 status, result = self.mcp.dispatch(body)
                 return PanelResponse(status, b"") if result is None else _json_response(status, result)
             if path[:2] == ("api", "v1"):
-                return self._dispatch_service(method.upper(), path, params, body)
+                return self._dispatch_service(request_method, path, params, body)
             payload = _parse_json_body(body)
-            request_method = method.upper()
             if request_method == "GET":
                 return self._dispatch_get(path, params)
             if request_method == "POST":
@@ -145,6 +172,13 @@ class PanelApplication:
             )
 
     def _is_authorized(self, headers: Mapping[str, str] | None) -> bool:
+        if self._has_valid_bearer(headers):
+            return True
+        if self.wx_sso is not None and self.wx_sso.read_session(headers) is not None:
+            return True
+        return False
+
+    def _has_valid_bearer(self, headers: Mapping[str, str] | None) -> bool:
         authorization = ""
         if headers is not None:
             for name, value in headers.items():
@@ -156,6 +190,112 @@ class PanelApplication:
         supplied = authorization[len(prefix) :] if has_bearer_prefix else ""
         matches = secrets.compare_digest(supplied, self._auth_token)
         return has_bearer_prefix and matches
+
+    def _auth_me(self, headers: Mapping[str, str] | None) -> PanelResponse:
+        sso_enabled = self.wx_sso is not None
+        if self.wx_sso is not None:
+            session = self.wx_sso.read_session(headers)
+            if session is not None:
+                return _json_response(
+                    200,
+                    {
+                        "authenticated": True,
+                        "mode": "sso",
+                        "sso_enabled": True,
+                        "user": {
+                            "openid": session.openid,
+                            "nickname": session.nickname,
+                            "avatar_url": session.avatar_url,
+                        },
+                        "central_logout_url": f"{self.wx_sso.config.issuer}/sso/logout",
+                    },
+                )
+        if self._has_valid_bearer(headers):
+            return _json_response(
+                200,
+                {
+                    "authenticated": True,
+                    "mode": "token",
+                    "sso_enabled": sso_enabled,
+                    "user": None,
+                },
+            )
+        return _json_response(
+            200,
+            {
+                "authenticated": False,
+                "mode": None,
+                "sso_enabled": sso_enabled,
+                "user": None,
+            },
+        )
+
+    def _dispatch_sso(
+        self,
+        method: str,
+        path: tuple[str, ...],
+        params: dict[str, str],
+        headers: Mapping[str, str] | None,
+    ) -> PanelResponse:
+        if self.wx_sso is None:
+            return _error_response(404, "sso_disabled", "WeChat SSO is not configured.")
+        if path == ("api", "sso", "start"):
+            if method != "GET":
+                return _error_response(405, "method_not_allowed", "Method not allowed.")
+            authorize_url, tx_cookie = self.wx_sso.start(return_to=params.get("next", "/"))
+            return PanelResponse(
+                status=302,
+                body=b"",
+                content_type="text/plain; charset=utf-8",
+                headers=(("Location", authorize_url), ("Set-Cookie", tx_cookie)),
+            )
+        if path == ("api", "sso", "callback"):
+            if method != "GET":
+                return _error_response(405, "method_not_allowed", "Method not allowed.")
+            try:
+                return_to, cookies = self.wx_sso.complete_callback(params, headers)
+            except WxSsoError as err:
+                html_err = (
+                    "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+                    "<title>登录失败</title><style>body{font-family:-apple-system,sans-serif;"
+                    "display:flex;align-items:center;justify-content:center;min-height:100vh;"
+                    "margin:0;background:#f8fafc;color:#0f172a}.card{background:#fff;border:1px solid #e2e8f0;"
+                    "border-radius:12px;padding:28px;max-width:420px;box-shadow:0 4px 16px rgba(15,23,42,.06)}"
+                    "a{display:inline-block;margin-top:16px;margin-right:12px;padding:8px 16px;border-radius:8px;"
+                    "text-decoration:none;font-weight:600}.primary{background:#2563eb;color:#fff}"
+                    ".secondary{border:1px solid #cbd5e1;color:#334155}</style></head><body><div class='card'>"
+                    f"<h3>微信登录未完成</h3><p>{err}</p>"
+                    "<a class='primary' href='/api/sso/start'>重新扫码登录</a>"
+                    "<a class='secondary' href='/?token_login=1'>使用访问密钥</a>"
+                    "</div></body></html>"
+                ).encode("utf-8")
+                return PanelResponse(
+                    status=err.status,
+                    body=html_err,
+                    content_type="text/html; charset=utf-8",
+                )
+            resp_headers = [("Location", return_to)] + [("Set-Cookie", c) for c in cookies]
+            return PanelResponse(
+                status=303,
+                body=b"",
+                content_type="text/plain; charset=utf-8",
+                headers=tuple(resp_headers),
+            )
+        if path == ("api", "sso", "logout"):
+            if method != "POST":
+                return _error_response(405, "method_not_allowed", "Method not allowed.")
+            return PanelResponse(
+                status=200,
+                body=json.dumps(
+                    {
+                        "ok": True,
+                        "central_logout_url": f"{self.wx_sso.config.issuer}/sso/logout",
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                headers=(("Set-Cookie", self.wx_sso.logout_cookie()),),
+            )
+        return _error_response(404, "not_found", "Resource not found.")
 
     def _dispatch_service(
         self,
@@ -213,6 +353,9 @@ class PanelApplication:
             return _json_response(200, self._topics(params))
         if path == ("api", "questions"):
             return _json_response(200, self._questions(params))
+        if path == ("api", "dreams"):
+            _reject_params(params, {"limit"})
+            return _json_response(200, {"items": self._dream_reports(params)})
         if path == ("api", "recycle-bin"):
             _reject_params(params, set())
             return _json_response(200, {"items": self._recycle_items()})
@@ -566,6 +709,27 @@ class PanelApplication:
                 recall_ms=recall_ms,
             ),
         )
+
+    def _dream_reports(self, params: dict[str, str]) -> list[dict[str, Any]]:
+        limit = _positive_integer(params["limit"], "limit") if "limit" in params else 30
+        limit = min(limit, 100)
+        reports_dir = self.data_root / "dream-reports"
+        if not reports_dir.is_dir():
+            return []
+        items: list[dict[str, Any]] = []
+        for path in sorted(reports_dir.glob("*.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict):
+                    items.append(entry)
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return items[:limit]
 
     def _overview(self) -> dict[str, Any]:
         snapshot = TopicCatalog(self.data_root).snapshot()

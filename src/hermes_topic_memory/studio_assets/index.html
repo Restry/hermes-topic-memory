@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Topic Memory · 云端记忆台</title>
+  <link rel="stylesheet" href="/studio/styles.css" />
+</head>
+<body>
+  <div id="auth-gate" class="auth-gate hidden">
+    <div class="auth-card">
+      <div class="brand-row">
+        <svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        <h1>Topic Memory 云端记忆台</h1>
+      </div>
+      <p class="muted">请输入访问密钥，或使用微信网关一键登录查看整体记忆库状态。</p>
+      <form id="token-form" class="token-form">
+        <input id="token-input" type="password" placeholder="Bearer Token" autocomplete="off" required />
+        <button type="submit" class="btn btn-primary">进入记忆台</button>
+      </form>
+      <div id="sso-entry-wrap" class="sso-entry hidden">
+        <a href="/api/sso/start" class="btn btn-ghost full-width">微信网关登录</a>
+      </div>
+      <p id="auth-error" class="error-text hidden"></p>
+    </div>
+  </div>
+
+  <div id="app-shell" class="app-shell hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <svg class="icon-md accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        <span class="brand-title">Topic Memory</span>
+        <span class="badge badge-soft">云端记忆库</span>
+      </div>
+      <div class="stats-strip">
+        <div class="stat-pill"><span class="stat-label">活跃主题</span><strong id="stat-topics">-</strong></div>
+        <div class="stat-pill"><span class="stat-label">总字符</span><strong id="stat-chars">-</strong></div>
+        <div class="stat-pill"><span class="stat-label">有效 QA 缓存</span><strong id="stat-cache">-</strong></div>
+        <div class="stat-pill"><span class="stat-label">近 30 天召回</span><strong id="stat-queries">-</strong></div>
+      </div>
+      <div class="topbar-right">
+        <span id="user-badge" class="muted small"></span>
+        <button id="btn-refresh" class="btn btn-ghost btn-sm" type="button">刷新</button>
+        <button id="btn-logout" class="btn btn-ghost btn-sm" type="button">退出</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <input id="topic-search" type="search" placeholder="搜索主题名 / ID / 摘要..." />
+        </div>
+        <div id="topic-list" class="topic-list"></div>
+      </aside>
+
+      <section class="content">
+        <nav class="tabs">
+          <button class="tab active" data-tab="topic" type="button">记忆与 Dream</button>
+          <button class="tab" data-tab="ask" type="button">直接提问（免选主题）</button>
+          <button class="tab" data-tab="logs" type="button">运行流水</button>
+        </nav>
+
+        <!-- Tab 1: Topic Detail + Dream -->
+        <div id="panel-topic" class="tab-panel">
+          <div class="topic-header">
+            <div>
+              <h2 id="detail-title">请选择左侧主题</h2>
+              <p id="detail-summary" class="muted small"></p>
+              <div id="detail-meta" class="meta-row"></div>
+            </div>
+            <div class="action-row">
+              <button id="btn-dream-preview" class="btn btn-purple" type="button" disabled>Dream 预览</button>
+              <button id="btn-dream-apply" class="btn btn-primary" type="button" disabled>确认 Dream 换版</button>
+            </div>
+          </div>
+
+          <div id="dream-box" class="dream-box hidden">
+            <div class="dream-box-head">
+              <strong id="dream-status-title">Dream 巩固结果</strong>
+              <button id="btn-dream-close" class="btn btn-ghost btn-xs" type="button">收起</button>
+            </div>
+            <div id="dream-metrics" class="meta-row"></div>
+            <ul id="dream-changes" class="change-list"></ul>
+            <pre id="dream-diff" class="code-box diff-box"></pre>
+          </div>
+
+          <pre id="detail-body" class="code-box memory-body">点击左侧任意主题查看权威记忆正文。</pre>
+        </div>
+
+        <!-- Tab 2: Context-Free Ask -->
+        <div id="panel-ask" class="tab-panel hidden">
+          <div class="ask-card">
+            <h3>免选主题直接提问</h3>
+            <p class="muted small">不传任何 topic，服务端自动基于全部主题目录路由，并由长上下文 Reader 返回 ≤200 字高密度胶囊。</p>
+            <form id="ask-form" class="ask-form">
+              <input id="ask-input" type="text" placeholder="例如：VeloIQ 里 Company Code 是做权限还是业务筛选？" required />
+              <button id="btn-ask-submit" type="submit" class="btn btn-primary">提问</button>
+            </form>
+            <div id="ask-result" class="ask-result hidden">
+              <div id="ask-meta" class="meta-row"></div>
+              <div id="ask-capsule" class="capsule-box"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: Recent Recall & Dream Logs -->
+        <div id="panel-logs" class="tab-panel hidden">
+          <div class="logs-grid">
+            <div class="log-col">
+              <h3>最近召回记录</h3>
+              <div id="log-questions" class="log-list"></div>
+            </div>
+            <div class="log-col">
+              <h3>最近 Dream 巩固</h3>
+              <div id="log-dreams" class="log-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/studio/app.js"></script>
+</body>
+</html>

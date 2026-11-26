@@ -10,6 +10,7 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 from .panel_app import PanelApplication, PanelResponse
+from .wx_sso import WxGatewaySso, WxSsoConfig
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8080
@@ -20,10 +21,14 @@ _CONTENT_SECURITY_POLICY = (
     "form-action 'self'; object-src 'none'"
 )
 _STATIC_ASSETS = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
-    "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/": ("panel_assets", "index.html", "text/html; charset=utf-8"),
+    "/index.html": ("panel_assets", "index.html", "text/html; charset=utf-8"),
+    "/assets/styles.css": ("panel_assets", "styles.css", "text/css; charset=utf-8"),
+    "/assets/app.js": ("panel_assets", "app.js", "text/javascript; charset=utf-8"),
+    "/studio": ("studio_assets", "index.html", "text/html; charset=utf-8"),
+    "/studio/": ("studio_assets", "index.html", "text/html; charset=utf-8"),
+    "/studio/styles.css": ("studio_assets", "styles.css", "text/css; charset=utf-8"),
+    "/studio/app.js": ("studio_assets", "app.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -70,7 +75,33 @@ class TopicMemoryPanelHandler(BaseHTTPRequestHandler):
 
     def _handle_request(self) -> None:
         if self.command == "GET":
-            asset = _asset_response(urlsplit(self.path).path)
+            parsed = urlsplit(self.path)
+            req_path = parsed.path
+            # When Studio UI + WeChat SSO is enabled, top-level `/` seamlessly enters SSO if unauthenticated.
+            if req_path in {"/", "/index.html", "/studio", "/studio/"}:
+                app = self.server.application
+                wants_token_login = "token_login=1" in (parsed.query or "")
+                if (
+                    app.wx_sso is not None
+                    and not wants_token_login
+                    and app.wx_sso.read_session(dict(self.headers.items())) is None
+                ):
+                    authorize_url, tx_cookie = app.wx_sso.start(return_to=req_path or "/")
+                    self._send_response(
+                        PanelResponse(
+                            status=302,
+                            body=b"",
+                            content_type="text/plain; charset=utf-8",
+                            headers=(("Location", authorize_url), ("Set-Cookie", tx_cookie)),
+                        )
+                    )
+                    return
+                if req_path in {"/", "/index.html"} and app.ui_mode == "studio":
+                    asset = _asset_response("/studio")
+                    if asset is not None:
+                        self._send_response(asset)
+                        return
+            asset = _asset_response(req_path)
             if asset is not None:
                 self._send_response(asset)
                 return
@@ -115,6 +146,8 @@ class TopicMemoryPanelHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
         )
+        for header_name, header_value in response.headers:
+            self.send_header(header_name, header_value)
         self.end_headers()
         self.wfile.write(response.body)
 
@@ -126,11 +159,11 @@ def _asset_response(path: str) -> PanelResponse | None:
     asset = _STATIC_ASSETS.get(path)
     if asset is None:
         return None
-    filename, content_type = asset
+    asset_dir, filename, content_type = asset
     try:
         body = (
             resources.files("hermes_topic_memory")
-            .joinpath("panel_assets", filename)
+            .joinpath(asset_dir, filename)
             .read_bytes()
         )
     except OSError:
@@ -160,7 +193,12 @@ def serve_panel(
     token = auth_token if auth_token is not None else environment.get(PANEL_AUTH_TOKEN_ENV)
     if not token:
         raise RuntimeError(f"{PANEL_AUTH_TOKEN_ENV} is required")
-    application = PanelApplication(data_root, reader, token)
+    sso_config = WxSsoConfig.from_environ(environment)
+    wx_sso = WxGatewaySso(sso_config, session_secret=token) if sso_config is not None else None
+    ui_mode = (environment.get("TOPIC_MEMORY_UI_MODE") or "auto").strip().lower()
+    application = PanelApplication(
+        data_root, reader, token, wx_sso=wx_sso, ui_mode=ui_mode
+    )
     with create_panel_server(application, host=host, port=port) as server:
         server.serve_forever()
 
