@@ -15,7 +15,7 @@
   - `POST /api/v1/remember` — persist a durable fact with provenance & idempotency
   - `POST /api/v1/topics/bind` — bind a `chat_id`, `repo_url`, or `workspace_path` to an existing topic
   - `POST /api/v1/dream` — consolidate a topic (`dry_run: true` recommended before applying)
-- Human Studio UI: `/studio` (API key or environment token; WeChat SSO when configured). Its **接入与密钥** tab creates keys and generates current-origin client snippets.
+- Human Studio UI: `/studio` (API key or environment token; WeChat SSO when configured). Administrators manage topics, bindings, Core / WhoAmI and the recycle bin inline; the **接入与密钥** tab creates keys and generates current-origin client snippets. Read/write users keep read-only management surfaces.
 - This guide: `GET /llms.txt` (public, no auth required)
 
 ## Managed Keys, Roles, and Topic Scope
@@ -55,6 +55,7 @@ All tools are discovered via `tools/list` on `POST /mcp` (`protocolVersion: "202
 5. `bind_topic`
    - Required: `topic` (topic_id or alias)
    - Optional: `chat_id`, `repo_url`, `workspace_path`
+   - Optional concurrency pair: `expected_version` (integer >= 1) and `expected_fingerprint` (64 lowercase SHA-256 hex characters), supplied together from a current topic detail/body snapshot. Stale values return `409 concurrent_update`; omission preserves existing binding behavior. Binding changes do not create a canonical body version.
    - One-time setup so future `remember` / `recall` calls from a repo or workspace auto-route without passing `topic`.
 
 6. `dream`

@@ -115,7 +115,7 @@ TOPIC_MEMORY_UI_MODE=studio hermes-topic-memory --data-root /path/to/data serve 
   --bind 127.0.0.1 --port 8080
 ```
 
-The environment token remains the bootstrap administrator; WeChat SSO sessions are also administrators. Studio's **接入与密钥** tab issues a separate key per agent/user and generates copyable client configurations without adding P2 editors.
+The environment token remains the bootstrap administrator; WeChat SSO sessions are also administrators. Studio's **接入与密钥** tab issues a separate key per agent/user and generates copyable client configurations. Administrators can create topics inline, edit or roll back bodies, manage bindings, archive/restore topics, and move topics to the recycle bin. The fifth **Core 与回收站** tab initializes/edits shared Core / WhoAmI, browses and rolls back its versions, and restores or permanently deletes recycled topics.
 
 | Role | MCP / REST access | Panel access |
 | --- | --- | --- |
@@ -129,12 +129,17 @@ Keys use `htm_` plus 32 URL-safe random characters. Creation reveals the plainte
 
 Omit the topic allowlist for all topics, or supply non-empty topic IDs. IDs, aliases, and bound contexts are checked before effects; automatic recall sees only allowed candidates. Scoped topic lists, overview counts, histories, reports, and activity pagination cannot expose another topic. Mixed-topic history is hidden unless every selected topic is allowed. Core / WhoAmI remains shared. Scoped administrators cannot create broader-scope keys.
 
+Studio administrative controls are hidden for read/write users; both can read Core, and write users retain Remember/Dream. Topic and Core edits/rollbacks use version/fingerprint snapshots read when editing or confirming, so concurrent writes reject without discarding the draft. Confirmations stay inline. Recycled entries use their listed `trashed_at` as the concurrency guard, and permanent deletion requires the exact display name. Restore archived topics before editing, rolling back, or adding bindings.
+
+`TopicCatalog` shares bounded, thread-safe snapshots by resolved data root and Beijing date, with isolated topic-scope views. Each read checks stat signatures for the registry, topic bodies/metadata/version-directory membership, and query-history/QA-cache/cache files; changes rebuild before returning. Directory validation still runs on cache hits, and corruption is not cached. Concurrent writes retry until the before/after signature converges rather than serving a stale snapshot.
+
 Administrative endpoints:
 
 - `GET /api/keys` → `{"items": [...]}`: public metadata and active/revoked/expired status only.
 - `POST /api/keys` with `name`, `role`, optional non-empty `allowed_topics`, optional positive integer `expires_in_days` → `201 {"key": {...}, "secret": "htm_..."}`.
 - `POST /api/keys/{key_id}/revoke` → `200 {"key": {...}}`; repeated revocation preserves its timestamp; a missing key returns `404`.
 - `GET /api/auth/me` includes authenticated `actor`, `role`, `key_id`; the environment-token response retains `mode="token"`, managed keys use `mode="api_key"`.
+- `POST /api/v1/topics/bind` accepts optional `expected_version` (positive integer) and `expected_fingerprint` (lowercase SHA-256) together. Studio sends both from a current topic snapshot; stale values return `409 concurrent_update`. Existing callers may omit the pair. Bindings do not generate a canonical body version.
 
 Role denials return `403 forbidden`; out-of-scope targets return `403 topic_forbidden` (MCP returns a tool error). Ledger events identify the authenticated actor/key, including key changes and denials, without tokens. A valid Bearer credential takes precedence over SSO; otherwise the independent existing SSO-session fallback is preserved.
 

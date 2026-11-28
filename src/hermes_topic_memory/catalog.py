@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
-from dataclasses import dataclass
+import os
+import stat
+import threading
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -17,6 +21,8 @@ from .store import TopicCorruptionError
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _DAY_COUNT = 30
+_CACHE_MAXSIZE = 32
+_FilesystemSignature = tuple[tuple[str, int, int, int, int, int, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +94,24 @@ class CatalogSnapshot:
         }
 
 
+@dataclass(slots=True)
+class _SnapshotCacheEntry:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    signature: _FilesystemSignature | None = None
+    registry: TopicRegistry | None = None
+    snapshots: OrderedDict[frozenset[str] | None, CatalogSnapshot] = field(
+        default_factory=OrderedDict
+    )
+
+
+_CACHE_ENTRY_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=_CACHE_MAXSIZE)
+def _snapshot_cache_entry(data_root: Path, day: date) -> _SnapshotCacheEntry:
+    return _SnapshotCacheEntry()
+
+
 class TopicCatalog:
     def __init__(self, data_root: str | Path) -> None:
         self.data_root = Path(data_root).expanduser().resolve(strict=True)
@@ -95,8 +119,44 @@ class TopicCatalog:
     def snapshot(
         self, *, now: datetime | None = None, allowed_topics: frozenset[str] | None = None
     ) -> CatalogSnapshot:
-        registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
-        self._validate_topic_directories(registry)
+        last_day = _as_beijing(now or datetime.now(_BEIJING)).date()
+        # Serialize entry creation too: lru_cache may call a cold factory twice
+        # when concurrent callers arrive before the first result is stored.
+        with _CACHE_ENTRY_LOCK:
+            entry = _snapshot_cache_entry(self.data_root, last_day)
+        with entry.lock:
+            while True:
+                before = _filesystem_signature(self.data_root)
+                if entry.signature == before and allowed_topics in entry.snapshots:
+                    assert entry.registry is not None
+                    self._validate_topic_directories(entry.registry)
+                    if _filesystem_signature(self.data_root) == before:
+                        entry.snapshots.move_to_end(allowed_topics)
+                        return entry.snapshots[allowed_topics]
+                    continue
+
+                registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
+                self._validate_topic_directories(registry)
+                snapshot = self._build_snapshot(registry, last_day, allowed_topics)
+                if _filesystem_signature(self.data_root) != before:
+                    # Do not associate a read of the old tree with a new signature.
+                    continue
+                if entry.signature != before:
+                    entry.snapshots.clear()
+                entry.signature = before
+                entry.registry = registry
+                entry.snapshots[allowed_topics] = snapshot
+                entry.snapshots.move_to_end(allowed_topics)
+                if len(entry.snapshots) > _CACHE_MAXSIZE:
+                    entry.snapshots.popitem(last=False)
+                return snapshot
+
+    def _build_snapshot(
+        self,
+        registry: TopicRegistry,
+        last_day: date,
+        allowed_topics: frozenset[str] | None,
+    ) -> CatalogSnapshot:
         query_records = QueryHistoryStore(self.data_root).list()
         if allowed_topics is not None:
             query_records = [
@@ -110,8 +170,6 @@ class TopicCatalog:
                 result.topic_id for result in record.selected_topics
             )
 
-        beijing_now = _as_beijing(now or datetime.now(_BEIJING))
-        last_day = beijing_now.date()
         first_day = last_day - timedelta(days=_DAY_COUNT - 1)
         daily_counts: Counter[date] = Counter()
         for record in query_records:
@@ -244,6 +302,64 @@ class TopicCatalog:
         }
         versions.add(metadata.version)
         return len(versions)
+
+
+def _filesystem_signature(data_root: Path) -> _FilesystemSignature:
+    """Stat-only identity of every input, including missing paths and shapes."""
+    entries: list[tuple[str, int, int, int, int, int, int]] = []
+
+    def record(path: Path) -> os.stat_result | None:
+        relative = path.relative_to(data_root).as_posix()
+        try:
+            value = path.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            entries.append((relative, 0, 0, 0, 0, 0, 0))
+            return None
+        entries.append(
+            (
+                relative,
+                stat.S_IFMT(value.st_mode),
+                value.st_mtime_ns,
+                value.st_size,
+                value.st_ctime_ns,
+                value.st_dev,
+                value.st_ino,
+            )
+        )
+        return value
+
+    def children(path: Path) -> list[Path]:
+        try:
+            with os.scandir(path) as directory:
+                return [path / name for name in sorted(item.name for item in directory)]
+        except (FileNotFoundError, NotADirectoryError):
+            return []
+
+    def tree(path: Path, ancestors: frozenset[tuple[int, int]]) -> None:
+        value = record(path)
+        if value is None or not stat.S_ISDIR(value.st_mode):
+            return
+        identity = (value.st_dev, value.st_ino)
+        if identity in ancestors:
+            return
+        ancestors = ancestors | {identity}
+        for child in children(path):
+            tree(child, ancestors)
+
+    record(data_root / "topic-registry.json")
+    topics_dir = data_root / "topics"
+    topics_stat = record(topics_dir)
+    if topics_stat is not None and stat.S_ISDIR(topics_stat.st_mode):
+        for topic_dir in children(topics_dir):
+            value = record(topic_dir)
+            if value is not None and stat.S_ISDIR(value.st_mode):
+                for name in ("metadata.json", "memory.md", "versions"):
+                    record(topic_dir / name)
+    # QuestionCache uses qa-cache; also track the conventional cache directory
+    # and nested entries so additions/deletions cannot hide behind parent stats.
+    for name in ("query-history", "qa-cache", "cache"):
+        tree(data_root / name, frozenset())
+    return tuple(entries)
 
 
 def _safe_source_relative_path(

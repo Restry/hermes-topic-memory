@@ -151,7 +151,7 @@ def test_studio_tabs_have_panel_relationships_and_roving_keyboard_contract(studi
     assert tablist.attrs.get("role") == "tablist"
     assert tablist.attrs.get("aria-label")
     tabs = [node for node in tablist.descendants() if node.attrs.get("role") == "tab"]
-    assert len(tabs) == 4
+    assert len(tabs) == 5
     assert sum(tab.attrs.get("aria-selected") == "true" for tab in tabs) == 1
     for tab in tabs:
         assert tab.tag == "button" and tab.text_content().strip()

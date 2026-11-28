@@ -11,7 +11,7 @@
     <div class="auth-card">
       <div class="brand-row">
         <div class="brand-mark">
-          <svg aria-hidden="true" focusable="false" class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
         </div>
         <div>
           <h1>Topic Memory</h1>
@@ -20,7 +20,7 @@
       </div>
       <div id="sso-entry-wrap" class="sso-entry hidden">
         <a href="/api/sso/start" class="btn btn-primary full-width">
-          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           <span>微信扫码一键登录</span>
         </a>
         <div class="divider"><span>或使用访问密钥</span></div>
@@ -38,7 +38,7 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="brand-mark-sm">
-          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
         </div>
         <span class="brand-title">Topic Memory</span>
         <div class="runtime-pills">
@@ -56,7 +56,7 @@
         <a href="/llms.txt" target="_blank" rel="noopener" class="btn btn-ghost btn-sm" title="Agent MCP 接入说明 (llms.txt)">llms.txt</a>
         <span id="user-badge" class="pill pill-green"></span>
         <button id="btn-refresh" class="btn btn-icon" type="button" title="刷新全部数据" aria-label="刷新全部数据">
-          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
         <button id="btn-logout" class="btn btn-ghost btn-sm" type="button">退出</button>
       </div>
@@ -66,7 +66,7 @@
       <aside class="sidebar">
         <div class="sidebar-head">
           <div class="search-wrap">
-            <svg aria-hidden="true" focusable="false" class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <svg aria-hidden="true" focusable="false" class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <label for="topic-search" class="sr-only">搜索主题、ID 或摘要</label>
             <input id="topic-search" type="search" placeholder="搜索主题、ID 或摘要..." />
           </div>
@@ -76,6 +76,23 @@
             <button class="filter-chip" data-filter="largest" type="button" aria-pressed="false">按字数</button>
             <span id="sidebar-count" class="sidebar-count">0</span>
           </div>
+          <button id="btn-topic-create" class="btn btn-ghost btn-sm hidden" type="button" aria-controls="topic-create-form" aria-expanded="false" hidden>+ 新建主题</button>
+          <form id="topic-create-form" class="topic-form topic-create-form hidden" aria-label="新建主题" hidden>
+            <label for="topic-create-id">主题 ID</label>
+            <input id="topic-create-id" name="topic_id" required pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="project-notes" aria-describedby="topic-create-id-help" />
+            <p id="topic-create-id-help" class="muted small">小写字母、数字与连字符，创建后不可修改。</p>
+            <label for="topic-create-name">主题名称</label>
+            <input id="topic-create-name" name="display_name" required />
+            <label for="topic-create-aliases">别名（可选，逗号分隔）</label>
+            <input id="topic-create-aliases" name="aliases" />
+            <label for="topic-create-body">初始正文</label>
+            <textarea id="topic-create-body" name="body" rows="5" required></textarea>
+            <p id="topic-create-status" class="topic-status small hidden" role="status" aria-live="polite" hidden></p>
+            <div class="action-row">
+              <button id="btn-topic-create-submit" class="btn btn-primary btn-sm" type="submit">创建主题</button>
+              <button id="btn-topic-create-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+            </div>
+          </form>
         </div>
         <div id="topic-list" class="topic-list"></div>
       </aside>
@@ -83,20 +100,23 @@
       <section class="content">
         <nav id="studio-tabs" class="tabs" role="tablist" aria-label="记忆工作台">
           <button id="tab-topic" class="tab active" data-tab="topic" type="button" role="tab" aria-selected="true" aria-controls="panel-topic" tabindex="0">
-            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
             <span>记忆与 Dream</span>
           </button>
           <button id="tab-ask" class="tab" data-tab="ask" type="button" role="tab" aria-selected="false" aria-controls="panel-ask" tabindex="-1">
-            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <span>免选主题提问</span>
           </button>
           <button id="tab-logs" class="tab" data-tab="logs" type="button" role="tab" aria-selected="false" aria-controls="panel-logs" tabindex="-1">
-            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <span>运行流水</span>
           </button>
           <button id="tab-keys" class="tab" data-tab="keys" type="button" role="tab" aria-selected="false" aria-controls="panel-keys" tabindex="-1">
-            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="5"/><path d="m11.5 11.5 9-9L23 5l-3 3-2-2-3 3"/></svg>
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="5"/><path d="m11.5 11.5 9-9L23 5l-3 3-2-2-3 3"/></svg>
             <span>接入与密钥</span>
+          </button>
+          <button id="tab-admin" class="tab" data-tab="admin" type="button" role="tab" aria-selected="false" aria-controls="panel-admin" tabindex="-1">
+            <span>Core 与回收站</span>
           </button>
         </nav>
 
@@ -115,8 +135,41 @@
               <button id="btn-toggle-remember" class="btn btn-ghost btn-sm" type="button" aria-controls="remember-drawer" aria-expanded="false" disabled>+ 记一条</button>
               <button id="btn-dream-preview" class="btn btn-purple-outline btn-sm" type="button" disabled>Dream 预览</button>
               <button id="btn-dream-apply" class="btn btn-primary btn-sm" type="button" aria-controls="dream-apply-confirm" aria-expanded="false" disabled>应用 Dream 换版…</button>
+              <button id="btn-topic-bindings" class="btn btn-ghost btn-sm hidden" type="button" aria-controls="topic-bindings-panel" aria-expanded="false" hidden>绑定管理</button>
+              <button id="btn-topic-archive" class="btn btn-ghost btn-sm hidden" type="button" hidden>归档</button>
+              <button id="btn-topic-restore" class="btn btn-ghost btn-sm hidden" type="button" hidden>恢复主题</button>
+              <button id="btn-topic-trash" class="btn btn-danger-outline btn-sm hidden" type="button" aria-controls="topic-trash-confirm" aria-expanded="false" hidden>移至回收站…</button>
             </div>
           </div>
+          <p id="topic-admin-permission" class="permission-note hidden" hidden>主题创建、正文编辑、回滚、绑定与归档管理需要管理权限；当前为只读查看。</p>
+          <p id="topic-admin-status" class="topic-status small hidden" role="status" aria-live="polite" hidden></p>
+          <section id="topic-bindings-panel" class="topic-admin-card hidden" aria-labelledby="topic-bindings-title" hidden>
+            <h3 id="topic-bindings-title">上下文绑定</h3>
+            <ul id="topic-bindings-list" class="topic-bindings-list" aria-label="当前主题上下文绑定"></ul>
+            <form id="topic-bind-form" class="topic-form topic-bind-form">
+              <div class="topic-field">
+                <label for="topic-binding-type">绑定类型</label>
+                <select id="topic-binding-type" name="binding_type">
+                  <option value="chat_id">聊天 ID</option>
+                  <option value="repo_url">仓库 URL</option>
+                  <option value="workspace_path">工作区路径</option>
+                </select>
+              </div>
+              <div class="topic-field topic-field-grow">
+                <label for="topic-binding-value">绑定值</label>
+                <input id="topic-binding-value" name="binding_value" required />
+              </div>
+              <button id="btn-topic-bind" class="btn btn-primary btn-sm" type="submit">添加绑定</button>
+              <p id="topic-binding-status" class="topic-status small hidden" role="status" aria-live="polite" hidden></p>
+            </form>
+          </section>
+          <section id="topic-trash-confirm" class="topic-confirm hidden" aria-labelledby="topic-trash-message" hidden>
+            <p id="topic-trash-message">确认将主题移至回收站？正文和历史保留，可在回收站恢复。</p>
+            <div class="action-row">
+              <button id="btn-topic-trash-confirm" class="btn btn-danger-outline btn-sm" type="button">确认移至回收站</button>
+              <button id="btn-topic-trash-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+            </div>
+          </section>
 
           <div id="dream-apply-confirm" class="dream-confirm hidden" role="region" aria-labelledby="dream-confirm-title" aria-describedby="dream-confirm-description">
             <h3 id="dream-confirm-title">确认 Dream 换版</h3>
@@ -164,9 +217,28 @@
             <div class="toolbar-right">
               <label for="version-select" class="sr-only">查看记忆版本</label>
               <select id="version-select" class="version-select" title="查看历史版本" disabled></select>
+              <button id="btn-topic-edit" class="btn btn-ghost btn-xs hidden" type="button" aria-controls="topic-editor-form" aria-expanded="false" hidden>编辑正文</button>
+              <button id="btn-topic-rollback" class="btn btn-danger-outline btn-xs hidden" type="button" aria-controls="topic-rollback-confirm" aria-expanded="false" hidden>回滚到此版本…</button>
               <button id="btn-copy-body" class="btn btn-ghost btn-xs" type="button" disabled>复制全文</button>
             </div>
           </div>
+          <section id="topic-rollback-confirm" class="topic-confirm hidden" aria-labelledby="topic-rollback-message" hidden>
+            <p id="topic-rollback-message"></p>
+            <div class="action-row">
+              <button id="btn-topic-rollback-confirm" class="btn btn-primary btn-sm" type="button">确认回滚并生成新版本</button>
+              <button id="btn-topic-rollback-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+            </div>
+          </section>
+          <form id="topic-editor-form" class="topic-form topic-admin-card hidden" hidden>
+            <label for="topic-editor-body">主题完整正文（Markdown）</label>
+            <textarea id="topic-editor-body" class="topic-editor-body" name="body" rows="18" required aria-describedby="topic-editor-help"></textarea>
+            <p id="topic-editor-help" class="muted small">保存将生成新版本并保留历史；并发冲突不会覆盖您的草稿。</p>
+            <p id="topic-editor-status" class="topic-status small hidden" role="status" aria-live="polite" hidden></p>
+            <div class="action-row">
+              <button id="btn-topic-save" class="btn btn-primary btn-sm" type="submit">保存修改</button>
+              <button id="btn-topic-edit-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+            </div>
+          </form>
 
           <div id="detail-pretty" class="pretty-body">点击左侧任意主题查看记忆内容。</div>
           <pre id="detail-raw" class="code-box memory-body hidden"></pre>
@@ -391,6 +463,63 @@
             </div>
             <p id="keys-empty" class="muted small hidden">尚未创建 API 密钥。使用上方表单，为第一个 Agent 分配独立权限，再复制接入配置。</p>
             <ul id="key-list" class="key-list" aria-label="API 密钥与权限" aria-busy="false"></ul>
+          </section>
+        </div>
+
+        <!-- Tab 5: Core / WhoAmI and Recycle Bin -->
+        <div id="panel-admin" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-admin" tabindex="0" hidden>
+          <p id="admin-permission-note" class="permission-note hidden" hidden>当前账号仅可阅读 Core / WhoAmI；初始化、编辑、回滚与回收站管理需要管理权限。</p>
+          <section class="admin-card" aria-labelledby="core-heading">
+            <div class="admin-card-head">
+              <div>
+                <h2 id="core-heading">Core / WhoAmI</h2>
+                <p class="muted small">跨主题核心记忆 · 最多 4000 字符，修改会保留历史版本。</p>
+              </div>
+              <div class="action-row">
+                <button id="btn-core-edit" class="btn btn-ghost btn-sm hidden" type="button" aria-controls="core-editor-form" aria-expanded="false" hidden>编辑正文</button>
+                <button id="btn-admin-refresh" class="btn btn-ghost btn-sm" type="button">刷新 Core 与回收站</button>
+              </div>
+            </div>
+            <p id="core-state" class="muted small" role="status" aria-live="polite">打开此页后加载 Core / WhoAmI。</p>
+            <div id="core-meta" class="meta-row"></div>
+            <p id="core-error" class="admin-error hidden" role="alert" hidden></p>
+            <button id="btn-core-initialize" class="btn btn-primary btn-sm hidden" type="button" aria-controls="core-editor-form" aria-expanded="false" hidden>初始化 Core / WhoAmI</button>
+            <form id="core-editor-form" class="admin-editor hidden" hidden>
+              <label for="core-editor-body">Core / WhoAmI 正文</label>
+              <textarea id="core-editor-body" name="body" rows="10" required aria-describedby="core-editor-help core-editor-status"></textarea>
+              <p id="core-editor-help" class="muted small">最多 4000 字符。保存时校验开始编辑时的当前版本；冲突不会丢弃草稿。</p>
+              <p id="core-editor-status" class="small" role="status" aria-live="polite"></p>
+              <div class="action-row">
+                <button id="btn-core-save" class="btn btn-primary btn-sm" type="submit">保存修改</button>
+                <button id="btn-core-edit-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+              </div>
+            </form>
+            <div class="admin-history">
+              <label for="core-version-select">查看 Core 版本</label>
+              <select id="core-version-select" name="core-version" class="version-select" disabled></select>
+              <button id="btn-core-rollback" class="btn btn-purple-outline btn-sm hidden" type="button" aria-controls="core-rollback-confirm" aria-expanded="false" hidden>回滚到此版本</button>
+            </div>
+            <div id="core-rollback-confirm" class="admin-confirm hidden" role="region" aria-labelledby="core-rollback-message" hidden>
+              <p id="core-rollback-message"></p>
+              <div class="action-row">
+                <button id="btn-core-rollback-confirm" class="btn btn-primary btn-sm" type="button">确认回滚 Core / WhoAmI</button>
+                <button id="btn-core-rollback-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
+              </div>
+            </div>
+            <div id="core-body" class="pretty-body core-body" role="region" aria-label="Core / WhoAmI 正文" tabindex="0"></div>
+          </section>
+          <section id="recycle-bin-section" class="admin-card hidden" aria-labelledby="recycle-heading" hidden>
+            <div class="admin-card-head">
+              <div>
+                <h2 id="recycle-heading">回收站</h2>
+                <p class="muted small">恢复会保留移入前的状态；永久删除不可撤销。</p>
+              </div>
+              <span id="recycle-count" class="pill pill-gray">0 个主题</span>
+            </div>
+            <p id="recycle-status" class="muted small" role="status" aria-live="polite"></p>
+            <p id="recycle-error" class="admin-error hidden" role="alert" hidden></p>
+            <p id="recycle-empty" class="muted small hidden" hidden>回收站为空。</p>
+            <ul id="recycle-list" class="recycle-list" aria-label="已移入回收站的主题" aria-busy="false"></ul>
           </section>
         </div>
       </section>

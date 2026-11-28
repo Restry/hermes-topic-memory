@@ -23,6 +23,11 @@
     dreamConfirmTrigger: null,
     dreamReportsRequestId: 0,
     dreamReportsController: null,
+    topicAdmin: {
+      sessionId: 0, scopeId: 0, snapshot: null, selectedVersion: "current", bodyReady: false,
+      editor: null, bindings: null, confirmation: null, busy: false, pending: null,
+    },
+    topicCreate: { requestId: 0, open: false, busy: false, createdId: null },
     activities: {
       page: 0,
       pageSize: 30,
@@ -49,6 +54,27 @@
       revokingKeyId: null,
       revokeError: "",
       client: "hermes",
+    },
+    admin: {
+      sessionId: 0,
+      viewId: 0,
+      requestId: 0,
+      versionRequestId: 0,
+      actionRequestId: 0,
+      controller: null,
+      loading: false,
+      core: null,
+      currentSnapshot: null,
+      currentBody: "",
+      versions: [],
+      selectedVersion: "current",
+      editor: null,
+      rollback: null,
+      coreBusy: false,
+      recycleItems: [],
+      recycleLoaded: false,
+      recycleBusy: null,
+      deleteDraft: null,
     },
   };
 
@@ -288,6 +314,11 @@
 
   function switchTab(name, { focus = false } = {}) {
     if (name !== "topic") clearDreamConfirmation();
+    if (name !== "topic" && name !== state.activeTab) resetTopicAdminView();
+    if (name !== state.activeTab) {
+      state.admin.viewId += 1;
+      cancelAdminReads();
+    }
     state.activeTab = name;
     if (name !== "keys" && !state.keys.revokingKeyId) cancelKeyRevoke({ restoreFocus: false });
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -296,7 +327,7 @@
       tab.setAttribute("aria-selected", String(active));
       tab.tabIndex = active ? 0 : -1;
     });
-    ["topic", "ask", "logs", "keys"].forEach((nameOfPanel) => {
+    ["topic", "ask", "logs", "keys", "admin"].forEach((nameOfPanel) => {
       const panel = $("panel-" + nameOfPanel);
       panel.classList.toggle("hidden", nameOfPanel !== name);
       panel.hidden = nameOfPanel !== name;
@@ -306,9 +337,11 @@
       renderIntegration();
       if (state.role === "admin" && !state.keys.loaded && !state.keys.loading) refreshKeys();
     }
+    if (name === "admin") refreshAdmin();
   }
 
   function updateViewMode(mode) {
+    if (mode !== state.viewMode) resetTopicAdminView();
     state.viewMode = mode;
     $("btn-view-pretty").classList.toggle("active", mode === "pretty");
     $("btn-view-raw").classList.toggle("active", mode === "raw");
@@ -316,13 +349,17 @@
     $("btn-view-raw").setAttribute("aria-pressed", String(mode === "raw"));
     $("detail-pretty").classList.toggle("hidden", mode !== "pretty");
     $("detail-raw").classList.toggle("hidden", mode !== "raw");
+    syncTopicAdminControls();
   }
 
   async function bootstrap() {
+    const sessionId = state.topicAdmin.sessionId;
     let me;
     try {
       me = await api("/api/auth/me");
+      if (sessionId !== state.topicAdmin.sessionId) return;
     } catch (err) {
+      if (sessionId !== state.topicAdmin.sessionId) return;
       showGate();
       $("auth-error").textContent = "无法确认登录状态：" + err.message;
       $("auth-error").classList.remove("hidden");
@@ -345,6 +382,8 @@
 
   function applyAuth(me) {
     clearKeySession();
+    clearAdminSession();
+    clearTopicAdminSession();
     state.authMode = me.mode;
     state.role = ["read", "write", "admin"].includes(me.role) ? me.role : null;
     state.actor = typeof me.actor === "string" ? me.actor : "";
@@ -355,13 +394,15 @@
     $("user-badge").textContent = identity + " · " + (keyRoleLabels[state.role] || "权限未知");
     $("user-badge").title = state.actor;
     syncKeyControls();
+    syncAdminControls();
     updateTopicActions();
     renderIntegration();
   }
 
   function updateTopicActions() {
     const canWrite = state.role === "write" || state.role === "admin";
-    const hasTopic = Boolean(state.selectedId);
+    const selectedTopic = state.topicAdmin.snapshot || state.topics.find((topic) => topic.topic_id === state.selectedId);
+    const hasTopic = Boolean(state.selectedId) && (!selectedTopic || selectedTopic.state !== "archived");
     $("btn-toggle-remember").disabled = !canWrite || !hasTopic || state.rememberBusy;
     $("btn-remember-submit").disabled = !canWrite || !hasTopic || state.rememberBusy;
     $("btn-dream-preview").disabled = !canWrite || !hasTopic || state.dreamBusy;
@@ -374,6 +415,7 @@
     const inlinePrimary = Boolean(state.dreamConfirmTopicId) || !$("remember-drawer").classList.contains("hidden");
     $("btn-dream-apply").classList.toggle("btn-primary", !inlinePrimary);
     $("btn-dream-apply").classList.toggle("btn-ghost", inlinePrimary);
+    syncTopicAdminControls();
   }
 
   function syncKeyControls() {
@@ -859,6 +901,8 @@
     state.keyId = null;
     state.authMode = null;
     clearKeySession();
+    clearAdminSession();
+    clearTopicAdminSession();
     $("app-shell").classList.add("hidden");
     $("auth-gate").classList.remove("hidden");
   }
@@ -868,14 +912,17 @@
     $("app-shell").classList.remove("hidden");
   }
 
-  async function refreshAll() {
+  async function refreshAll({ preferredTopicId = null } = {}) {
     const requestId = ++state.overviewRequestId;
-    const [overview, topicsRes, runtime] = await Promise.all([
+    const sessionId = state.topicAdmin.sessionId;
+    const selectionRequestId = state.topicRequestId;
+    const [overview, topicsRes, runtime, adminTopics] = await Promise.all([
       api("/api/overview"),
       api("/api/v1/topics"),
       api("/api/runtime").catch(() => null),
+      state.role === "admin" ? loadAdminTopicListing() : null,
     ]);
-    if (requestId !== state.overviewRequestId) return false;
+    if (requestId !== state.overviewRequestId || sessionId !== state.topicAdmin.sessionId) return false;
     if (runtime) {
       $("runtime-model-badge").textContent = "模型: " + (runtime.reader_model || "-");
       const endpoint = endpointLabel(runtime.reader_endpoint);
@@ -889,7 +936,10 @@
     }
     const ov = overview.overview || overview;
     const kpis = ov.kpis || ov;
-    const topics = topicsRes.topics || [];
+    const bindingsById = new Map((topicsRes.topics || []).map((topic) => [topic.topic_id, topic]));
+    const topics = adminTopics ? adminTopics.map((topic) => ({
+      ...bindingsById.get(topic.topic_id), ...topic, state: topic.status || topic.state,
+    })) : topicsRes.topics || [];
     state.topics = topics;
     renderKeyTopicOptions();
     state.charsMap = {};
@@ -908,11 +958,13 @@
       : String(totalChars);
 
     renderTopicList();
-    const nextTopic = topics.find((topic) => topic.topic_id === state.selectedId) || topics[0];
+    if (selectionRequestId !== state.topicRequestId) return false;
+    const nextTopic = topics.find((topic) => topic.topic_id === (preferredTopicId || state.selectedId)) || topics[0];
     if (!nextTopic) {
       state.selectedId = null;
       state.currentBody = "";
       state.topicRequestId += 1;
+      resetTopicAdminView({ preserveScope: true });
       clearDreamConfirmation();
       $("dream-box").classList.add("hidden");
       $("remember-drawer").classList.add("hidden");
@@ -928,13 +980,14 @@
       $("btn-copy-body").disabled = true;
       updateTopicActions();
     }
-    const [detailReady, logsReady, reportsReady, keysReady] = await Promise.all([
-      nextTopic ? selectTopic(nextTopic.topic_id) : true,
+    const [detailReady, logsReady, reportsReady, keysReady, adminReady] = await Promise.all([
+      nextTopic ? selectTopic(nextTopic.topic_id, { preserveTopicAdmin: true }) : true,
       refreshLogs(),
       $("dream-reports-view").open ? refreshDreamReports() : true,
       state.activeTab === "keys" && state.role === "admin" ? refreshKeys() : true,
+      state.activeTab === "admin" ? refreshAdmin() : true,
     ]);
-    return requestId === state.overviewRequestId && runtime !== null && detailReady && logsReady && reportsReady && keysReady;
+    return requestId === state.overviewRequestId && runtime !== null && detailReady && logsReady && reportsReady && keysReady && adminReady;
   }
 
   function renderTopicList() {
@@ -990,9 +1043,14 @@
     }
   }
 
-  async function selectTopic(topicId) {
+  async function selectTopic(topicId, { preserveTopicAdmin = false } = {}) {
     const requestId = ++state.topicRequestId;
     const changed = state.selectedId !== topicId;
+    const sessionId = state.topicAdmin.sessionId;
+    if (changed || !preserveTopicAdmin) resetTopicAdminView({ preserveScope: preserveTopicAdmin });
+    state.topicAdmin.snapshot = null;
+    state.topicAdmin.bodyReady = false;
+    state.topicAdmin.selectedVersion = "current";
     state.selectedId = topicId;
     state.currentBody = "";
     clearDreamConfirmation();
@@ -1028,12 +1086,24 @@
     $("detail-pretty").textContent = "加载中...";
     $("detail-raw").textContent = "加载中...";
     try {
-      const [bodyRes, versRes] = await Promise.all([
+      const [bodyRes, versRes, detailRes] = await Promise.all([
         api("/api/topics/" + encodeURIComponent(topicId) + "/body"),
         api("/api/topics/" + encodeURIComponent(topicId) + "/versions?page_size=20").catch(() => null),
+        api("/api/topics/" + encodeURIComponent(topicId)),
       ]);
-      if (requestId !== state.topicRequestId || state.selectedId !== topicId) return false;
+      if (sessionId !== state.topicAdmin.sessionId || requestId !== state.topicRequestId || state.selectedId !== topicId) return false;
       state.currentBody = bodyRes.body || "";
+      const detail = detailRes.topic;
+      if (!detail || detail.version !== bodyRes.version || detail.content_fingerprint !== bodyRes.fingerprint) {
+        throw new Error("主题在读取时发生变化，请刷新重试；草稿不会覆盖最新正文");
+      }
+      state.topicAdmin.snapshot = { ...detail, fingerprint: bodyRes.fingerprint, body: state.currentBody };
+      state.topicAdmin.bodyReady = true;
+      vPill.textContent = "v" + bodyRes.version;
+      $("detail-title").textContent = detail.display_name || topicId;
+      $("detail-summary").textContent = detail.summary || (topic && topic.summary) || "暂无目录摘要";
+      meta.appendChild(makePill(detail.state === "archived" ? "已归档" : "活跃", detail.state === "archived" ? "pill-amber" : "pill-green"));
+      renderTopicBindings();
       renderPrettyMarkdown($("detail-pretty"), state.currentBody);
       $("detail-raw").textContent = state.currentBody;
       $("btn-copy-body").disabled = false;
@@ -1042,11 +1112,11 @@
       const sel = $("version-select");
       const currentOpt = document.createElement("option");
       currentOpt.value = "current";
-      currentOpt.textContent = "当前版本 v" + (topic ? topic.version : 1);
+      currentOpt.textContent = "当前版本 v" + bodyRes.version;
       sel.appendChild(currentOpt);
       if (versRes) {
         for (const version of versRes.items || []) {
-          if (topic && version.version === topic.version) continue;
+          if (version.version === bodyRes.version) continue;
           const opt = document.createElement("option");
           opt.value = String(version.version);
           opt.textContent = "历史快照 v" + version.version;
@@ -1057,15 +1127,372 @@
       }
       sel.title = versRes ? "查看历史版本" : "历史版本加载失败，请刷新全部数据重试";
       sel.disabled = sel.options.length <= 1;
+      syncTopicAdminControls();
       return Boolean(versRes);
     } catch (err) {
-      if (requestId !== state.topicRequestId || state.selectedId !== topicId) return false;
+      if (sessionId !== state.topicAdmin.sessionId || requestId !== state.topicRequestId || state.selectedId !== topicId) return false;
       $("detail-pretty").textContent = "读取失败: " + err.message + "。请刷新全部数据重试。";
       $("detail-raw").textContent = $("detail-pretty").textContent;
+      state.topicAdmin.snapshot = null;
+      state.topicAdmin.bodyReady = false;
+      topicAdminStatus("topic-admin-status", err.message, true);
       return false;
     } finally {
       if (requestId === state.topicRequestId) $("panel-topic").setAttribute("aria-busy", "false");
+      updateTopicActions();
     }
+  }
+
+  function topicAdminVisibility(id, visible) {
+    $(id).hidden = !visible;
+    $(id).classList.toggle("hidden", !visible);
+  }
+
+  function topicAdminStatus(id, message = "", error = false, retry = null) {
+    const node = $(id);
+    clearNode(node);
+    node.setAttribute("role", error ? "alert" : "status");
+    node.classList.toggle("error-text", error);
+    if (message) node.appendChild(document.createTextNode(message));
+    if (retry) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn btn-ghost btn-xs";
+      button.textContent = "重试刷新（不重复提交）";
+      button.addEventListener("click", retry);
+      node.appendChild(button);
+    }
+    topicAdminVisibility(id, Boolean(message));
+  }
+
+  function resetTopicAdminView({ preserveScope = false } = {}) {
+    const admin = state.topicAdmin;
+    if (!preserveScope) {
+      admin.scopeId += 1;
+      admin.busy = false;
+      admin.pending = null;
+    }
+    admin.editor = null;
+    admin.bindings = null;
+    admin.confirmation = null;
+    $("topic-editor-body").value = "";
+    $("topic-bind-form").reset();
+    for (const id of ["topic-admin-status", "topic-editor-status", "topic-binding-status"]) topicAdminStatus(id);
+    syncTopicAdminControls();
+  }
+
+  function clearTopicAdminSession() {
+    state.topicAdmin.sessionId += 1;
+    state.overviewRequestId += 1;
+    state.topicRequestId += 1;
+    state.topicAdmin.snapshot = null;
+    state.topicAdmin.bodyReady = false;
+    state.topicAdmin.selectedVersion = "current";
+    resetTopicAdminView();
+    state.topicCreate.requestId += 1;
+    state.topicCreate.open = false;
+    state.topicCreate.busy = false;
+    state.topicCreate.createdId = null;
+    $("topic-create-form").reset();
+    topicAdminStatus("topic-create-status");
+    syncTopicAdminControls();
+  }
+
+  function syncTopicAdminControls() {
+    const admin = state.topicAdmin;
+    const canAdmin = state.role === "admin";
+    const ready = canAdmin && Boolean(state.selectedId && admin.snapshot);
+    const current = admin.selectedVersion === "current";
+    const active = ready && admin.snapshot.state === "active";
+    const busy = admin.busy || Boolean(admin.pending) || state.topicCreate.busy || state.dreamBusy || state.rememberBusy;
+    topicAdminVisibility("btn-topic-create", canAdmin);
+    $("btn-topic-create").disabled = busy;
+    $("btn-topic-create").setAttribute("aria-expanded", String(canAdmin && state.topicCreate.open));
+    topicAdminVisibility("topic-create-form", canAdmin && state.topicCreate.open);
+    for (const node of $("topic-create-form").querySelectorAll("input, textarea, button[type=submit]")) node.disabled = !canAdmin || busy || Boolean(state.topicCreate.createdId);
+    $("btn-topic-create-cancel").disabled = !canAdmin || state.topicCreate.busy;
+    topicAdminVisibility("topic-admin-permission", Boolean(state.role) && !canAdmin);
+    for (const id of ["btn-topic-bindings", "btn-topic-trash", "btn-topic-edit"]) topicAdminVisibility(id, canAdmin && Boolean(state.selectedId));
+    topicAdminVisibility("btn-topic-archive", ready && active);
+    topicAdminVisibility("btn-topic-restore", ready && admin.snapshot.state === "archived");
+    topicAdminVisibility("btn-topic-rollback", active && !current && admin.bodyReady);
+    for (const id of ["btn-topic-bindings", "btn-topic-archive", "btn-topic-restore", "btn-topic-trash"]) $(id).disabled = !ready || busy;
+    $("btn-topic-edit").disabled = !active || !current || !admin.bodyReady || busy || Boolean(admin.editor);
+    $("btn-topic-edit").title = ready && !active ? "请先恢复已归档主题再编辑" : "编辑完整 Markdown 正文";
+    $("btn-topic-rollback").disabled = !active || current || !admin.bodyReady || busy;
+    const editing = canAdmin && Boolean(admin.editor);
+    topicAdminVisibility("topic-editor-form", editing);
+    $("btn-topic-edit").setAttribute("aria-expanded", String(editing));
+    $("topic-editor-body").disabled = !canAdmin;
+    $("topic-editor-body").readOnly = admin.busy || Boolean(admin.pending);
+    $("btn-topic-save").disabled = !active || !editing || busy;
+    const bindings = ready && Boolean(admin.bindings);
+    topicAdminVisibility("topic-bindings-panel", bindings);
+    $("btn-topic-bindings").setAttribute("aria-expanded", String(bindings));
+    for (const node of $("topic-bind-form").querySelectorAll("input, select, button[type=submit]")) node.disabled = !active || busy;
+    for (const kind of ["rollback", "trash"]) {
+      const visible = canAdmin && Boolean(admin.confirmation && admin.confirmation.kind === kind);
+      topicAdminVisibility("topic-" + kind + "-confirm", visible);
+      $("btn-topic-" + kind).setAttribute("aria-expanded", String(visible));
+      $("btn-topic-" + kind + "-confirm").disabled = !ready || !visible || busy || (kind === "rollback" && !active);
+    }
+    $("topic-editor-form").setAttribute("aria-busy", String(admin.busy));
+    $("topic-bind-form").setAttribute("aria-busy", String(admin.busy));
+    $("topic-create-form").setAttribute("aria-busy", String(state.topicCreate.busy));
+    topicAdminVisibility("detail-pretty", !editing && state.viewMode === "pretty");
+    topicAdminVisibility("detail-raw", !editing && state.viewMode === "raw");
+  }
+
+  async function loadAdminTopicListing() {
+    if (state.role !== "admin") return null;
+    const sessionId = state.topicAdmin.sessionId;
+    const items = [];
+    let page = 1;
+    while (true) {
+      if (state.role !== "admin" || sessionId !== state.topicAdmin.sessionId) return null;
+      const result = await api("/api/topics?page=" + page + "&page_size=100");
+      if (state.role !== "admin" || sessionId !== state.topicAdmin.sessionId) return null;
+      items.push(...(result.items || []));
+      if (items.length >= result.total || !(result.items || []).length) return items;
+      page += 1;
+    }
+  }
+
+  function topicAdminBaseline(snapshot = state.topicAdmin.snapshot) {
+    if (!snapshot || snapshot.topic_id !== state.selectedId || !Number.isInteger(snapshot.version)
+        || snapshot.version < 1 || !/^[a-f0-9]{64}$/.test(snapshot.fingerprint || snapshot.content_fingerprint || "")) return null;
+    return { topicId: snapshot.topic_id, expected_version: snapshot.version,
+      expected_fingerprint: snapshot.fingerprint || snapshot.content_fingerprint };
+  }
+
+  function renderTopicBindings() {
+    const list = $("topic-bindings-list");
+    clearNode(list);
+    const topic = state.topicAdmin.snapshot || state.topics.find((item) => item.topic_id === state.selectedId) || {};
+    for (const [key, label] of [["chat_ids", "聊天 ID"], ["repo_urls", "仓库 URL"], ["workspace_paths", "工作区路径"]]) {
+      const values = topic[key] || [];
+      const item = document.createElement("li");
+      const heading = document.createElement("strong");
+      heading.textContent = label + "（" + values.length + "）";
+      item.appendChild(heading);
+      if (!values.length) item.appendChild(document.createTextNode(" 暂无绑定"));
+      for (const value of values) {
+        const code = document.createElement("code");
+        code.textContent = value;
+        item.appendChild(code);
+      }
+      list.appendChild(item);
+    }
+  }
+
+  function topicMutationCurrent(operation) {
+    return state.role === "admin" && operation.sessionId === state.topicAdmin.sessionId
+      && operation.scopeId === state.topicAdmin.scopeId;
+  }
+
+  async function finishTopicMutation(operation) {
+    if (!topicMutationCurrent(operation) || state.topicAdmin.busy) return;
+    state.topicAdmin.busy = true;
+    syncTopicAdminControls();
+    try {
+      const refreshed = await refreshAll({ preferredTopicId: operation.kind === "trash" ? null : operation.topicId });
+      if (!topicMutationCurrent(operation)) return;
+      if (!refreshed) throw new Error("部分数据未能刷新，请重试刷新；不要重复提交");
+      if (operation.kind === "trash") {
+        if (state.topics.some((topic) => topic.topic_id === operation.topicId)) throw new Error("回收站状态尚未确认，请重试刷新");
+      } else {
+        const snapshot = state.topicAdmin.snapshot;
+        if (!snapshot || snapshot.topic_id !== operation.topicId || (operation.version && snapshot.version < operation.version)) throw new Error("最新版本尚未读回，请重试刷新");
+      }
+      state.topicAdmin.pending = null;
+      state.topicAdmin.busy = false;
+      resetTopicAdminView({ preserveScope: true });
+      topicAdminStatus("topic-admin-status", operation.message + (operation.kind === "trash" ? "" : " · 当前 v" + state.topicAdmin.snapshot.version));
+    } catch (err) {
+      if (!topicMutationCurrent(operation)) return;
+      topicAdminStatus("topic-admin-status", "操作已提交，但最新状态读取失败：" + err.message, true, () => finishTopicMutation(operation));
+      if (err.status === 401) showGate();
+    } finally {
+      if (topicMutationCurrent(operation)) { state.topicAdmin.busy = false; syncTopicAdminControls(); }
+    }
+  }
+
+  async function submitTopicMutation(kind, baseline, extra = {}, statusId = "topic-admin-status") {
+    if (state.role !== "admin" || state.topicAdmin.busy || state.topicAdmin.pending || state.topicCreate.busy || state.dreamBusy || state.rememberBusy || !baseline || baseline.topicId !== state.selectedId) return;
+    const snapshot = state.topicAdmin.snapshot;
+    if (!snapshot || (["replace", "rollback", "bind", "archive"].includes(kind) && snapshot.state !== "active") || (kind === "restore" && snapshot.state !== "archived")) return;
+    const operation = { kind, topicId: baseline.topicId, sessionId: state.topicAdmin.sessionId,
+      scopeId: state.topicAdmin.scopeId, message: { replace: "正文已保存", rollback: "回滚已生成新版本", bind: "绑定已添加", archive: "主题已归档", restore: "主题已恢复", trash: "主题已移至回收站" }[kind] };
+    state.topicAdmin.busy = true;
+    syncTopicAdminControls();
+    topicAdminStatus(statusId, "正在提交…");
+    try {
+      if (state.role !== "admin" || !topicMutationCurrent(operation)) return;
+      const payload = { expected_version: baseline.expected_version, expected_fingerprint: baseline.expected_fingerprint, ...extra };
+      const path = kind === "bind" ? "/api/v1/topics/bind" : "/api/topics/" + encodeURIComponent(baseline.topicId) + "/" + kind;
+      const result = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (!topicMutationCurrent(operation)) return;
+      operation.version = result.topic && result.topic.version;
+      state.topicAdmin.pending = operation;
+      state.topicAdmin.busy = false;
+      topicAdminStatus(statusId, "操作已提交，正在读取最新状态…");
+      await finishTopicMutation(operation);
+    } catch (err) {
+      if (!topicMutationCurrent(operation)) return;
+      topicAdminStatus(statusId, err.status === 409
+        ? "并发冲突：主题已被修改。草稿和确认基线已保留；请先复制草稿，再取消并重新打开以读取最新版本。"
+        : "提交失败：" + err.message, true);
+      if (err.status === 401) showGate();
+    } finally {
+      if (topicMutationCurrent(operation)) { state.topicAdmin.busy = false; syncTopicAdminControls(); }
+    }
+  }
+
+  function cancelTopicCreate({ focus = true } = {}) {
+    if (state.topicCreate.busy) return;
+    state.topicCreate.requestId += 1;
+    state.topicCreate.open = false;
+    state.topicCreate.busy = false;
+    state.topicCreate.createdId = null;
+    $("topic-create-form").reset();
+    topicAdminStatus("topic-create-status");
+    syncTopicAdminControls();
+    if (focus) $("btn-topic-create").focus();
+  }
+
+  async function finishTopicCreate(requestId, sessionId, topicId) {
+    const current = () => state.role === "admin" && requestId === state.topicCreate.requestId && sessionId === state.topicAdmin.sessionId;
+    if (!current() || state.topicCreate.busy) return;
+    state.topicCreate.busy = true;
+    syncTopicAdminControls();
+    try {
+      if (!await refreshAll({ preferredTopicId: topicId })) throw new Error("部分数据未能刷新");
+      if (!current()) return;
+      if (state.selectedId !== topicId || !state.topicAdmin.snapshot) throw new Error("新主题尚未读回");
+      state.topicCreate.busy = false;
+      cancelTopicCreate();
+      topicAdminStatus("topic-admin-status", "主题已创建 · 当前 v" + state.topicAdmin.snapshot.version);
+    } catch (err) {
+      if (!current()) return;
+      topicAdminStatus("topic-create-status", "主题已创建，但刷新失败：" + err.message + "。不要重复创建。", true, () => finishTopicCreate(requestId, sessionId, topicId));
+      if (err.status === 401) showGate();
+    } finally {
+      if (current()) { state.topicCreate.busy = false; syncTopicAdminControls(); }
+    }
+  }
+
+  $("btn-topic-create").addEventListener("click", () => {
+    if (state.role !== "admin" || state.topicCreate.busy || state.topicAdmin.busy || state.topicAdmin.pending) return;
+    if (state.topicCreate.open) { cancelTopicCreate(); return; }
+    state.topicCreate.open = true;
+    syncTopicAdminControls();
+    $("topic-create-id").focus();
+  });
+  $("btn-topic-create-cancel").addEventListener("click", () => cancelTopicCreate());
+  $("topic-create-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state.role !== "admin" || !state.topicCreate.open || state.topicCreate.busy || state.topicCreate.createdId || state.topicAdmin.busy || state.topicAdmin.pending || state.dreamBusy || state.rememberBusy) return;
+    if (!$("topic-create-form").reportValidity()) return;
+    const topicId = $("topic-create-id").value.trim();
+    const displayName = $("topic-create-name").value.trim();
+    const body = $("topic-create-body").value;
+    if (!topicId || !displayName || !body.trim()) { topicAdminStatus("topic-create-status", "请填写主题 ID、名称和初始正文。", true); return; }
+    const requestId = ++state.topicCreate.requestId;
+    const sessionId = state.topicAdmin.sessionId;
+    const selectionRequestId = state.topicRequestId;
+    state.topicCreate.busy = true;
+    syncTopicAdminControls();
+    topicAdminStatus("topic-create-status", "正在创建…");
+    try {
+      if (state.role !== "admin") return;
+      await api("/api/topics", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+        topic_id: topicId, display_name: displayName,
+        aliases: $("topic-create-aliases").value.split(/[,，]/).map((alias) => alias.trim()).filter(Boolean), body,
+      }) });
+      if (state.role !== "admin" || sessionId !== state.topicAdmin.sessionId || requestId !== state.topicCreate.requestId) return;
+      state.topicCreate.createdId = topicId;
+      state.topicCreate.busy = false;
+      if (selectionRequestId !== state.topicRequestId) {
+        topicAdminStatus("topic-create-status", "主题已创建；当前选择已变化，请刷新后查看新主题。", false, () => finishTopicCreate(requestId, sessionId, topicId));
+        return;
+      }
+      await finishTopicCreate(requestId, sessionId, topicId);
+    } catch (err) {
+      if (sessionId !== state.topicAdmin.sessionId || requestId !== state.topicCreate.requestId) return;
+      topicAdminStatus("topic-create-status", err.status === 409 ? "主题 ID 或名称冲突；请修改后重试，输入已保留。" : "创建失败：" + err.message, true);
+      if (err.status === 401) showGate();
+    } finally {
+      if (sessionId === state.topicAdmin.sessionId && requestId === state.topicCreate.requestId) { state.topicCreate.busy = false; syncTopicAdminControls(); }
+    }
+  });
+
+  $("btn-topic-edit").addEventListener("click", () => {
+    if (state.role !== "admin" || state.topicAdmin.busy || state.topicAdmin.pending || state.topicAdmin.selectedVersion !== "current" || !state.topicAdmin.bodyReady || !state.topicAdmin.snapshot || state.topicAdmin.snapshot.state !== "active") return;
+    const baseline = topicAdminBaseline();
+    if (!baseline) return;
+    resetTopicAdminView();
+    state.topicAdmin.editor = baseline;
+    $("topic-editor-body").value = state.topicAdmin.snapshot.body;
+    syncTopicAdminControls();
+    $("topic-editor-body").focus();
+  });
+  $("btn-topic-edit-cancel").addEventListener("click", () => { resetTopicAdminView(); $("btn-topic-edit").focus(); });
+  $("topic-editor-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.role !== "admin" || !state.topicAdmin.editor) return;
+    const body = $("topic-editor-body").value;
+    if (!body.trim()) { topicAdminStatus("topic-editor-status", "正文不能为空。", true); return; }
+    submitTopicMutation("replace", state.topicAdmin.editor, { body }, "topic-editor-status");
+  });
+  $("btn-topic-bindings").addEventListener("click", () => {
+    if (state.role !== "admin" || state.topicAdmin.busy || state.topicAdmin.pending) return;
+    if (state.topicAdmin.bindings) { resetTopicAdminView(); return; }
+    const baseline = topicAdminBaseline();
+    if (!baseline) return;
+    resetTopicAdminView();
+    state.topicAdmin.bindings = baseline;
+    renderTopicBindings();
+    if (state.topicAdmin.snapshot.state === "archived") topicAdminStatus("topic-binding-status", "已归档主题仅可查看绑定；恢复主题后可添加绑定。");
+    syncTopicAdminControls();
+    $("topic-bindings-title").tabIndex = -1;
+    $("topic-bindings-title").focus();
+  });
+  $("topic-bind-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.role !== "admin" || !state.topicAdmin.bindings || !state.topicAdmin.snapshot || state.topicAdmin.snapshot.state !== "active") return;
+    const type = $("topic-binding-type").value;
+    const value = $("topic-binding-value").value.trim();
+    if (!["chat_id", "repo_url", "workspace_path"].includes(type) || !value) { topicAdminStatus("topic-binding-status", "请选择绑定类型并填写绑定值。", true); return; }
+    submitTopicMutation("bind", state.topicAdmin.bindings, { topic: state.topicAdmin.bindings.topicId, [type]: value }, "topic-binding-status");
+  });
+  for (const kind of ["rollback", "trash"]) {
+    $("btn-topic-" + kind).addEventListener("click", () => {
+      if (state.role !== "admin" || state.topicAdmin.busy || state.topicAdmin.pending) return;
+      const baseline = topicAdminBaseline();
+      if (!baseline || (kind === "rollback" && (state.topicAdmin.selectedVersion === "current" || !state.topicAdmin.bodyReady || state.topicAdmin.snapshot.state !== "active"))) return;
+      const targetVersion = Number(state.topicAdmin.selectedVersion);
+      resetTopicAdminView();
+      state.topicAdmin.confirmation = { kind, baseline, targetVersion };
+      if (kind === "rollback") $("topic-rollback-message").textContent = "确认将主题回滚至 v" + targetVersion + "？将生成新版本，历史保留";
+      else $("topic-trash-message").textContent = "确认将主题「" + (state.topicAdmin.snapshot.display_name || baseline.topicId) + "」移至回收站？正文和历史保留，可在回收站恢复。";
+      syncTopicAdminControls();
+      $("btn-topic-" + kind + "-confirm").focus();
+    });
+    $("btn-topic-" + kind + "-cancel").addEventListener("click", () => { resetTopicAdminView(); $("btn-topic-" + kind).focus(); });
+    $("btn-topic-" + kind + "-confirm").addEventListener("click", () => {
+      if (state.role !== "admin") return;
+      const confirmation = state.topicAdmin.confirmation;
+      if (!confirmation || confirmation.kind !== kind) return;
+      submitTopicMutation(kind, confirmation.baseline, kind === "rollback" ? { target_version: confirmation.targetVersion } : {});
+    });
+  }
+  for (const kind of ["archive", "restore"]) {
+    $("btn-topic-" + kind).addEventListener("click", () => {
+      if (state.role !== "admin") return;
+      const snapshot = state.topicAdmin.snapshot;
+      if (!snapshot || snapshot.state !== (kind === "archive" ? "active" : "archived")) return;
+      submitTopicMutation(kind, topicAdminBaseline());
+    });
   }
 
   function requestDreamApply(triggerId) {
@@ -1392,27 +1819,630 @@
     }
   }
 
+  function setAdminHidden(id, hidden) {
+    $(id).classList.toggle("hidden", hidden);
+    $(id).hidden = hidden;
+  }
+
+  function adminViewCurrent(sessionId, viewId) {
+    return sessionId === state.admin.sessionId && viewId === state.admin.viewId
+      && state.activeTab === "admin" && ["read", "write", "admin"].includes(state.role);
+  }
+
+  function cancelAdminReads() {
+    const admin = state.admin;
+    admin.requestId += 1;
+    admin.versionRequestId += 1;
+    admin.actionRequestId += 1;
+    if (admin.controller) admin.controller.abort();
+    admin.controller = null;
+    admin.loading = false;
+    if (admin.editor && admin.editor.pending) admin.editor = null;
+    if (admin.rollback && admin.rollback.pending) admin.rollback = null;
+    $("recycle-list").setAttribute("aria-busy", "false");
+    syncAdminControls();
+  }
+
+  function clearAdminSession() {
+    const admin = state.admin;
+    admin.sessionId += 1;
+    admin.viewId += 1;
+    cancelAdminReads();
+    admin.core = null;
+    admin.currentSnapshot = null;
+    admin.currentBody = "";
+    admin.versions = [];
+    admin.selectedVersion = "current";
+    admin.editor = null;
+    admin.rollback = null;
+    admin.coreBusy = false;
+    admin.recycleItems = [];
+    admin.recycleLoaded = false;
+    admin.recycleBusy = null;
+    admin.deleteDraft = null;
+    for (const id of ["core-body", "core-meta", "core-version-select", "recycle-list"]) clearNode($(id));
+    $("core-editor-form").reset();
+    $("core-editor-status").textContent = "";
+    $("core-rollback-message").textContent = "";
+    $("core-state").textContent = "打开此页后加载 Core / WhoAmI。";
+    $("recycle-status").textContent = "";
+    $("recycle-count").textContent = "0 个主题";
+    setAdminError("core-error", "");
+    setAdminError("recycle-error", "");
+    syncAdminControls();
+  }
+
+  function syncAdminControls() {
+    const admin = state.admin;
+    const canManage = state.role === "admin";
+    const present = Boolean(admin.core && admin.core.present);
+    const busy = admin.loading || admin.coreBusy || Boolean(admin.recycleBusy);
+    setAdminHidden("admin-permission-note", canManage);
+    setAdminHidden("recycle-bin-section", !canManage);
+    setAdminHidden("btn-core-initialize", !canManage || !admin.core || present || Boolean(admin.editor));
+    setAdminHidden("btn-core-edit", !canManage || !present || Boolean(admin.editor));
+    setAdminHidden("core-editor-form", !canManage || !admin.editor);
+    setAdminHidden("core-body", Boolean(canManage && admin.editor));
+    setAdminHidden("btn-core-rollback", !canManage || !present || admin.selectedVersion === "current" || Boolean(admin.editor));
+    setAdminHidden("core-rollback-confirm", !canManage || !admin.rollback);
+    setAdminHidden("recycle-empty", !canManage || !admin.recycleLoaded || admin.recycleItems.length > 0);
+    $("btn-admin-refresh").disabled = busy;
+    $("btn-core-initialize").disabled = busy;
+    $("btn-core-edit").disabled = busy;
+    $("core-editor-body").disabled = admin.coreBusy || Boolean(admin.editor && admin.editor.pending);
+    $("btn-core-save").disabled = !canManage || busy || !admin.editor || admin.editor.pending;
+    $("btn-core-save").textContent = admin.coreBusy ? "正在保存…" : admin.editor && admin.editor.mode === "initialize" ? "初始化 Core / WhoAmI" : "保存修改";
+    $("btn-core-edit-cancel").disabled = admin.coreBusy;
+    $("core-version-select").disabled = busy || Boolean(admin.editor) || admin.versions.length <= 1;
+    $("btn-core-rollback").disabled = busy;
+    $("btn-core-rollback-confirm").disabled = !canManage || busy || !admin.rollback || admin.rollback.pending;
+    $("btn-core-rollback-cancel").disabled = admin.coreBusy;
+    $("btn-core-edit").setAttribute("aria-expanded", String(Boolean(canManage && admin.editor && admin.editor.mode === "replace")));
+    $("btn-core-initialize").setAttribute("aria-expanded", String(Boolean(canManage && admin.editor && admin.editor.mode === "initialize")));
+    $("btn-core-rollback").setAttribute("aria-expanded", String(Boolean(canManage && admin.rollback)));
+    for (const button of $("recycle-list").querySelectorAll("button")) button.disabled = !canManage || busy;
+    for (const input of $("recycle-list").querySelectorAll("input")) input.disabled = !canManage || Boolean(admin.recycleBusy);
+    const confirm = $("recycle-list").querySelector("[data-recycle-delete-confirm]");
+    if (confirm) confirm.disabled = !canManage || busy || !admin.deleteDraft || admin.deleteDraft.name !== admin.deleteDraft.item.display_name;
+  }
+
+  function setAdminError(id, message) {
+    $(id).textContent = message;
+    setAdminHidden(id, !message);
+  }
+
+  function adminOperationError(err, resource) {
+    if (err.status === 409) return resource + "已被其他操作修改，或确认信息不匹配。草稿与原始校验信息已保留；请取消草稿、刷新最新状态后重新确认。";
+    if (err.status === 403) return "当前账号没有此操作权限，请使用管理账号。";
+    if (err.status === 404) return resource + "已不存在或状态发生变化。请刷新后重试。";
+    if (err.status === 400) return "提交内容无效，请检查正文不超过 4000 字符及确认名称完全一致。";
+    return err.message + "。操作结果尚未确认；请刷新当前状态后再重试。";
+  }
+
+  async function readCoreSnapshot(signal) {
+    const response = await api("/api/core-memory", { signal });
+    const core = response.core_memory;
+    if (!core || typeof core.present !== "boolean") throw new Error("Core 状态无法读取");
+    if (!core.present) return { core, body: null, versions: [] };
+    const [body, firstPage] = await Promise.all([
+      api("/api/core-memory/body", { signal }),
+      api("/api/core-memory/versions?page_size=100", { signal }),
+    ]);
+    const versions = (firstPage.items || []).slice();
+    for (let page = 2; versions.length < firstPage.total; page += 1) {
+      const next = await api("/api/core-memory/versions?page_size=100&page=" + page, { signal });
+      if (!(next.items || []).length) break;
+      versions.push(...next.items);
+    }
+    return { core, body, versions };
+  }
+
+  function coreCharacterCount(body) {
+    let count = 0;
+    // Match Python's codepoint count without copying the body into an array.
+    for (let index = 0; index < body.length; count += 1) {
+      index += body.codePointAt(index) > 0xffff ? 2 : 1;
+    }
+    return count;
+  }
+
+  function renderCoreSnapshot(snapshot) {
+    const admin = state.admin;
+    admin.core = snapshot.core;
+    admin.currentSnapshot = snapshot.body ? { version: snapshot.body.version, fingerprint: snapshot.body.fingerprint } : null;
+    admin.currentBody = snapshot.body ? snapshot.body.body || "" : "";
+    admin.versions = snapshot.versions;
+    const meta = $("core-meta");
+    clearNode(meta);
+    clearNode($("core-version-select"));
+    if (!snapshot.core.present) {
+      admin.selectedVersion = "current";
+      $("core-state").textContent = state.role === "admin" ? "Core / WhoAmI 尚未初始化。填写初始正文即可启用。" : "Core / WhoAmI 尚未初始化，请联系管理员。";
+      $("core-body").textContent = "尚无核心记忆。";
+      return;
+    }
+    const version = snapshot.body.version;
+    $("core-state").textContent = "当前版本 v" + version + " · " + coreCharacterCount(admin.currentBody) + " / 4000 字符";
+    meta.appendChild(makePill("v" + version, "pill-blue"));
+    if (snapshot.core.updated_at) meta.appendChild(makeTimestamp(snapshot.core.updated_at));
+    const current = document.createElement("option");
+    current.value = "current";
+    current.textContent = "当前版本 v" + version;
+    $("core-version-select").appendChild(current);
+    for (const item of snapshot.versions) {
+      if (item.version === version) continue;
+      const option = document.createElement("option");
+      option.value = String(item.version);
+      option.textContent = "历史快照 v" + item.version;
+      $("core-version-select").appendChild(option);
+    }
+    if (!snapshot.versions.some((item) => String(item.version) === admin.selectedVersion)) admin.selectedVersion = "current";
+    $("core-version-select").value = admin.selectedVersion;
+    if (admin.selectedVersion === "current") renderPrettyMarkdown($("core-body"), admin.currentBody);
+  }
+
+  async function refreshAdmin() {
+    const admin = state.admin;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    if (!adminViewCurrent(sessionId, viewId)) return true;
+    if (admin.coreBusy || admin.recycleBusy) return true;
+    if (admin.controller) admin.controller.abort();
+    const controller = new AbortController();
+    admin.controller = controller;
+    const requestId = ++admin.requestId;
+    admin.loading = true;
+    const current = () => requestId === admin.requestId && adminViewCurrent(sessionId, viewId);
+    $("core-state").textContent = "正在读取 Core / WhoAmI…";
+    $("recycle-status").textContent = state.role === "admin" ? "正在读取回收站…" : "";
+    $("recycle-list").setAttribute("aria-busy", String(state.role === "admin"));
+    syncAdminControls();
+    const coreTask = (async () => {
+      try {
+        const snapshot = await readCoreSnapshot(controller.signal);
+        if (!current()) return false;
+        renderCoreSnapshot(snapshot);
+        setAdminError("core-error", "");
+        if (admin.selectedVersion !== "current" && !admin.editor) return await selectCoreVersion(admin.selectedVersion, { preserveRollback: true }) && current();
+        return current();
+      } catch (err) {
+        if (!current() || err.name === "AbortError") return false;
+        $("core-state").textContent = admin.core && admin.core.present ? "保留上次读取内容；最新状态读取失败。" : "Core / WhoAmI 暂不可用。";
+        setAdminError("core-error", "读取 Core 失败：" + err.message + "。请刷新重试。");
+        return false;
+      }
+    })();
+    const recycleTask = state.role === "admin" ? (async () => {
+      try {
+        const response = await api("/api/recycle-bin", { signal: controller.signal });
+        if (!current() || state.role !== "admin") return false;
+        admin.recycleItems = response.items || [];
+        admin.recycleLoaded = true;
+        renderRecycleList();
+        $("recycle-status").textContent = "恢复与删除均校验本次列表的移入时间。";
+        setAdminError("recycle-error", "");
+        return true;
+      } catch (err) {
+        if (!current() || err.name === "AbortError") return false;
+        $("recycle-status").textContent = admin.recycleLoaded ? "保留上次读取的列表。" : "";
+        setAdminError("recycle-error", "读取回收站失败：" + err.message + "。请刷新重试。");
+        return false;
+      }
+    })() : Promise.resolve(true);
+    try {
+      const ready = await Promise.all([coreTask, recycleTask]);
+      return current() && ready.every(Boolean);
+    } finally {
+      if (current()) {
+        admin.loading = false;
+        admin.controller = null;
+        $("recycle-list").setAttribute("aria-busy", "false");
+        syncAdminControls();
+      }
+    }
+  }
+
+  async function beginCoreEdit(mode) {
+    const admin = state.admin;
+    if (state.role !== "admin" || state.activeTab !== "admin" || admin.loading || admin.coreBusy || admin.recycleBusy || admin.editor) return;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    const requestId = ++admin.actionRequestId;
+    admin.rollback = null;
+    admin.editor = { mode, baseline: null, pending: mode === "replace" };
+    $("core-editor-body").value = "";
+    $("core-editor-status").textContent = mode === "replace" ? "正在读取当前正文与校验版本…" : "填写初始 Core / WhoAmI 正文。";
+    setAdminError("core-error", "");
+    syncAdminControls();
+    if (mode === "replace") {
+      try {
+        const body = await api("/api/core-memory/body");
+        if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.actionRequestId || !admin.editor) return;
+        admin.editor.baseline = { version: body.version, fingerprint: body.fingerprint };
+        admin.editor.pending = false;
+        admin.currentSnapshot = admin.editor.baseline;
+        admin.currentBody = body.body || "";
+        admin.selectedVersion = "current";
+        $("core-version-select").value = "current";
+        $("core-editor-body").value = admin.currentBody;
+        $("core-editor-status").textContent = "编辑基于当前 v" + body.version + "，保存会生成新版本。";
+      } catch (err) {
+        if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.actionRequestId) return;
+        admin.editor = null;
+        setAdminError("core-error", "读取编辑版本失败：" + err.message + "。请刷新重试。");
+      }
+      syncAdminControls();
+    }
+    if (admin.editor && adminViewCurrent(sessionId, viewId)) $("core-editor-body").focus();
+  }
+
+  function cancelCoreEdit({ restoreFocus = true } = {}) {
+    if (state.admin.coreBusy) return;
+    const mode = state.admin.editor && state.admin.editor.mode;
+    state.admin.actionRequestId += 1;
+    state.admin.editor = null;
+    $("core-editor-form").reset();
+    $("core-editor-status").textContent = "";
+    renderPrettyMarkdown($("core-body"), state.admin.currentBody);
+    syncAdminControls();
+    if (restoreFocus && state.activeTab === "admin") $(mode === "initialize" ? "btn-core-initialize" : "btn-core-edit").focus();
+  }
+
+  async function selectCoreVersion(value, { preserveRollback = false } = {}) {
+    const admin = state.admin;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    if (!adminViewCurrent(sessionId, viewId) || admin.editor || admin.coreBusy) return false;
+    const requestId = ++admin.versionRequestId;
+    admin.selectedVersion = value;
+    if (!preserveRollback) {
+      admin.actionRequestId += 1;
+      admin.rollback = null;
+    }
+    setAdminError("core-error", "");
+    syncAdminControls();
+    if (value === "current") {
+      renderPrettyMarkdown($("core-body"), admin.currentBody);
+      return true;
+    }
+    $("core-body").textContent = "正在读取历史快照 v" + value + "…";
+    try {
+      const body = await api("/api/core-memory/versions/" + encodeURIComponent(value) + "/body");
+      if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.versionRequestId || admin.selectedVersion !== value || admin.editor) return false;
+      renderPrettyMarkdown($("core-body"), body.body || "");
+      return true;
+    } catch (err) {
+      if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.versionRequestId || admin.selectedVersion !== value || admin.editor) return false;
+      $("core-body").textContent = "历史快照读取失败。";
+      setAdminError("core-error", err.message + "。请重新选择版本或刷新重试。");
+      return false;
+    }
+  }
+
+  function cancelCoreRollback({ restoreFocus = true } = {}) {
+    if (state.admin.coreBusy) return;
+    state.admin.actionRequestId += 1;
+    state.admin.rollback = null;
+    $("core-rollback-message").textContent = "";
+    syncAdminControls();
+    if (restoreFocus && state.activeTab === "admin") $("btn-core-rollback").focus();
+  }
+
+  async function beginCoreRollback() {
+    const admin = state.admin;
+    if (state.role !== "admin" || state.activeTab !== "admin" || admin.loading || admin.coreBusy || admin.editor || admin.selectedVersion === "current") return;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    const requestId = ++admin.actionRequestId;
+    const targetVersion = Number(admin.selectedVersion);
+    admin.rollback = { targetVersion, baseline: null, pending: true };
+    $("core-rollback-message").textContent = "正在读取当前版本的回滚校验信息…";
+    syncAdminControls();
+    try {
+      const body = await api("/api/core-memory/body");
+      if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.actionRequestId || !admin.rollback) return;
+      admin.rollback.baseline = { version: body.version, fingerprint: body.fingerprint };
+      admin.rollback.pending = false;
+      $("core-rollback-message").textContent = "确认将 Core / WhoAmI 从当前 v" + body.version + " 回滚至 v" + targetVersion + "？将生成新版本，历史保留。";
+      syncAdminControls();
+      $("btn-core-rollback-confirm").focus();
+    } catch (err) {
+      if (!adminViewCurrent(sessionId, viewId) || requestId !== admin.actionRequestId) return;
+      admin.rollback = null;
+      setAdminError("core-error", "读取回滚版本失败：" + err.message + "。请刷新重试。");
+      syncAdminControls();
+    }
+  }
+
+  async function mutateCore(action, payload) {
+    const admin = state.admin;
+    if (state.role !== "admin" || state.activeTab !== "admin" || admin.coreBusy || admin.loading || admin.recycleBusy) return;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    admin.coreBusy = true;
+    setAdminError("core-error", "");
+    syncAdminControls();
+    try {
+      await api("/api/core-memory/" + action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (sessionId !== admin.sessionId || state.role !== "admin") return;
+      admin.coreBusy = false;
+      admin.selectedVersion = "current";
+      if (adminViewCurrent(sessionId, viewId)) {
+        cancelCoreEdit({ restoreFocus: false });
+        cancelCoreRollback({ restoreFocus: false });
+      } else {
+        admin.editor = null;
+        admin.rollback = null;
+        admin.actionRequestId += 1;
+      }
+      if (adminViewCurrent(sessionId, viewId)) {
+        const ready = await refreshAdmin();
+        if (adminViewCurrent(sessionId, viewId)) {
+          if (ready) toast(action === "initialize" ? "Core / WhoAmI 已初始化" : action === "rollback" ? "Core / WhoAmI 已回滚并保留历史" : "Core / WhoAmI 已保存新版本");
+          else setAdminError("core-error", "操作已提交，最新状态读取失败。请刷新确认结果，不要重复提交。");
+        }
+      }
+    } catch (err) {
+      if (adminViewCurrent(sessionId, viewId)) setAdminError("core-error", adminOperationError(err, "Core / WhoAmI"));
+    } finally {
+      if (sessionId === admin.sessionId) {
+        admin.coreBusy = false;
+        syncAdminControls();
+        if (viewId !== admin.viewId && state.activeTab === "admin") refreshAdmin();
+      }
+    }
+  }
+
+  function saveCoreEdit() {
+    const admin = state.admin;
+    if (state.role !== "admin" || !admin.editor || admin.editor.pending || admin.coreBusy) return;
+    const body = $("core-editor-body").value;
+    if (!body.trim() || coreCharacterCount(body) > 4000) {
+      setAdminError("core-error", "请填写正文，且不要超过 4000 字符。草稿已保留。");
+      return;
+    }
+    const editor = admin.editor;
+    const payload = { body };
+    if (editor.mode === "replace") {
+      if (!editor.baseline) return;
+      payload.expected_version = editor.baseline.version;
+      payload.expected_fingerprint = editor.baseline.fingerprint;
+    }
+    mutateCore(editor.mode, payload);
+  }
+
+  function confirmCoreRollback() {
+    const rollback = state.admin.rollback;
+    if (state.role !== "admin" || !rollback || rollback.pending || !rollback.baseline) return;
+    mutateCore("rollback", {
+      target_version: rollback.targetVersion,
+      expected_version: rollback.baseline.version,
+      expected_fingerprint: rollback.baseline.fingerprint,
+      confirmation: "Core / WhoAmI",
+    });
+  }
+
+  function renderRecycleList() {
+    const admin = state.admin;
+    const list = $("recycle-list");
+    clearNode(list);
+    if (state.role !== "admin") return;
+    $("recycle-count").textContent = admin.recycleItems.length + " 个主题";
+    for (const item of admin.recycleItems) {
+      const row = document.createElement("li");
+      row.className = "recycle-entry";
+      const head = document.createElement("div");
+      head.className = "recycle-entry-head";
+      const title = document.createElement("h3");
+      title.textContent = item.display_name;
+      head.appendChild(title);
+      head.appendChild(makePill(item.topic_id, "pill-mono"));
+      row.appendChild(head);
+      const metadata = document.createElement("p");
+      metadata.className = "recycle-metadata small";
+      const prior = item.prior_state === "archived" ? "已归档" : "活跃";
+      metadata.appendChild(document.createTextNode("移入前状态：" + prior + "（" + item.prior_state + "） · 移入时间："));
+      metadata.appendChild(makeTimestamp(item.trashed_at));
+      row.appendChild(metadata);
+      const actions = document.createElement("div");
+      actions.className = "action-row";
+      const restore = document.createElement("button");
+      restore.type = "button";
+      restore.className = "btn btn-ghost btn-sm";
+      restore.textContent = admin.recycleBusy && admin.recycleBusy.topicId === item.topic_id && admin.recycleBusy.action === "restore" ? "正在恢复…" : "恢复";
+      restore.setAttribute("data-recycle-restore", item.topic_id);
+      restore.addEventListener("click", () => mutateRecycle(item, "restore"));
+      actions.appendChild(restore);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn btn-danger-outline btn-sm";
+      remove.textContent = "永久删除…";
+      remove.setAttribute("data-recycle-delete", item.topic_id);
+      const formId = "recycle-delete-form-" + encodeURIComponent(item.topic_id);
+      remove.setAttribute("aria-controls", formId);
+      const confirming = Boolean(admin.deleteDraft && admin.deleteDraft.item.topic_id === item.topic_id);
+      remove.setAttribute("aria-expanded", String(confirming));
+      remove.addEventListener("click", () => {
+        if (state.role !== "admin" || admin.recycleBusy || admin.loading) return;
+        if (!admin.deleteDraft || admin.deleteDraft.item.topic_id !== item.topic_id) admin.deleteDraft = { item: { ...item }, name: "", error: "" };
+        renderRecycleList();
+        $("recycle-delete-name-" + encodeURIComponent(item.topic_id)).focus();
+      });
+      actions.appendChild(remove);
+      row.appendChild(actions);
+      const form = document.createElement("form");
+      form.id = formId;
+      form.className = "admin-confirm recycle-delete-confirm";
+      form.classList.toggle("hidden", !confirming);
+      form.hidden = !confirming;
+      if (confirming) {
+        const draft = admin.deleteDraft;
+        const description = document.createElement("p");
+        description.textContent = "永久删除不可撤销。请输入完整显示名称「" + draft.item.display_name + "」确认（不是主题 ID）。";
+        form.appendChild(description);
+        const inputId = "recycle-delete-name-" + encodeURIComponent(item.topic_id);
+        const label = document.createElement("label");
+        label.htmlFor = inputId;
+        label.textContent = "确认删除的主题显示名称";
+        form.appendChild(label);
+        const input = document.createElement("input");
+        input.id = inputId;
+        input.type = "text";
+        input.required = true;
+        input.autocomplete = "off";
+        input.value = draft.name;
+        input.addEventListener("input", () => {
+          if (admin.deleteDraft !== draft) return;
+          draft.name = input.value;
+          syncAdminControls();
+        });
+        form.appendChild(input);
+        if (draft.error) {
+          const error = document.createElement("p");
+          error.className = "admin-error";
+          error.setAttribute("role", "alert");
+          error.textContent = draft.error;
+          form.appendChild(error);
+        }
+        const controls = document.createElement("div");
+        controls.className = "action-row";
+        const confirm = document.createElement("button");
+        confirm.type = "submit";
+        confirm.className = "btn btn-danger-outline btn-sm";
+        confirm.textContent = "确认永久删除";
+        confirm.setAttribute("data-recycle-delete-confirm", item.topic_id);
+        controls.appendChild(confirm);
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "btn btn-ghost btn-sm";
+        cancel.textContent = "取消";
+        cancel.addEventListener("click", () => {
+          if (admin.recycleBusy) return;
+          admin.deleteDraft = null;
+          renderRecycleList();
+          for (const trigger of list.querySelectorAll("[data-recycle-delete]")) {
+            if (trigger.getAttribute("data-recycle-delete") === item.topic_id) {
+              trigger.focus();
+              break;
+            }
+          }
+        });
+        controls.appendChild(cancel);
+        form.appendChild(controls);
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          if (state.role !== "admin" || admin.deleteDraft !== draft || draft.name !== draft.item.display_name) return;
+          mutateRecycle(draft.item, "delete", draft.name);
+        });
+      }
+      row.appendChild(form);
+      list.appendChild(row);
+    }
+    syncAdminControls();
+  }
+
+  async function mutateRecycle(item, action, confirmation) {
+    const admin = state.admin;
+    if (state.role !== "admin" || state.activeTab !== "admin" || admin.recycleBusy || admin.coreBusy || admin.loading) return;
+    if (action === "delete" && confirmation !== item.display_name) return;
+    const sessionId = admin.sessionId;
+    const viewId = admin.viewId;
+    const selectionBefore = state.selectedId;
+    const selectionRequestId = state.topicRequestId;
+    admin.recycleBusy = { topicId: item.topic_id, action };
+    const payload = { trashed_at: item.trashed_at };
+    if (action === "delete") payload.confirmation = confirmation;
+    let committed = false;
+    setAdminError("recycle-error", "");
+    renderRecycleList();
+    try {
+      await api("/api/recycle-bin/" + encodeURIComponent(item.topic_id) + "/" + action, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      if (sessionId !== admin.sessionId || state.role !== "admin") return;
+      committed = true;
+      admin.recycleItems = admin.recycleItems.filter((entry) => entry.topic_id !== item.topic_id);
+      if (admin.deleteDraft && admin.deleteDraft.item.topic_id === item.topic_id) admin.deleteDraft = null;
+      let ready = true;
+      if (action === "restore") {
+        const preferredTopicId = adminViewCurrent(sessionId, viewId) && state.selectedId === selectionBefore && selectionRequestId === state.topicRequestId ? item.topic_id : null;
+        ready = await refreshAll({ preferredTopicId });
+        if (sessionId !== admin.sessionId || state.role !== "admin") return;
+      }
+      admin.recycleBusy = null;
+      if (adminViewCurrent(sessionId, viewId)) {
+        const adminReady = await refreshAdmin();
+        if (!adminViewCurrent(sessionId, viewId)) return;
+        if (ready && adminReady) toast(action === "restore" ? "主题已恢复，目录与概览已刷新" : "主题已永久删除");
+        else setAdminError("recycle-error", "操作已提交，但部分读回失败。请刷新确认最新状态，不要重复提交。");
+      }
+    } catch (err) {
+      if (!adminViewCurrent(sessionId, viewId)) return;
+      const message = committed ? "操作已提交，但目录读回失败。请刷新确认最新状态，不要重复提交。" : adminOperationError(err, "回收站主题");
+      if (!committed && action === "delete" && admin.deleteDraft && admin.deleteDraft.item.topic_id === item.topic_id) admin.deleteDraft.error = message;
+      setAdminError("recycle-error", message);
+    } finally {
+      if (sessionId === admin.sessionId) {
+        admin.recycleBusy = null;
+        if (adminViewCurrent(sessionId, viewId)) renderRecycleList();
+        else if (state.activeTab === "admin") refreshAdmin();
+        syncAdminControls();
+      }
+    }
+  }
+
   // Event wiring
+  $("btn-admin-refresh").addEventListener("click", refreshAdmin);
+  $("btn-core-initialize").addEventListener("click", () => beginCoreEdit("initialize"));
+  $("btn-core-edit").addEventListener("click", () => beginCoreEdit("replace"));
+  $("core-editor-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveCoreEdit();
+  });
+  $("btn-core-edit-cancel").addEventListener("click", () => cancelCoreEdit());
+  $("core-version-select").addEventListener("change", (event) => selectCoreVersion(event.target.value));
+  $("btn-core-rollback").addEventListener("click", beginCoreRollback);
+  $("btn-core-rollback-confirm").addEventListener("click", confirmCoreRollback);
+  $("btn-core-rollback-cancel").addEventListener("click", () => cancelCoreRollback());
+  $("core-editor-form").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !state.admin.coreBusy) {
+      event.preventDefault();
+      cancelCoreEdit();
+    }
+  });
+  $("core-rollback-confirm").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !state.admin.coreBusy) {
+      event.preventDefault();
+      cancelCoreRollback();
+    }
+  });
   $("toast-close").addEventListener("click", dismissToast);
   $("token-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    $("auth-error").classList.add("hidden");
     const button = e.currentTarget.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    clearTopicAdminSession();
+    const sessionId = state.topicAdmin.sessionId;
+    let accepted = false;
+    state.role = null;
+    syncTopicAdminControls();
+    $("auth-error").classList.add("hidden");
     button.disabled = true;
     state.token = ($("token-input").value || "").trim();
     try {
       const me = await api("/api/auth/me");
+      if (sessionId !== state.topicAdmin.sessionId) return;
       if (!me.authenticated) throw new Error("密钥未获授权，请检查后重试");
       applyAuth(me);
+      accepted = true;
       $("token-input").value = "";
       showShell();
     } catch (err) {
+      if (sessionId !== state.topicAdmin.sessionId) return;
       state.token = "";
       $("auth-error").textContent = "密钥校验失败：" + err.message;
       $("auth-error").classList.remove("hidden");
       return;
     } finally {
-      button.disabled = false;
+      if (accepted || sessionId === state.topicAdmin.sessionId) button.disabled = false;
     }
     try {
       if (!await refreshAll()) toast("部分数据未能加载，请查看错误提示并刷新重试", { error: true });
@@ -1430,6 +2460,8 @@
     state.authMode = null;
     $("token-input").value = "";
     clearKeySession();
+    clearAdminSession();
+    clearTopicAdminSession();
     if (mode === "sso") {
       try { await api("/api/sso/logout", { method: "POST" }); } catch (_) {}
     }
@@ -1476,31 +2508,46 @@
     const val = e.target.value;
     const topicId = state.selectedId;
     if (!topicId) return;
+    resetTopicAdminView();
+    state.topicAdmin.selectedVersion = val;
+    state.topicAdmin.bodyReady = false;
+    syncTopicAdminControls();
     if (val === "current") {
       await selectTopic(topicId);
       return;
     }
     const requestId = ++state.topicRequestId;
+    const sessionId = state.topicAdmin.sessionId;
     state.currentBody = "";
     $("btn-copy-body").disabled = true;
     $("detail-pretty").textContent = "正在读取历史快照…";
     $("detail-raw").textContent = "正在读取历史快照…";
     $("panel-topic").setAttribute("aria-busy", "true");
     try {
-      const res = await api("/api/topics/" + encodeURIComponent(topicId) + "/versions/" + encodeURIComponent(val) + "/body");
-      if (requestId !== state.topicRequestId || state.selectedId !== topicId) return;
+      const [res, detailRes] = await Promise.all([
+        api("/api/topics/" + encodeURIComponent(topicId) + "/versions/" + encodeURIComponent(val) + "/body"),
+        api("/api/topics/" + encodeURIComponent(topicId)),
+      ]);
+      if (sessionId !== state.topicAdmin.sessionId || requestId !== state.topicRequestId || state.selectedId !== topicId || state.topicAdmin.selectedVersion !== val) return;
+      if (!detailRes.topic || !topicAdminBaseline(detailRes.topic)) throw new Error("当前主题校验信息无法读取，请刷新重试");
+      state.topicAdmin.snapshot = detailRes.topic;
+      $("detail-version-pill").textContent = "当前 v" + detailRes.topic.version + " · 查看 v" + val;
+      renderTopicBindings();
       state.currentBody = res.body || "";
+      state.topicAdmin.bodyReady = true;
+      updateTopicActions();
       renderPrettyMarkdown($("detail-pretty"), state.currentBody);
       $("detail-raw").textContent = state.currentBody;
       $("btn-copy-body").disabled = false;
       toast("正在查看历史快照 v" + val);
     } catch (err) {
-      if (requestId !== state.topicRequestId || state.selectedId !== topicId) return;
+      if (sessionId !== state.topicAdmin.sessionId || requestId !== state.topicRequestId || state.selectedId !== topicId) return;
       $("detail-pretty").textContent = "读取历史版本失败: " + err.message + "。可切回当前版本或刷新重试。";
       $("detail-raw").textContent = $("detail-pretty").textContent;
       toast("读取历史版本失败: " + err.message, { error: true });
     } finally {
       if (requestId === state.topicRequestId) $("panel-topic").setAttribute("aria-busy", "false");
+      syncTopicAdminControls();
     }
   });
 

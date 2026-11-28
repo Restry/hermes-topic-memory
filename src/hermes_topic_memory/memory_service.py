@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -71,7 +72,14 @@ _TOOL_DEFINITIONS = (
     (
         "bind_topic",
         "Bind a chat, repository, or workspace to an active topic by name or alias.",
-        {"topic": _TEXT, "chat_id": _TEXT, "repo_url": _TEXT, "workspace_path": _TEXT},
+        {
+            "topic": _TEXT,
+            "chat_id": _TEXT,
+            "repo_url": _TEXT,
+            "workspace_path": _TEXT,
+            "expected_version": {"type": "integer", "minimum": 1},
+            "expected_fingerprint": {**_TEXT, "pattern": "^[0-9a-f]{64}$"},
+        },
         ("topic",),
     ),
     (
@@ -200,6 +208,8 @@ class MemoryService:
                     ]
                 }
             if name == "bind_topic":
+                if ("expected_version" in arguments) != ("expected_fingerprint" in arguments):
+                    raise MemoryServiceError("invalid_request", "Both binding preconditions are required.")
                 topic_id = self._registry().resolve_name(arguments["topic"])
                 require_topic(principal, topic_id)
                 topic = self.admin.bind_context(
@@ -207,6 +217,8 @@ class MemoryService:
                     chat_id=arguments.get("chat_id"),
                     repo_url=arguments.get("repo_url"),
                     workspace_path=arguments.get("workspace_path"),
+                    expected_version=arguments.get("expected_version"),
+                    expected_fingerprint=arguments.get("expected_fingerprint"),
                 )
                 return {"topic": self._topic_dict(topic)}
             if name == "remember":
@@ -255,6 +267,8 @@ class MemoryService:
         except TopicAdminError as error:
             if error.code == "topic_not_found":
                 raise MemoryServiceError("topic_not_found", "Topic not found.", 404) from None
+            if error.code == "concurrent_update":
+                raise MemoryServiceError("concurrent_update", "Topic changed; reload before binding.", 409) from None
             raise MemoryServiceError("invalid_request", "Topic operation could not be completed.") from None
         except (ValueError, TypeError):
             raise MemoryServiceError("invalid_request", "Invalid tool arguments.") from None
@@ -580,5 +594,11 @@ def _validate_arguments(value: Any, properties: dict[str, Any], required: tuple[
             if not isinstance(item, bool):
                 raise MemoryServiceError("invalid_request", "Invalid tool arguments.")
             continue
+        if schema.get("type") == "integer":
+            if isinstance(item, bool) or not isinstance(item, int) or item < schema.get("minimum", 1):
+                raise MemoryServiceError("invalid_request", "Invalid tool arguments.")
+            continue
         if not isinstance(item, str) or not item.strip() or len(item) > schema.get("maxLength", 2_000_000):
+            raise MemoryServiceError("invalid_request", "Invalid tool arguments.")
+        if "pattern" in schema and not re.fullmatch(schema["pattern"], item):
             raise MemoryServiceError("invalid_request", "Invalid tool arguments.")

@@ -1125,6 +1125,13 @@ class PanelApplication:
         except KeyError as error:
             raise _ResourceNotFound from error
         metadata = memory.metadata
+        config = next(
+            (item for item in TopicRegistry.from_file(self.data_root / "topic-registry.json").topics
+             if item.topic_id == topic_id and item.state != "trashed"),
+            None,
+        )
+        if config is None:
+            raise _ResourceNotFound
         source_relative_path = _safe_relative_path(metadata.source_relative_path)
         return {
             "topic_id": metadata.topic_id,
@@ -1136,6 +1143,10 @@ class PanelApplication:
             "updated_at": metadata.updated_at,
             "source_policy": metadata.source_policy,
             "state": metadata.state,
+            "summary": config.summary,
+            "chat_ids": list(config.chat_ids),
+            "repo_urls": list(config.repo_urls),
+            "workspace_paths": list(config.workspace_paths),
             "source_relative_path": source_relative_path,
             "source_sha256": metadata.source_sha256,
             "source_bytes": metadata.source_bytes,

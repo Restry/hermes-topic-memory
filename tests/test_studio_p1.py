@@ -36,8 +36,8 @@ def _client_section(script: str, client: str) -> str:
 
 def test_keys_is_the_fourth_accessible_studio_tab(studio_dom: _StudioDom, studio_assets: dict[str, str]) -> None:
     tabs = [node for node in studio_dom.ids["studio-tabs"].descendants() if node.attrs.get("role") == "tab"]
-    assert [node.attrs.get("data-tab") for node in tabs] == ["topic", "ask", "logs", "keys"]
-    tab = tabs[-1]
+    assert [node.attrs.get("data-tab") for node in tabs] == ["topic", "ask", "logs", "keys", "admin"]
+    tab = tabs[3]
     assert tab.attrs.get("id") == "tab-keys"
     assert tab.attrs.get("type") == "button"
     assert tab.text_content().strip() == "接入与密钥"
@@ -48,7 +48,7 @@ def test_keys_is_the_fourth_accessible_studio_tab(studio_dom: _StudioDom, studio
     assert panel.attrs.get("aria-labelledby") == "tab-keys"
     assert panel.attrs.get("tabindex") == "0" and "hidden" in panel.attrs
     switch = _function(studio_assets["app.js"], "switchTab")
-    assert '["topic", "ask", "logs", "keys"]' in switch
+    assert '["topic", "ask", "logs", "keys", "admin"]' in switch
     assert "panel.hidden = nameOfPanel !== name" in switch
     assert 'if (name === "keys")' in switch and "renderIntegration()" in switch
 

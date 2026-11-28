@@ -144,9 +144,13 @@ class TopicAdminService:
         chat_id: str | None = None,
         repo_url: str | None = None,
         workspace_path: str | None = None,
+        expected_version: int | None = None,
+        expected_fingerprint: str | None = None,
     ) -> TopicConfig:
         """Add context bindings idempotently under the data-root mutation lock."""
         self._validate_topic_id(topic_id)
+        if (expected_version is None) != (expected_fingerprint is None):
+            raise ValueError("both binding preconditions are required")
         if chat_id is None and repo_url is None and workspace_path is None:
             raise ValueError("at least one context binding is required")
         contexts = self._normalize_contexts(
@@ -155,7 +159,13 @@ class TopicAdminService:
             (workspace_path,) if workspace_path is not None else None,
         )
         with self._locked():
-            return self._update_context_locked(topic_id, contexts, append=True)
+            return self._update_context_locked(
+                topic_id,
+                contexts,
+                append=True,
+                expected_version=expected_version,
+                expected_fingerprint=expected_fingerprint,
+            )
 
     def update_summary(self, topic_id: str, summary: str) -> TopicConfig:
         """Persist a short one-line catalog summary for a topic."""
@@ -194,38 +204,59 @@ class TopicAdminService:
             return result
 
     def _update_context_locked(
-        self, topic_id: str, contexts: dict[str, tuple[str, ...]], *, append: bool
+        self,
+        topic_id: str,
+        contexts: dict[str, tuple[str, ...]],
+        *,
+        append: bool,
+        expected_version: int | None = None,
+        expected_fingerprint: str | None = None,
     ) -> TopicConfig:
         registry = self._load_registry()
         item = self._registered_item(registry, topic_id)
         self._require_state(item, ("active",))
-        current = self.store.get_topic(topic_id)
-        candidate = self._copy_json(registry)
-        updated = self._registered_item(candidate, topic_id)
-        existing = next(
-            config for config in TopicRegistry.from_dict(registry).topics
-            if config.topic_id == topic_id
-        )
-        for field, values in contexts.items():
-            prior = getattr(existing, field) if append else ()
-            updated[field] = list(dict.fromkeys((*prior, *values)))
-        self._validate_registry(candidate)
-        result = next(
-            config for config in TopicRegistry.from_dict(candidate).topics
-            if config.topic_id == topic_id
-        )
-        if candidate == registry:
-            return result
-        with self._transaction((self._registry_path, self._operations_audit_path)):
-            self._write_registry(candidate)
-            self._failpoint("after_registry_write")
-            self._append_operation_audit(
-                "bind_context" if append else "update_context",
-                topic_id,
-                current.metadata.version,
-                current.metadata.state,
+        if expected_version is not None and (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 1
+            or not isinstance(expected_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
+        ):
+            raise ValueError("invalid binding preconditions")
+        # Keep Remember/Dream writes behind the same lock until bindings commit.
+        with self.store._lock(topic_id, require_existing=True):
+            current = self.store._read_unlocked(topic_id)
+            if expected_version is not None and (
+                current.metadata.version != expected_version
+                or current.metadata.content_fingerprint != expected_fingerprint
+            ):
+                raise TopicAdminError("concurrent_update", "topic no longer matches binding preconditions")
+            candidate = self._copy_json(registry)
+            updated = self._registered_item(candidate, topic_id)
+            existing = next(
+                config for config in TopicRegistry.from_dict(registry).topics
+                if config.topic_id == topic_id
             )
-        return result
+            for field, values in contexts.items():
+                prior = getattr(existing, field) if append else ()
+                updated[field] = list(dict.fromkeys((*prior, *values)))
+            self._validate_registry(candidate)
+            result = next(
+                config for config in TopicRegistry.from_dict(candidate).topics
+                if config.topic_id == topic_id
+            )
+            if candidate == registry:
+                return result
+            with self._transaction((self._registry_path, self._operations_audit_path)):
+                self._write_registry(candidate)
+                self._failpoint("after_registry_write")
+                self._append_operation_audit(
+                    "bind_context" if append else "update_context",
+                    topic_id,
+                    current.metadata.version,
+                    current.metadata.state,
+                )
+            return result
 
     @staticmethod
     def _normalize_contexts(
