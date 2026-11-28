@@ -17,7 +17,7 @@ class McpProtocol:
     def __init__(self, service: MemoryService) -> None:
         self.service = service
 
-    def dispatch(self, body: bytes) -> tuple[int, dict[str, Any] | None]:
+    def dispatch(self, body: bytes, *, actor: str = "anonymous") -> tuple[int, dict[str, Any] | None]:
         try:
             request = json.loads(body.decode("utf-8"), parse_constant=_reject_constant)
         except (UnicodeDecodeError, ValueError, RecursionError):
@@ -48,7 +48,7 @@ class McpProtocol:
                 return 202, None
             return 200, _error(request_id, -32600, "Expected a notification")
         try:
-            result = self._method(method, params)
+            result = self._method(method, params, actor=actor)
         except _ProtocolError as error:
             return (202, None) if notification else (200, _error(request_id, error.code, str(error)))
         except Exception:
@@ -57,7 +57,7 @@ class McpProtocol:
             return 202, None
         return 200, {"jsonrpc": "2.0", "id": request_id, "result": result}
 
-    def _method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _method(self, method: str, params: dict[str, Any], *, actor: str = "anonymous") -> dict[str, Any]:
         if method == "initialize":
             version = params.get("protocolVersion", DEFAULT_PROTOCOL_VERSION)
             if (
@@ -84,7 +84,7 @@ class McpProtocol:
             ):
                 raise _ProtocolError(-32602, "Invalid params")
             try:
-                value = self.service.call(params["name"], params.get("arguments", {}), source="mcp")
+                value = self.service.call(params["name"], params.get("arguments", {}), source="mcp", actor=actor)
             except MemoryServiceError as error:
                 if error.code in {"invalid_request", "unknown_tool"}:
                     raise _ProtocolError(-32602, "Invalid params") from None

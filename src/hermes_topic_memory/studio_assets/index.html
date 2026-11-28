@@ -11,7 +11,7 @@
     <div class="auth-card">
       <div class="brand-row">
         <div class="brand-mark">
-          <svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
         </div>
         <div>
           <h1>Topic Memory</h1>
@@ -20,16 +20,17 @@
       </div>
       <div id="sso-entry-wrap" class="sso-entry hidden">
         <a href="/api/sso/start" class="btn btn-primary full-width">
-          <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           <span>微信扫码一键登录</span>
         </a>
         <div class="divider"><span>或使用访问密钥</span></div>
       </div>
       <form id="token-form" class="token-form">
+        <label for="token-input" class="sr-only">访问密钥</label>
         <input id="token-input" type="password" placeholder="输入 Bearer Token" autocomplete="off" required />
         <button type="submit" class="btn btn-ghost full-width">密钥进入</button>
       </form>
-      <p id="auth-error" class="error-text hidden"></p>
+      <p id="auth-error" class="error-text hidden" role="alert"></p>
     </div>
   </div>
 
@@ -37,7 +38,7 @@
     <header class="topbar">
       <div class="topbar-left">
         <div class="brand-mark-sm">
-          <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
         </div>
         <span class="brand-title">Topic Memory</span>
         <div class="runtime-pills">
@@ -54,8 +55,8 @@
       <div class="topbar-right">
         <a href="/llms.txt" target="_blank" rel="noopener" class="btn btn-ghost btn-sm" title="Agent MCP 接入说明 (llms.txt)">llms.txt</a>
         <span id="user-badge" class="pill pill-green"></span>
-        <button id="btn-refresh" class="btn btn-icon" type="button" title="刷新全部数据">
-          <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        <button id="btn-refresh" class="btn btn-icon" type="button" title="刷新全部数据" aria-label="刷新全部数据">
+          <svg aria-hidden="true" focusable="false" class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
         <button id="btn-logout" class="btn btn-ghost btn-sm" type="button">退出</button>
       </div>
@@ -65,13 +66,14 @@
       <aside class="sidebar">
         <div class="sidebar-head">
           <div class="search-wrap">
-            <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <svg aria-hidden="true" focusable="false" class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <label for="topic-search" class="sr-only">搜索主题、ID 或摘要</label>
             <input id="topic-search" type="search" placeholder="搜索主题、ID 或摘要..." />
           </div>
           <div class="filter-bar">
-            <button class="filter-chip active" data-filter="all" type="button">全部</button>
-            <button class="filter-chip" data-filter="bound" type="button">已绑群</button>
-            <button class="filter-chip" data-filter="largest" type="button">按字数</button>
+            <button class="filter-chip active" data-filter="all" type="button" aria-pressed="true">全部</button>
+            <button class="filter-chip" data-filter="bound" type="button" aria-pressed="false">已绑群</button>
+            <button class="filter-chip" data-filter="largest" type="button" aria-pressed="false">按字数</button>
             <span id="sidebar-count" class="sidebar-count">0</span>
           </div>
         </div>
@@ -79,23 +81,23 @@
       </aside>
 
       <section class="content">
-        <nav class="tabs">
-          <button class="tab active" data-tab="topic" type="button">
-            <svg class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <nav id="studio-tabs" class="tabs" role="tablist" aria-label="记忆工作台">
+          <button id="tab-topic" class="tab active" data-tab="topic" type="button" role="tab" aria-selected="true" aria-controls="panel-topic" tabindex="0">
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
             <span>记忆与 Dream</span>
           </button>
-          <button class="tab" data-tab="ask" type="button">
-            <svg class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <button id="tab-ask" class="tab" data-tab="ask" type="button" role="tab" aria-selected="false" aria-controls="panel-ask" tabindex="-1">
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
             <span>免选主题提问</span>
           </button>
-          <button class="tab" data-tab="logs" type="button">
-            <svg class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <button id="tab-logs" class="tab" data-tab="logs" type="button" role="tab" aria-selected="false" aria-controls="panel-logs" tabindex="-1">
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <span>运行流水</span>
           </button>
         </nav>
 
         <!-- Tab 1: Topic Detail + Remember + Dream -->
-        <div id="panel-topic" class="tab-panel">
+        <div id="panel-topic" class="tab-panel" role="tabpanel" aria-labelledby="tab-topic" tabindex="0">
           <div class="topic-header">
             <div class="topic-header-info">
               <div class="title-line">
@@ -106,14 +108,24 @@
               <div id="detail-meta" class="meta-row"></div>
             </div>
             <div class="action-row">
-              <button id="btn-toggle-remember" class="btn btn-ghost btn-sm" type="button" disabled>+ 记一条</button>
+              <button id="btn-toggle-remember" class="btn btn-ghost btn-sm" type="button" aria-controls="remember-drawer" aria-expanded="false" disabled>+ 记一条</button>
               <button id="btn-dream-preview" class="btn btn-purple btn-sm" type="button" disabled>Dream 预览</button>
-              <button id="btn-dream-apply" class="btn btn-primary btn-sm" type="button" disabled>确认换版</button>
+              <button id="btn-dream-apply" class="btn btn-primary btn-sm" type="button" aria-controls="dream-apply-confirm" aria-expanded="false" disabled>应用 Dream 换版…</button>
+            </div>
+          </div>
+
+          <div id="dream-apply-confirm" class="dream-confirm hidden" role="region" aria-labelledby="dream-confirm-title" aria-describedby="dream-confirm-description">
+            <h3 id="dream-confirm-title">确认 Dream 换版</h3>
+            <p id="dream-confirm-description">将为主题 <strong id="dream-confirm-topic"></strong> 运行 Dream 并应用新版本。旧版会保留为历史快照，QA 缓存将失效；此操作会修改当前记忆。</p>
+            <div class="action-row">
+              <button id="btn-dream-confirm" class="btn btn-primary btn-sm" type="button">确认应用 Dream 换版</button>
+              <button id="btn-dream-cancel" class="btn btn-ghost btn-sm" type="button">取消</button>
             </div>
           </div>
 
           <!-- Inline Quick Remember Composer -->
           <form id="remember-drawer" class="remember-drawer hidden">
+            <label for="remember-input" class="sr-only">要长期记住的事实</label>
             <input id="remember-input" type="text" placeholder="输入一条要长期记住的事实（将自动追加并生成新版本）..." required />
             <button id="btn-remember-submit" type="submit" class="btn btn-primary btn-sm">写入记忆</button>
             <button id="btn-remember-cancel" type="button" class="btn btn-ghost btn-sm">取消</button>
@@ -123,29 +135,30 @@
           <div id="dream-box" class="dream-box hidden">
             <div class="dream-box-head">
               <div class="dream-title-wrap">
-                <span id="dream-spinner" class="spinner hidden"></span>
-                <strong id="dream-status-title">Dream 巩固结果</strong>
+                <span id="dream-spinner" class="spinner hidden" aria-hidden="true"></span>
+                <strong id="dream-status-title" role="status" aria-live="polite">Dream 巩固结果</strong>
               </div>
               <div class="dream-head-actions">
-                <button id="btn-dream-commit-inline" class="btn btn-primary btn-xs hidden" type="button">应用此版本</button>
+                <button id="btn-dream-commit-inline" class="btn btn-primary btn-xs hidden" type="button" aria-controls="dream-apply-confirm" aria-expanded="false">应用此版本…</button>
                 <button id="btn-dream-close" class="btn btn-ghost btn-xs" type="button">收起</button>
               </div>
             </div>
             <div id="dream-metrics" class="meta-row"></div>
             <div id="dream-bar-wrap" class="dream-bar-wrap hidden">
-              <div id="dream-bar-fill" class="dream-bar-fill"></div>
+              <progress id="dream-progress" class="dream-progress" max="100" value="0" aria-label="Dream 正文压缩比例"></progress>
             </div>
             <ul id="dream-changes" class="change-list"></ul>
-            <div id="dream-diff" class="diff-view"></div>
+            <div id="dream-diff" class="diff-view" role="region" aria-label="Dream 正文差异" tabindex="0"></div>
           </div>
 
           <!-- Reader Toolbar -->
           <div class="reader-toolbar">
             <div class="segmented">
-              <button id="btn-view-pretty" class="seg-btn active" type="button">阅读视图</button>
-              <button id="btn-view-raw" class="seg-btn" type="button">Markdown 原文</button>
+              <button id="btn-view-pretty" class="seg-btn active" type="button" aria-pressed="true">阅读视图</button>
+              <button id="btn-view-raw" class="seg-btn" type="button" aria-pressed="false">Markdown 原文</button>
             </div>
             <div class="toolbar-right">
+              <label for="version-select" class="sr-only">查看记忆版本</label>
               <select id="version-select" class="version-select" title="查看历史版本" disabled></select>
               <button id="btn-copy-body" class="btn btn-ghost btn-xs" type="button" disabled>复制全文</button>
             </div>
@@ -156,7 +169,7 @@
         </div>
 
         <!-- Tab 2: Context-Free Ask -->
-        <div id="panel-ask" class="tab-panel hidden">
+        <div id="panel-ask" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-ask" tabindex="0" hidden>
           <div class="ask-card">
             <div class="ask-head">
               <h3>免选主题直接提问</h3>
@@ -169,6 +182,7 @@
               <button class="starter-chip" type="button" data-q="云展 / Pi 项目的仓库拆分和现状是什么？">云展 / Pi 拆仓现状</button>
             </div>
             <form id="ask-form" class="ask-form">
+              <label for="ask-input" class="sr-only">关于项目或历史决策的问题</label>
               <input id="ask-input" type="text" placeholder="问任何关于你项目或历史决策的问题..." required />
               <button id="btn-ask-submit" type="submit" class="btn btn-primary">提问</button>
             </form>
@@ -177,29 +191,110 @@
         </div>
 
         <!-- Tab 3: Activity Logs -->
-        <div id="panel-logs" class="tab-panel hidden">
-          <div class="logs-grid">
-            <div class="log-col">
-              <div class="log-col-head">
-                <h3>最近多 Agent 召回</h3>
-                <span id="log-q-count" class="pill pill-gray">0</span>
-              </div>
-              <div id="log-questions" class="log-list"></div>
+        <div id="panel-logs" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-logs" tabindex="0" hidden>
+          <section class="log-col" aria-labelledby="activity-heading">
+            <div class="log-col-head">
+              <h3 id="activity-heading">统一运行流水</h3>
+              <span id="activity-count" class="pill pill-gray">0 条</span>
             </div>
-            <div class="log-col">
+            <p class="muted small logs-intro">查看记忆操作、调用来源与结果。流水只展示安全摘要，不包含提问或事实原文。</p>
+            <form id="activity-filters" class="activity-filters" aria-label="筛选运行流水">
+              <div class="log-filter">
+                <label for="activity-action">操作</label>
+                <select id="activity-action" name="action">
+                  <option value="">全部操作</option>
+                  <option value="recall">召回</option>
+                  <option value="remember">记忆写入</option>
+                  <option value="dream">Dream 巩固</option>
+                  <option value="bind_topic">绑定主题</option>
+                  <option value="list_topics">列出主题</option>
+                  <option value="whoami">身份查询</option>
+                  <option value="topic_create">创建主题</option>
+                  <option value="topic_edit">编辑主题</option>
+                  <option value="topic_append">追加主题</option>
+                  <option value="topic_rollback">回滚主题</option>
+                  <option value="topic_archive">归档主题</option>
+                  <option value="topic_restore">恢复主题</option>
+                  <option value="topic_trash">移入回收站</option>
+                  <option value="topic_delete">永久删除主题</option>
+                  <option value="core_init">初始化核心记忆</option>
+                  <option value="core_edit">编辑核心记忆</option>
+                  <option value="core_rollback">回滚核心记忆</option>
+                  <option value="auth_failed">认证失败</option>
+                  <option value="sso_login">SSO 登录</option>
+                  <option value="sso_logout">SSO 退出</option>
+                </select>
+              </div>
+              <div class="log-filter">
+                <label for="activity-source">来源</label>
+                <select id="activity-source" name="source">
+                  <option value="">全部来源</option>
+                  <option value="mcp">MCP</option>
+                  <option value="rest">REST</option>
+                  <option value="panel">Panel</option>
+                  <option value="studio">Studio</option>
+                  <option value="cli">CLI</option>
+                  <option value="system">系统</option>
+                </select>
+              </div>
+              <div class="log-filter">
+                <label for="activity-status">状态</label>
+                <select id="activity-status" name="status">
+                  <option value="">全部状态</option>
+                  <option value="ok">成功</option>
+                  <option value="no_fact">无匹配事实</option>
+                  <option value="duplicate">重复</option>
+                  <option value="skipped">已跳过</option>
+                  <option value="error">失败</option>
+                  <option value="denied">拒绝访问</option>
+                </select>
+              </div>
+              <div class="log-filter log-filter-search">
+                <label for="activity-search">搜索安全摘要、操作者或主题</label>
+                <input id="activity-search" name="q" type="search" placeholder="输入关键词后筛选" />
+              </div>
+              <div class="activity-filter-actions">
+                <button class="btn btn-ghost btn-sm" type="submit">筛选流水</button>
+                <button id="btn-activity-reset" class="btn btn-ghost btn-sm" type="button">重置筛选</button>
+              </div>
+            </form>
+            <p id="activity-loading" class="muted small logs-intro" role="status" aria-live="polite"></p>
+            <div id="activity-error" class="inline-error hidden" role="alert">
+              <p id="activity-error-message"></p>
+              <button id="btn-activity-retry" class="btn btn-ghost btn-sm" type="button">重试</button>
+            </div>
+            <p id="activity-empty" class="muted small hidden">暂无符合条件的流水。可重置筛选，或完成一次记忆操作后刷新。</p>
+            <ol id="activity-list" class="activity-timeline" aria-label="记忆操作时间线" aria-busy="false"></ol>
+            <div class="activity-pagination">
+              <p id="activity-page-status" class="muted small logs-intro" role="status" aria-live="polite">显示 0 条</p>
+              <button id="btn-activity-more" class="btn btn-ghost btn-sm hidden" type="button">加载更多流水</button>
+            </div>
+          </section>
+          <details id="dream-reports-view" class="log-col dream-reports-view">
+            <summary>Dream 详细报告与差异</summary>
+            <div class="dream-reports-content">
               <div class="log-col-head">
-                <h3>最近 Dream 巩固</h3>
+                <p class="muted small logs-intro">最近 20 次 Dream 的版本、变更说明与正文差异。</p>
                 <span id="log-d-count" class="pill pill-purple">0</span>
+                <button id="btn-dream-reports-refresh" class="btn btn-ghost btn-xs" type="button">刷新 Dream 报告</button>
               </div>
-              <div id="log-dreams" class="log-list"></div>
+              <p id="dream-reports-loading" class="muted small logs-intro" role="status" aria-live="polite"></p>
+              <div id="dream-reports-error" class="inline-error hidden" role="alert">
+                <p id="dream-reports-error-message"></p>
+                <button id="btn-dream-reports-retry" class="btn btn-ghost btn-sm" type="button">重试</button>
+              </div>
+              <div id="log-dreams" class="log-list" aria-busy="false"></div>
             </div>
-          </div>
+          </details>
         </div>
       </section>
     </main>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true">
+    <span id="toast-message"></span>
+    <button id="toast-close" class="toast-close" type="button" aria-label="关闭通知">关闭</button>
+  </div>
   <script src="/studio/app.js"></script>
 </body>
 </html>

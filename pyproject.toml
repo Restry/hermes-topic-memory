@@ -21,7 +21,7 @@ hermes-topic-memory-install = "hermes_topic_memory.install:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hermes_topic_memory = ["panel_assets/*.html", "panel_assets/*.css", "panel_assets/*.js", "studio_assets/*.html", "studio_assets/*.css", "studio_assets/*.js"]
+hermes_topic_memory = ["panel_assets/*.html", "panel_assets/*.css", "panel_assets/*.js", "studio_assets/*.html", "studio_assets/*.css", "studio_assets/*.js", "studio_assets/*.txt"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

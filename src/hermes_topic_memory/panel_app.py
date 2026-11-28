@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
+from .activity_log import ActivityAction, ActivityLedger, ActivityRecord, ActivitySource, ActivityStatus
 from .cache import QuestionCache
 from .core_memory import (
     CORE_DISPLAY_NAME,
@@ -69,6 +70,7 @@ class PanelApplication:
         "_auth_token",
         "_reader",
         "admin",
+        "activities",
         "core_memory",
         "data_root",
         "history",
@@ -107,7 +109,8 @@ class PanelApplication:
         self.history = QueryHistoryStore(self.data_root)
         self.admin = TopicAdminService(self.data_root)
         self.core_memory = CoreMemoryService(self.data_root)
-        self.memory_service = MemoryService(self.data_root, reader)  # type: ignore[arg-type]
+        self.activities = ActivityLedger(self.data_root)
+        self.memory_service = MemoryService(self.data_root, reader, activity_ledger=self.activities)  # type: ignore[arg-type]
         self.mcp = McpProtocol(self.memory_service)
 
     def dispatch(
@@ -118,6 +121,7 @@ class PanelApplication:
         headers: Mapping[str, str] | None = None,
         body: bytes = b"",
     ) -> PanelResponse:
+        started_ns = time.perf_counter_ns()
         request_method = method.upper()
         raw_path = urlsplit(target).path
         # Public auth/SSO endpoints (no Bearer/session required).
@@ -126,57 +130,172 @@ class PanelApplication:
                 return _error_response(405, "method_not_allowed", "Method not allowed.")
             return self._auth_me(headers)
         if raw_path.startswith("/api/sso/"):
-            try:
-                sso_path, sso_params = _parse_target(target)
-            except _RequestError as error:
-                return _error_response(400, error.code, error.message)
-            return self._dispatch_sso(request_method, sso_path, sso_params, headers)
+            return self._sso_response(request_method, target, raw_path, headers, started_ns)
 
-        if not self._is_authorized(headers):
+        actor = self._request_actor(headers)
+        if actor == "anonymous":
+            try:
+                self.activities.append(ActivityRecord(
+                    action="auth_failed", source=_panel_activity_source(headers, raw_path),
+                    status="denied", latency_ms=_elapsed_ms(started_ns),
+                    summary="Protected request denied.",
+                    meta={"method": _safe_method(request_method), "path": _safe_activity_path(raw_path)},
+                ))
+            except Exception:
+                return _error_response(500, "internal_error", "Request could not be completed.")
             return _error_response(401, "unauthorized", "Authentication required.")
 
         is_mutation = _is_topic_mutation_target(method, target)
+        action, topic_id = _panel_activity_action(request_method, raw_path)
+        payload = None
         try:
             path, params = _parse_target(target)
             if path == ("mcp",):
                 _reject_params(params, set())
                 if request_method != "POST":
                     return _error_response(405, "method_not_allowed", "Method not allowed.")
-                status, result = self.mcp.dispatch(body)
+                status, result = self.mcp.dispatch(body, actor=actor)
                 return PanelResponse(status, b"") if result is None else _json_response(status, result)
             if path[:2] == ("api", "v1"):
-                return self._dispatch_service(request_method, path, params, body)
+                return self._dispatch_service(request_method, path, params, body, actor=actor)
             payload = _parse_json_body(body)
             if request_method == "GET":
-                return self._dispatch_get(path, params)
-            if request_method == "POST":
-                return self._dispatch_post(path, params, payload)
-            return _error_response(405, "method_not_allowed", "Method not allowed.")
+                response = self._dispatch_get(path, params)
+            elif request_method == "POST":
+                response = self._dispatch_post(path, params, payload)
+            else:
+                response = _error_response(405, "method_not_allowed", "Method not allowed.")
         except _RequestError as error:
             code = "invalid_request" if is_mutation else error.code
             message = _MUTATION_MESSAGES[code] if is_mutation else error.message
-            return _error_response(400, code, message)
+            response = _error_response(400, code, message)
         except CoreMemoryNotFoundError:
-            if is_mutation:
-                return _mutation_error("core_memory_not_found")
-            return _error_response(404, "not_found", "Resource not found.")
+            response = _mutation_error("core_memory_not_found") if is_mutation else _error_response(404, "not_found", "Resource not found.")
         except (_ResourceNotFound, TopicNotFoundError):
-            if is_mutation:
-                return _mutation_error("topic_not_found")
-            return _error_response(404, "not_found", "Resource not found.")
+            response = _mutation_error("topic_not_found") if is_mutation else _error_response(404, "not_found", "Resource not found.")
         except Exception:
-            if is_mutation:
+            response = _mutation_error("operation_failed") if is_mutation else _error_response(500, "internal_error", "Request could not be completed.")
+        if action is not None:
+            try:
+                self._record_response(
+                    action, topic_id, response, actor=actor,
+                    source=_panel_activity_source(headers), started_ns=started_ns, payload=payload,
+                )
+            except Exception:
                 return _mutation_error("operation_failed")
-            return _error_response(
-                500, "internal_error", "Request could not be completed."
-            )
+        return response
 
-    def _is_authorized(self, headers: Mapping[str, str] | None) -> bool:
+    def _request_actor(self, headers: Mapping[str, str] | None) -> str:
         if self._has_valid_bearer(headers):
-            return True
-        if self.wx_sso is not None and self.wx_sso.read_session(headers) is not None:
-            return True
-        return False
+            return "token:env-admin"
+        if self.wx_sso is not None:
+            try:
+                session = self.wx_sso.read_session(headers)
+            except (TypeError, ValueError):
+                session = None
+            if session is not None:
+                nickname = _safe_actor_component(session.nickname, 64)
+                identity = nickname or _safe_actor_component(session.openid, 12) or "user"
+                return f"sso:{identity}"
+        return "anonymous"
+
+    def _sso_response(
+        self, method: str, target: str, raw_path: str,
+        headers: Mapping[str, str] | None, started_ns: int,
+    ) -> PanelResponse:
+        actor = self._request_actor(headers)
+        error_code = None
+        try:
+            path, params = _parse_target(target)
+            response = self._dispatch_sso(method, path, params, headers)
+        except WxSsoError as error:
+            error_code = error.code
+            response = _sso_error_response(error)
+        except _RequestError as error:
+            response = _error_response(400, error.code, error.message)
+        except Exception:
+            response = _error_response(500, "internal_error", "Request could not be completed.")
+        action: ActivityAction | None = None
+        if raw_path == "/api/sso/callback":
+            action = "sso_login"
+        elif raw_path == "/api/sso/logout":
+            action = "sso_logout"
+        if action is not None:
+            if action == "sso_login" and response.status == 303:
+                cookies = "; ".join(
+                    value.split(";", 1)[0]
+                    for name, value in response.headers
+                    if name.casefold() == "set-cookie"
+                )
+                actor = self._request_actor({"Cookie": cookies})
+            try:
+                self._record_response(
+                    action, None, response, actor=actor,
+                    source=_panel_activity_source(headers), started_ns=started_ns, error_code=error_code,
+                )
+            except Exception:
+                return _mutation_error("operation_failed")
+        return response
+
+    def _record_response(
+        self, action: ActivityAction, topic_id: str | None, response: PanelResponse, *,
+        actor: str, source: ActivitySource, started_ns: int,
+        payload: dict[str, Any] | None = None, error_code: str | None = None,
+    ) -> None:
+        value: dict[str, Any] = {}
+        if response.content_type.startswith("application/json"):
+            value = json.loads(response.body)
+        error = value.get("error", {})
+        code = error_code or (error.get("code") if isinstance(error, dict) else None)
+        status: ActivityStatus = "ok"
+        if response.status >= 400:
+            status = "denied" if response.status in {401, 403} else "error"
+            if code in {"append_duplicate", "core_memory_exists", "topic_exists"}:
+                status = "duplicate"
+        elif value.get("status") in {"no_fact", "duplicate", "skipped", "error"}:
+            status = value["status"]
+        meta: dict[str, Any] = {"http_status": response.status}
+        if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code):
+            meta["error_code"] = code
+        resource = value.get("topic") or value.get("core_memory") or value.get("item") or value.get("result")
+        if isinstance(resource, dict):
+            candidate = resource.get("topic_id")
+            if _safe_activity_topic(candidate) is not None:
+                topic_id = candidate
+            version = resource.get("version")
+            if type(version) is int and version > 0:
+                meta["version"] = version
+        if payload is not None:
+            if action == "topic_create" and topic_id is None:
+                topic_id = _safe_activity_topic(payload.get("topic_id"))
+            for field, key in (("expected_version", "previous_version"), ("target_version", "target_version")):
+                number = payload.get(field)
+                if type(number) is int and 0 < number <= 2**63 - 1:
+                    meta[key] = number
+                    if action == "topic_trash" and status == "ok" and field == "expected_version":
+                        meta["version"] = number
+            if status == "ok" and action != "recall":
+                text = payload.get("body", payload.get("text"))
+                if isinstance(text, str):
+                    meta["size_chars"] = len(text)
+        if action == "recall":
+            results = value.get("topic_results", [])
+            if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict):
+                topic_id = _safe_activity_topic(results[0].get("topic_id"))
+                version = results[0].get("topic_version")
+                if type(version) is int and version > 0:
+                    meta["version"] = version
+            failure = value.get("failure")
+            if isinstance(failure, dict):
+                code = failure.get("code")
+                if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code):
+                    meta["error_code"] = code
+        self.activities.append(ActivityRecord(
+            action=action, source=source, actor=actor, topic_id=topic_id,
+            status=status, latency_ms=_elapsed_ms(started_ns),
+            summary=f"{action.replace('_', ' ').capitalize()}: {status}.", meta=meta,
+        ))
+
 
     def _has_valid_bearer(self, headers: Mapping[str, str] | None) -> bool:
         authorization = ""
@@ -188,7 +307,10 @@ class PanelApplication:
         prefix = "Bearer "
         has_bearer_prefix = authorization.startswith(prefix)
         supplied = authorization[len(prefix) :] if has_bearer_prefix else ""
-        matches = secrets.compare_digest(supplied, self._auth_token)
+        try:
+            matches = secrets.compare_digest(supplied, self._auth_token)
+        except (TypeError, ValueError):
+            return False
         return has_bearer_prefix and matches
 
     def _auth_me(self, headers: Mapping[str, str] | None) -> PanelResponse:
@@ -252,28 +374,7 @@ class PanelApplication:
         if path == ("api", "sso", "callback"):
             if method != "GET":
                 return _error_response(405, "method_not_allowed", "Method not allowed.")
-            try:
-                return_to, cookies = self.wx_sso.complete_callback(params, headers)
-            except WxSsoError as err:
-                html_err = (
-                    "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
-                    "<title>登录失败</title><style>body{font-family:-apple-system,sans-serif;"
-                    "display:flex;align-items:center;justify-content:center;min-height:100vh;"
-                    "margin:0;background:#f8fafc;color:#0f172a}.card{background:#fff;border:1px solid #e2e8f0;"
-                    "border-radius:12px;padding:28px;max-width:420px;box-shadow:0 4px 16px rgba(15,23,42,.06)}"
-                    "a{display:inline-block;margin-top:16px;margin-right:12px;padding:8px 16px;border-radius:8px;"
-                    "text-decoration:none;font-weight:600}.primary{background:#2563eb;color:#fff}"
-                    ".secondary{border:1px solid #cbd5e1;color:#334155}</style></head><body><div class='card'>"
-                    f"<h3>微信登录未完成</h3><p>{err}</p>"
-                    "<a class='primary' href='/api/sso/start'>重新扫码登录</a>"
-                    "<a class='secondary' href='/?token_login=1'>使用访问密钥</a>"
-                    "</div></body></html>"
-                ).encode("utf-8")
-                return PanelResponse(
-                    status=err.status,
-                    body=html_err,
-                    content_type="text/html; charset=utf-8",
-                )
+            return_to, cookies = self.wx_sso.complete_callback(params, headers)
             resp_headers = [("Location", return_to)] + [("Set-Cookie", c) for c in cookies]
             return PanelResponse(
                 status=303,
@@ -303,6 +404,8 @@ class PanelApplication:
         path: tuple[str, ...],
         params: dict[str, str],
         body: bytes,
+        *,
+        actor: str = "anonymous",
     ) -> PanelResponse:
         _reject_params(params, set())
         routes = {
@@ -322,7 +425,7 @@ class PanelApplication:
         if method == "GET" and payload is not None:
             raise _RequestError("invalid_request", "GET requests do not accept arguments.")
         try:
-            result = self.memory_service.call(route[1], payload or {}, source="rest")
+            result = self.memory_service.call(route[1], payload or {}, source="rest", actor=actor)
             return _json_response(200, result)
         except MemoryServiceError as error:
             return _json_response(error.status, {"error": error.to_dict()})
@@ -333,6 +436,8 @@ class PanelApplication:
         if path == ("api", "overview"):
             _reject_params(params, set())
             return _json_response(200, self._overview())
+        if path == ("api", "activities"):
+            return _json_response(200, self._activities(params))
         if path == ("api", "core-memory"):
             _reject_params(params, set())
             return _json_response(200, {"core_memory": self._core_metadata()})
@@ -387,6 +492,19 @@ class PanelApplication:
                 return _json_response(200, self._version_body(topic_id, version))
 
         raise _ResourceNotFound
+
+    def _activities(self, params: dict[str, str]) -> dict[str, Any]:
+        _reject_params(params, {"action", "source", "topic", "status", "q", "page", "page_size"})
+        page = _positive_integer(params.get("page", "1"), "page")
+        page_size = min(_positive_integer(params.get("page_size", "30"), "page_size"), _MAX_PAGE_SIZE)
+        try:
+            return self.activities.list(
+                action=params.get("action"), source=params.get("source"),
+                topic_id=params.get("topic"), status=params.get("status"), q=params.get("q"),
+                page=page, page_size=page_size,
+            )
+        except ValueError as error:
+            raise _RequestError("invalid_request", "Invalid activity filters.") from error
 
     def _dispatch_post(
         self,
@@ -781,6 +899,7 @@ class PanelApplication:
                 "total_question_count": snapshot.total_question_count,
                 "active_cache_count": snapshot.active_cache_count,
                 "questions_last_30_days": snapshot.questions_last_30_days,
+                "total_chars": snapshot.total_chars,
                 "archived_topic_count": sum(
                     topic.status == "archived" for topic in snapshot.topics
                 ),
@@ -992,7 +1111,7 @@ class PanelApplication:
         if status is not None and status not in {"answered", "no_fact", "error"}:
             raise _RequestError("invalid_request", "Invalid question status.")
         source = params.get("source")
-        if source is not None and source not in {"hermes", "panel", "cli"}:
+        if source is not None and source not in {"hermes", "panel", "cli", "mcp", "rest"}:
             raise _RequestError("invalid_request", "Invalid question source.")
         scope = params.get("scope")
         if scope is not None and scope not in {"single", "multi"}:
@@ -1134,6 +1253,105 @@ class PanelApplication:
             "created_at": created_at,
             "trashed_at": trashed_at,
         }
+
+
+def _sso_error_response(error: WxSsoError) -> PanelResponse:
+    html_error = (
+        "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        "<title>登录失败</title><style>body{font-family:-apple-system,sans-serif;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;"
+        "margin:0;background:#f8fafc;color:#0f172a}.card{background:#fff;border:1px solid #e2e8f0;"
+        "border-radius:12px;padding:28px;max-width:420px;box-shadow:0 4px 16px rgba(15,23,42,.06)}"
+        "a{display:inline-block;margin-top:16px;margin-right:12px;padding:8px 16px;border-radius:8px;"
+        "text-decoration:none;font-weight:600}.primary{background:#2563eb;color:#fff}"
+        ".secondary{border:1px solid #cbd5e1;color:#334155}</style></head><body><div class='card'>"
+        f"<h3>微信登录未完成</h3><p>{error}</p>"
+        "<a class='primary' href='/api/sso/start'>重新扫码登录</a>"
+        "<a class='secondary' href='/?token_login=1'>使用访问密钥</a>"
+        "</div></body></html>"
+    ).encode("utf-8")
+    return PanelResponse(status=error.status, body=html_error, content_type="text/html; charset=utf-8")
+
+
+def _safe_actor_component(value: Any, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    bounded = value[:maximum]
+    if any(not (char.isalnum() or char in " ._-") for char in bounded):
+        return ""
+    return bounded.strip()
+
+
+def _safe_activity_topic(value: Any) -> str | None:
+    if isinstance(value, str) and len(value) <= 100 and _TOPIC_ID.fullmatch(value):
+        return value
+    return None
+
+
+def _panel_activity_source(headers: Mapping[str, str] | None, path: str = "") -> ActivitySource:
+    if path == "/mcp":
+        return "mcp"
+    if path.startswith("/api/v1/"):
+        return "rest"
+    if headers is not None:
+        for name, value in headers.items():
+            if str(name).casefold() == "x-topic-memory-source" and value == "studio":
+                return "studio"
+    return "panel"
+
+
+def _safe_method(method: str) -> str:
+    return method if method in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"} else "OTHER"
+
+
+def _safe_activity_path(raw_path: str) -> str:
+    # Store only known route templates, never attacker-controlled path/query text.
+    path = tuple(unquote(raw_path).strip("/").split("/"))
+    if path == ("mcp",):
+        return "/mcp"
+    if len(path) == 3 and path[:2] == ("api", "v1") and path[2] in {"whoami", "topics", "recall", "remember", "dream"}:
+        return "/" + "/".join(path)
+    if path == ("api", "v1", "topics", "bind"):
+        return "/api/v1/topics/bind"
+    if len(path) == 2 and path[0] == "api" and path[1] in {"overview", "topics", "questions", "activities", "dreams", "runtime", "core-memory", "recycle-bin"}:
+        return "/" + "/".join(path)
+    if len(path) == 3 and path[:2] == ("api", "core-memory") and path[2] in {"body", "versions", "initialize", "replace", "rollback"}:
+        return "/" + "/".join(path)
+    if len(path) == 5 and path[:3] == ("api", "core-memory", "versions") and path[4] == "body":
+        return "/api/core-memory/versions/:version/body"
+    if len(path) == 3 and path[:2] == ("api", "topics"):
+        return "/api/topics/:topic_id"
+    if len(path) == 4 and path[:2] == ("api", "topics") and path[3] in {"body", "questions", "versions", "append", "replace", "rollback", "archive", "restore", "trash"}:
+        return "/api/topics/:topic_id/" + path[3]
+    if len(path) == 6 and path[:2] == ("api", "topics") and path[3] == "versions" and path[5] == "body":
+        return "/api/topics/:topic_id/versions/:version/body"
+    if len(path) == 4 and path[:2] == ("api", "recycle-bin") and path[3] in {"restore", "delete"}:
+        return "/api/recycle-bin/:topic_id/" + path[3]
+    if len(path) == 3 and path[:2] == ("api", "recall") and path[2] in {"run", "plan"}:
+        return "/" + "/".join(path)
+    if len(path) == 4 and path[:3] == ("api", "recall", "rerun"):
+        return "/api/recall/rerun/:query_id"
+    return "/unknown"
+
+
+def _panel_activity_action(method: str, raw_path: str) -> tuple[ActivityAction | None, str | None]:
+    if method != "POST":
+        return None, None
+    path = tuple(unquote(raw_path).strip("/").split("/"))
+    if path == ("api", "topics"):
+        return "topic_create", None
+    if len(path) == 3 and path[:2] == ("api", "core-memory"):
+        actions: dict[str, ActivityAction] = {"initialize": "core_init", "replace": "core_edit", "rollback": "core_rollback"}
+        return actions.get(path[2]), None
+    if path == ("api", "recall", "run") or (len(path) == 4 and path[:3] == ("api", "recall", "rerun")):
+        return "recall", None
+    if len(path) == 4 and path[:2] == ("api", "topics"):
+        actions = {"append": "topic_append", "replace": "topic_edit", "rollback": "topic_rollback", "archive": "topic_archive", "restore": "topic_restore", "trash": "topic_trash"}
+        return actions.get(path[3]), _safe_activity_topic(path[2])
+    if len(path) == 4 and path[:2] == ("api", "recycle-bin"):
+        actions = {"restore": "topic_restore", "delete": "topic_delete"}
+        return actions.get(path[3]), _safe_activity_topic(path[2])
+    return None, None
 
 
 _MUTATION_MESSAGES = {
@@ -1439,7 +1657,10 @@ def _validated_topic_id(topic_id: str) -> str:
 def _positive_integer(value: str, label: str) -> int:
     if not value.isascii() or not value.isdigit():
         raise _RequestError("invalid_request", f"Invalid {label}.")
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise _RequestError("invalid_request", f"Invalid {label}.") from error
     if number < 1:
         raise _RequestError("invalid_request", f"Invalid {label}.")
     return number

@@ -56,6 +56,7 @@ class TopicSummary:
             "status": self.status,
             "question_count": self.question_count,
             "active_cache_count": self.active_cache_count,
+            "chars": self.chars,
         }
 
 
@@ -65,6 +66,7 @@ class CatalogSnapshot:
     total_question_count: int
     active_cache_count: int
     questions_last_30_days: int
+    total_chars: int
     daily_questions: tuple[DailyQuestionCount, ...]
     topics: tuple[TopicSummary, ...]
 
@@ -80,6 +82,7 @@ class CatalogSnapshot:
             "total_question_count": self.total_question_count,
             "active_cache_count": self.active_cache_count,
             "questions_last_30_days": self.questions_last_30_days,
+            "total_chars": self.total_chars,
             "daily_questions": [item.to_public_dict() for item in self.daily_questions],
             "topics": [topic.to_public_dict() for topic in self.topics],
         }
@@ -157,6 +160,7 @@ class TopicCatalog:
             total_question_count=len(query_records),
             active_cache_count=active_cache_count,
             questions_last_30_days=sum(item.question_count for item in daily_questions),
+            total_chars=sum(topic.chars for topic in topics),
             daily_questions=daily_questions,
             topics=tuple(topics),
         )

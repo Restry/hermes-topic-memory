@@ -98,6 +98,20 @@ def test_wx_sso_end_to_end_and_studio_ui(tmp_path: Path) -> None:
         for tool in ("whoami", "recall", "remember", "list_topics", "bind_topic", "dream"):
             assert f"`{tool}`" in llms_txt
         assert "TOPIC_MEMORY_TOKEN" in llms_txt
+        assert "`POST /api/v1/topics/bind`" in llms_txt
+        assert "`POST /api/v1/bind`" not in llms_txt
+        assert "<TOPIC_MEMORY_TOKEN>" in llms_txt
+        assert "$TOPIC_MEMORY_TOKEN" in llms_txt
+        assert "<TOPIC...EN>" not in llms_txt
+        assert "$TOPIC...OKEN" not in llms_txt
+        assert "<TOKEN>" not in llms_txt
+        endpoint_line = next(
+            line for line in llms_txt.splitlines() if line.startswith("- MCP Endpoint:")
+        )
+        assert endpoint_line.count("`") % 2 == 0
+        assert llms_txt == (Path(__file__).resolve().parents[1] / "llms.txt").read_text(
+            encoding="utf-8"
+        )
 
         # 3. Callback exchanges code with HMAC + mints htm_session cookie
         cb_path = f"/api/sso/callback?code=one-time-code&state={state}&iss=https://wx.mvp.restry.cn"
@@ -133,5 +147,8 @@ def test_wx_sso_end_to_end_and_studio_ui(tmp_path: Path) -> None:
         assert r_out.status == 200 and out_json["ok"] is True
         assert out_json["central_logout_url"] == "https://wx.mvp.restry.cn/sso/logout"
     finally:
+        conn.close()
         srv.shutdown()
         srv.server_close()
+        t.join(timeout=5)
+        assert not t.is_alive()

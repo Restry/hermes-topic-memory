@@ -15,6 +15,7 @@ from hermes_topic_memory.query_history import (
     TopicQueryResult,
 )
 from hermes_topic_memory.store import FileTopicStore
+from hermes_topic_memory.topic_admin import TopicAdminService
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
 _FIXED_NOW = datetime(2026, 8, 11, 12, tzinfo=_BEIJING)
@@ -147,6 +148,10 @@ def test_catalog_snapshot_counts_queries_topics_and_only_current_cache(
     assert snapshot.total_question_count == 5
     assert snapshot.active_cache_count == 2
     assert snapshot.questions_last_30_days == 4
+    assert snapshot.total_chars == sum(
+        len(FileTopicStore(catalog_data).get_topic(topic.topic_id).body)
+        for topic in snapshot.topics
+    )
     assert snapshot.topic("alpha").question_count == 3
     assert snapshot.topic("alpha").active_cache_count == 1
     assert snapshot.topic("alpha").version == 2
@@ -185,6 +190,7 @@ def test_catalog_public_dict_has_no_bodies_or_absolute_private_paths(
 
     assert public["active_topic_count"] == 3
     assert public["total_question_count"] == 5
+    assert public["total_chars"] == snapshot.total_chars
     assert len(public["topics"]) == 3
     assert public["topics"][0] == {
         "topic_id": "alpha",
@@ -195,6 +201,7 @@ def test_catalog_public_dict_has_no_bodies_or_absolute_private_paths(
         "status": "active",
         "question_count": 3,
         "active_cache_count": 1,
+        "chars": len("ALPHA_PRIVATE_BODY version two"),
     }
     assert "ALPHA_PRIVATE_BODY" not in serialized
     assert "BETA_PRIVATE_BODY" not in serialized
@@ -221,6 +228,51 @@ def test_catalog_counts_active_topics_and_reports_archived_status(
     assert snapshot.active_topic_count == 2
     assert snapshot.topic("alpha").status == "active"
     assert snapshot.topic("beta").status == "archived"
+    assert snapshot.total_chars == sum(topic.chars for topic in snapshot.topics)
+
+
+def test_catalog_chars_track_current_unicode_bodies_and_exclude_trash(
+    tmp_path: Path,
+) -> None:
+    admin = TopicAdminService(tmp_path)
+    active_body = "中文记忆\n😀 active\n"
+    archived_body = "归档内容\n"
+    admin.create_topic("active", "Active", (), active_body)
+    admin.create_topic("archived", "Archived", (), archived_body)
+    admin.archive("archived", expected_version=1)
+    admin.create_topic("discarded", "Discarded", (), "not retained\n")
+    admin.trash("discarded", expected_version=1)
+
+    snapshot = TopicCatalog(tmp_path).snapshot(now=_FIXED_NOW)
+    assert snapshot.active_topic_count == 1
+    assert snapshot.topic("active").to_public_dict()["chars"] == len(active_body)
+    assert snapshot.topic("archived").chars == len(archived_body)
+    assert snapshot.total_chars == len(active_body) + len(archived_body)
+    assert snapshot.to_public_dict()["total_chars"] == snapshot.total_chars
+    assert {topic.topic_id for topic in snapshot.topics} == {"active", "archived"}
+
+    updated_body = active_body + "追加 durable fact\n"
+    FileTopicStore(tmp_path).update_topic("active", updated_body)
+    updated = TopicCatalog(tmp_path).snapshot(now=_FIXED_NOW)
+    assert updated.topic("active").chars == len(updated_body)
+    assert updated.total_chars == len(updated_body) + len(archived_body)
+
+    trashed_active = admin.trash("active", expected_version=2)
+    retained = TopicCatalog(tmp_path).snapshot(now=_FIXED_NOW)
+    assert retained.total_chars == len(archived_body)
+    admin.restore_from_trash(
+        "active", expected_trashed_at=trashed_active.trashed_at
+    )
+    assert TopicCatalog(tmp_path).snapshot(now=_FIXED_NOW).total_chars == (
+        len(updated_body) + len(archived_body)
+    )
+
+    admin.trash("active", expected_version=2)
+    admin.trash("archived", expected_version=1)
+    empty = TopicCatalog(tmp_path).snapshot(now=_FIXED_NOW)
+    assert empty.total_chars == 0
+    assert empty.active_topic_count == 0
+    assert empty.to_public_dict()["topics"] == []
 
 
 

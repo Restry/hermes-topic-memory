@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .activity_log import ActivityLedger, ActivityRecord, ActivityStatus
 from .cache import QuestionCache
 from .core_memory import CoreMemoryService
 from .dream import DreamConsolidator
@@ -104,21 +105,58 @@ def tool_definitions() -> list[dict[str, Any]]:
 class MemoryService:
     """One implementation shared by the MCP tools and versioned REST routes."""
 
-    def __init__(self, data_root: str | Path, reader: Reader) -> None:
+    def __init__(
+        self, data_root: str | Path, reader: Reader, *, activity_ledger: ActivityLedger | None = None
+    ) -> None:
         self.root = Path(data_root)
         self.reader = reader
         self.store = FileTopicStore(self.root)
         self.history = QueryHistoryStore(self.root)
+        self.activities = activity_ledger if activity_ledger is not None else ActivityLedger(self.root)
         self.admin = TopicAdminService(self.root)
         self.core = CoreMemoryService(self.root)
         self.remember_service = RememberService(self.root)
         self.dream_consolidator = DreamConsolidator(self.root, reader)
 
-    def call(self, name: str, arguments: Any, *, source: QuerySource) -> dict[str, Any]:
+    def call(
+        self, name: str, arguments: Any, *, source: QuerySource, actor: str = "anonymous"
+    ) -> dict[str, Any]:
         definition = next((item for item in _TOOL_DEFINITIONS if item[0] == name), None)
         if definition is None:
             raise MemoryServiceError("unknown_tool", "Unknown tool.", 404)
-        _validate_arguments(arguments, definition[2], definition[3])
+        started = time.perf_counter_ns()
+        try:
+            _validate_arguments(arguments, definition[2], definition[3])
+            result = self._dispatch(name, arguments, source=source)
+        except MemoryServiceError as error:
+            self._record_activity(name, arguments, source=source, actor=actor, started=started, error=error)
+            raise
+        self._record_activity(name, arguments, source=source, actor=actor, started=started, result=result)
+        return result
+
+    def _record_activity(
+        self, name: str, arguments: Any, *, source: QuerySource, actor: str, started: int,
+        result: dict[str, Any] | None = None, error: MemoryServiceError | None = None,
+    ) -> None:
+        result = result or {}
+        status = "error" if error is not None else _activity_status(name, result)
+        meta, topic_id = _activity_metadata(name, arguments, result)
+        if error is not None:
+            meta["error_code"] = error.code if error.code in {
+                "invalid_request", "topic_not_found", "topic_read_only", "routing_error", "operation_failed"
+            } else "operation_failed"
+        transport = source if source in {"mcp", "rest", "panel", "cli"} else "system"
+        try:
+            self.activities.append(ActivityRecord(
+                action=name, source=transport, actor=_activity_label(actor, 128) or "anonymous",
+                topic_id=topic_id, status=status,
+                latency_ms=max(0, (time.perf_counter_ns() - started) // 1_000_000),
+                summary=f"{name}: {status}", meta=meta,
+            ))
+        except Exception:
+            raise MemoryServiceError("operation_failed", "Operation could not be completed.", 500) from None
+
+    def _dispatch(self, name: str, arguments: dict[str, Any], *, source: QuerySource) -> dict[str, Any]:
         try:
             if name == "whoami":
                 memory = self.core.get_optional()
@@ -164,12 +202,14 @@ class MemoryService:
                 force = bool(arguments.get("force", False))
                 if "topic" in arguments:
                     topic_id = self._registry().resolve_name(arguments["topic"])
-                    return self.dream_consolidator.dream_topic(
+                    report = self.dream_consolidator.dream_topic(
                         topic_id, dry_run=dry_run, force=force
                     ).to_dict()
-                return self.dream_consolidator.dream_all(
-                    dry_run=dry_run, force=force
-                ).to_dict()
+                else:
+                    report = self.dream_consolidator.dream_all(
+                        dry_run=dry_run, force=force
+                    ).to_dict()
+                return _public_dream_result(report)
             return self._recall(arguments, source=source)
         except MemoryServiceError:
             raise
@@ -368,6 +408,113 @@ class MemoryService:
         if status == "error":
             response["error"] = {"code": "recall_failed", "message": "Recall could not be completed."}
         return response
+
+
+def _public_dream_result(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("error") is not None:
+        result["error"] = "Dream could not be completed."
+    for report in result.get("reports", []):
+        if report.get("error") is not None:
+            report["error"] = "Dream could not be completed."
+    return result
+
+
+def _activity_label(value: Any, maximum: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(char if char.isprintable() else " " for char in value[:maximum]).strip()
+
+
+def _activity_status(name: str, result: dict[str, Any]) -> ActivityStatus:
+    raw_status = result.get("status")
+    selected = result.get("selected_topics", [])
+    if name == "recall" and selected and result.get("source") == "none" and all(
+        item.get("status") == "no_fact" for item in selected
+    ):
+        return "no_fact"
+    if raw_status in {"error", "aborted_concurrent_write"}:
+        return "error"
+    reports = result.get("reports", [])
+    if any(item.get("status") == "error" for item in selected) or any(
+        item.get("status") in {"error", "aborted_concurrent_write"} for item in reports
+    ):
+        return "error"
+    if name == "dream" and (result.get("errors", 0) or result.get("aborted", 0)):
+        return "error"
+    if raw_status in {"no_fact", "duplicate", "skipped"}:
+        return raw_status
+    if raw_status in {"uninitialized", "no_change", "skipped_no_new_evidence"}:
+        return "skipped"
+    if name == "dream" and "reports" in result:
+        if not reports or all(item.get("status") in {"no_change", "skipped_no_new_evidence"} for item in reports):
+            return "skipped"
+    return "ok"
+
+
+def _activity_metadata(
+    name: str, arguments: Any, result: dict[str, Any]
+) -> tuple[dict[str, Any], str | None]:
+    meta: dict[str, Any] = {}
+    if isinstance(arguments, dict):
+        for field, key in (("query", "query_chars"), ("fact", "fact_chars")):
+            if isinstance(arguments.get(field), str):
+                meta[key] = len(arguments[field])
+        if name == "remember" and isinstance(arguments.get("source_agent"), str):
+            meta["source_agent"] = _activity_label(arguments["source_agent"], 160)
+        if name == "dream":
+            for key in ("force", "dry_run"):
+                if isinstance(arguments.get(key), bool):
+                    meta[key] = arguments[key]
+    topic = result.get("topic", {})
+    topic_id = result.get("topic_id") or topic.get("topic_id")
+    if topic_id is None and isinstance(arguments, dict):
+        candidate = arguments.get("topic")
+        if isinstance(candidate, str) and len(candidate) <= 128 and candidate.isascii() and all(
+            part.isalnum() and part.islower() or part.isdigit() for part in candidate.split("-")
+        ):
+            topic_id = candidate
+    version = result.get("topic_version", result.get("version", topic.get("version")))
+    if isinstance(version, int) and not isinstance(version, bool):
+        meta["version"] = version
+    for key in ("before_version", "after_version", "before_chars", "after_chars", "evidence_count",
+                "pruned_count", "merged_count", "conflicts_resolved"):
+        if isinstance(result.get(key), int) and not isinstance(result[key], bool):
+            meta[key] = result[key]
+    for key in ("body", "capsule"):
+        if isinstance(result.get(key), str):
+            meta["body_chars" if key == "body" else "answer_chars"] = len(result[key])
+    # Do not copy model identifiers, route explanations, report summaries, or errors.
+    if result.get("route_source") in {
+        "explicit", "chat_id", "repo", "workspace_path", "query", "query_multi", "catalog_planner", "default"
+    }:
+        meta["route_source"] = result["route_source"]
+    if result.get("source") in {"cache", "reader", "failure", "synthesizer"}:
+        meta["result_source"] = result["source"]
+        meta["cache"] = result["source"] == "cache"
+    if result.get("status") in {
+        "answered", "initialized", "uninitialized", "remembered", "duplicate", "no_fact", "error",
+        "consolidated", "no_change", "dry_run", "skipped_no_new_evidence", "aborted_concurrent_write",
+    }:
+        meta["status"] = result["status"]
+    selected = result.get("selected_topics")
+    reports = result.get("reports")
+    if isinstance(selected, list):
+        meta["topic_ids"] = [item["topic_id"] for item in selected[:8]]
+        meta["topic_versions"] = {item["topic_id"]: item["topic_version"] for item in selected[:8]}
+        meta["topic_count"] = len(selected)
+        meta["error_count"] = sum(item.get("status") == "error" for item in selected)
+        meta["no_fact_count"] = sum(item.get("status") == "no_fact" for item in selected)
+        # A multi-topic event describes the whole invocation, not only its first topic.
+        topic_id = None
+    elif isinstance(reports, list):
+        meta["topic_count"] = len(reports)
+        meta["error_count"] = sum(item.get("status") in {"error", "aborted_concurrent_write"} for item in reports)
+        meta["skipped_count"] = sum(item.get("status") in {"no_change", "skipped_no_new_evidence"} for item in reports)
+        meta["consolidated_count"] = sum(item.get("status") == "consolidated" for item in reports)
+        topic_id = None
+    elif isinstance(result.get("topics"), list):
+        meta["topic_count"] = len(result["topics"])
+    return meta, topic_id
 
 
 def _validate_arguments(value: Any, properties: dict[str, Any], required: tuple[str, ...]) -> None:

@@ -7,13 +7,13 @@
 ## Endpoints
 
 - Base URL: `https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn`
-- MCP Endpoint: `POST /mcp` (Stateless JSON-RPC 2.0, `Content-Type: application/json`, `Authorization: Bearer <TOKEN>`)
+- MCP Endpoint: `POST /mcp` (Stateless JSON-RPC 2.0, `Content-Type: application/json`, `Authorization: Bearer <TOPIC_MEMORY_TOKEN>`)
 - REST Endpoints:
   - `GET /api/v1/whoami` — read shared Core / WhoAmI profile
   - `GET /api/v1/topics` — list active topics, bindings, versions, and summaries
   - `POST /api/v1/recall` — recall a high-density capsule (<= 200 chars)
   - `POST /api/v1/remember` — persist a durable fact with provenance & idempotency
-  - `POST /api/v1/bind` — bind a `chat_id`, `repo_url`, or `workspace_path` to an existing topic
+  - `POST /api/v1/topics/bind` — bind a `chat_id`, `repo_url`, or `workspace_path` to an existing topic
   - `POST /api/v1/dream` — consolidate a topic (`dry_run: true` recommended before applying)
 - Human Studio UI: `/` (WeChat Gateway SSO protected)
 - This guide: `GET /llms.txt` (public, no auth required)

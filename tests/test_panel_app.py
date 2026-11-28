@@ -158,6 +158,7 @@ def test_overview_contains_real_kpis_charts_catalog_and_no_canonical_body(
     assert payload["kpis"]["trashed_topic_count"] == 1
     assert payload["kpis"]["total_question_count"] == 4
     assert payload["kpis"]["active_cache_count"] == 1
+    assert payload["kpis"]["total_chars"] == len(_ALPHA_BODY_V2) + len(_BETA_BODY)
     assert len(payload["charts"]["daily_questions"]) == 30
     assert payload["charts"]["topic_distribution"] == [
         {
@@ -172,6 +173,10 @@ def test_overview_contains_real_kpis_charts_catalog_and_no_canonical_body(
         },
     ]
     assert {topic["topic_id"] for topic in payload["topics"]} == {"alpha", "beta"}
+    assert {topic["topic_id"]: topic["chars"] for topic in payload["topics"]} == {
+        "alpha": len(_ALPHA_BODY_V2),
+        "beta": len(_BETA_BODY),
+    }
     assert payload["recent_questions"][0]["query_id"] == "beta-newest"
     _assert_no_body_or_secret(response.body, panel_fixture.data_root)
 
@@ -964,6 +969,9 @@ def test_write_routes_fail_closed_for_auth_schema_concurrency_state_and_audit(
         assert response.status == 401
         assert b"PRIVATE_AUTH_BYPASS_BODY" not in response.body
     assert _tree_hash(root) == before
+    denied = app.activities.list(action="auth_failed", status="denied")
+    assert denied["total"] == len(write_paths)
+    assert all(item["actor"] == "anonymous" for item in denied["items"])
 
     bad_ids = ("../escape", "%2e%2e%2fescape", "alpha%2F..%2Fescape")
     for bad_id in bad_ids:
@@ -1071,7 +1079,7 @@ def _tree_hash(path: Path) -> str:
     if not path.exists():
         return digest.hexdigest()
     for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
-        if item.name == ".topic-admin.lock":
+        if item.name == ".topic-admin.lock" or item.relative_to(path).parts[0] == "activity-log":
             continue
         digest.update(item.relative_to(path).as_posix().encode())
         digest.update(item.read_bytes())
