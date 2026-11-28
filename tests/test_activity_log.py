@@ -330,7 +330,67 @@ def test_activity_enumerations_match_the_public_schema() -> None:
         "recall", "remember", "dream", "bind_topic", "list_topics", "whoami",
         "topic_create", "topic_edit", "topic_append", "topic_rollback", "topic_archive",
         "topic_restore", "topic_trash", "topic_delete", "core_init", "core_edit",
-        "core_rollback", "auth_failed", "sso_login", "sso_logout",
+        "core_rollback", "auth_failed", "sso_login", "sso_logout", "key_create", "key_revoke",
     }
     assert set(get_args(ActivitySource)) == {"mcp", "rest", "panel", "studio", "cli", "system"}
     assert set(get_args(ActivityStatus)) == {"ok", "no_fact", "duplicate", "skipped", "error", "denied"}
+
+
+@pytest.mark.parametrize("action", ["key_create", "key_revoke"])
+def test_key_events_redact_managed_secrets_from_every_text_field(tmp_path: Path, action: str) -> None:
+    secret = "htm_" + "Ab_cd-09" * 4
+    record = _record(
+        action=action, actor=f"key:{secret}(key_0123456789ab)",
+        summary=f"created ({secret})",
+        meta={"key_id": "key_0123456789ab", "source_agent": f"agent-{secret}",
+              "path": f"/api/{secret}", "request": {"secret": secret}},
+    )
+    ActivityLedger(tmp_path).append(record)
+    public = ActivityLedger(tmp_path).list()["items"][0]
+    serialized = json.dumps(public)
+    assert secret not in serialized
+    assert "Ab_cd-09" not in serialized
+    assert "[redacted]" in public["actor"]
+    assert "[redacted]" in public["summary"]
+    assert "[redacted]" in public["meta"]["source_agent"]
+    assert "[redacted]" in public["meta"]["path"]
+    assert public["meta"]["key_id"] == "key_0123456789ab"
+    assert "request" not in public["meta"]
+
+
+def test_scoped_activity_pagination_excludes_partial_multi_topic_records(tmp_path: Path) -> None:
+    ledger = ActivityLedger(tmp_path)
+    for index, changes in enumerate((
+        {"topic_id": "alpha"},
+        {"topic_id": None, "action": "whoami"},
+        {"topic_id": None, "meta": {"topic_ids": ["alpha", "beta"]}},
+        {"topic_id": "beta"},
+        {"topic_id": None, "meta": {"topic_ids": ["alpha"]}},
+    ), start=1):
+        ledger.append(_record(index, **changes))
+    scope = frozenset({"alpha"})
+    first = ledger.list(allowed_topics=scope, page_size=2)
+    second = ledger.list(allowed_topics=scope, page=2, page_size=2)
+    assert first["total"] == second["total"] == 3
+    assert len(first["items"]) == 2
+    assert len(second["items"]) == 1
+    assert {item["event_id"] for item in first["items"] + second["items"]} == {
+        f"{index:032x}" for index in (1, 2, 5)
+    }
+    assert ledger.list(allowed_topics=scope, topic_id="beta")["total"] == 0
+
+
+@pytest.mark.parametrize("action", ["recall", "remember", "dream", "bind_topic", "list_topics"])
+def test_scoped_ledger_hides_topic_actions_without_complete_topic_ids(tmp_path: Path, action: str) -> None:
+    ledger = ActivityLedger(tmp_path)
+    unknown = _record(1, action=action, topic_id=None, meta={"topic_count": 9})
+    allowed = _record(2, action=action, topic_id=None, meta={"topic_ids": ["alpha"], "topic_count": 1})
+    mixed = _record(3, action=action, topic_id=None, meta={"topic_ids": ["alpha", "beta"], "topic_count": 2})
+    global_record = _record(4, action="whoami", topic_id=None)
+    for record in (unknown, allowed, mixed, global_record):
+        ledger.append(record)
+    result = ledger.list(allowed_topics=frozenset({"alpha"}), page_size=1)
+    assert result["total"] == 2
+    assert result["items"] == [global_record.to_dict()]
+    assert ledger.list(allowed_topics=frozenset({"alpha"}), page=2, page_size=1)["items"] == [allowed.to_dict()]
+    assert ledger.list()["total"] == 4

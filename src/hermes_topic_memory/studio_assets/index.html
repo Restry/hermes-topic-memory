@@ -94,6 +94,10 @@
             <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             <span>运行流水</span>
           </button>
+          <button id="tab-keys" class="tab" data-tab="keys" type="button" role="tab" aria-selected="false" aria-controls="panel-keys" tabindex="-1">
+            <svg aria-hidden="true" focusable="false" class="icon-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="5"/><path d="m11.5 11.5 9-9L23 5l-3 3-2-2-3 3"/></svg>
+            <span>接入与密钥</span>
+          </button>
         </nav>
 
         <!-- Tab 1: Topic Detail + Remember + Dream -->
@@ -109,7 +113,7 @@
             </div>
             <div class="action-row">
               <button id="btn-toggle-remember" class="btn btn-ghost btn-sm" type="button" aria-controls="remember-drawer" aria-expanded="false" disabled>+ 记一条</button>
-              <button id="btn-dream-preview" class="btn btn-purple btn-sm" type="button" disabled>Dream 预览</button>
+              <button id="btn-dream-preview" class="btn btn-purple-outline btn-sm" type="button" disabled>Dream 预览</button>
               <button id="btn-dream-apply" class="btn btn-primary btn-sm" type="button" aria-controls="dream-apply-confirm" aria-expanded="false" disabled>应用 Dream 换版…</button>
             </div>
           </div>
@@ -139,7 +143,7 @@
                 <strong id="dream-status-title" role="status" aria-live="polite">Dream 巩固结果</strong>
               </div>
               <div class="dream-head-actions">
-                <button id="btn-dream-commit-inline" class="btn btn-primary btn-xs hidden" type="button" aria-controls="dream-apply-confirm" aria-expanded="false">应用此版本…</button>
+                <button id="btn-dream-commit-inline" class="btn btn-purple-outline btn-xs hidden" type="button" aria-controls="dream-apply-confirm" aria-expanded="false">应用此版本…</button>
                 <button id="btn-dream-close" class="btn btn-ghost btn-xs" type="button">收起</button>
               </div>
             </div>
@@ -223,6 +227,8 @@
                   <option value="auth_failed">认证失败</option>
                   <option value="sso_login">SSO 登录</option>
                   <option value="sso_logout">SSO 退出</option>
+                  <option value="key_create">创建密钥</option>
+                  <option value="key_revoke">吊销密钥</option>
                 </select>
               </div>
               <div class="log-filter">
@@ -286,6 +292,106 @@
               <div id="log-dreams" class="log-list" aria-busy="false"></div>
             </div>
           </details>
+        </div>
+
+        <!-- Tab 4: Keys & Client Integration -->
+        <div id="panel-keys" class="tab-panel hidden" role="tabpanel" aria-labelledby="tab-keys" tabindex="0" hidden>
+          <header class="keys-intro">
+            <h2>让每个 Agent 使用自己的密钥</h2>
+            <p class="muted small">按任务分配权限与主题范围。接入配置使用当前站点，无需共享全局管理密钥。</p>
+          </header>
+          <p id="keys-permission-note" class="permission-note" role="note">创建、查看和吊销密钥需要管理员权限。你仍可复制接入配置；请向管理员申请与任务匹配的密钥。</p>
+
+          <section id="key-secret-card" class="key-secret-card hidden" aria-labelledby="key-secret-title" aria-describedby="key-secret-warning" hidden>
+            <div class="log-col-head">
+              <h3 id="key-secret-title">密钥已创建 · 请立即保存</h3>
+              <span class="pill pill-amber">仅此一次</span>
+            </div>
+            <p id="key-secret-warning" class="key-secret-warning">明文密钥仅显示这一次，关闭后无法再次查看。下方配置也会使用这把密钥；关闭或退出后会清除页面中的明文。</p>
+            <pre id="key-secret-value" class="key-secret-value" tabindex="0" aria-label="新建 API 密钥明文"></pre>
+            <div class="action-row">
+              <button id="btn-key-copy" class="btn btn-primary" type="button">复制密钥</button>
+              <button id="btn-key-dismiss" class="btn btn-ghost" type="button">关闭并清除明文</button>
+            </div>
+          </section>
+
+          <div id="keys-workspace" class="keys-workspace integration-only">
+            <section id="key-admin-create" class="log-col key-create-card hidden" aria-labelledby="key-create-heading" hidden>
+              <h3 id="key-create-heading">创建 API 密钥</h3>
+              <p class="muted small logs-intro">一把密钥对应一个 Agent 或协作者。建议从最小权限开始。</p>
+              <form id="key-create-form" aria-label="创建 API 密钥">
+                <fieldset id="key-create-fields" class="key-form-fields">
+                  <legend class="sr-only">密钥权限与有效期</legend>
+                  <div class="log-filter">
+                    <label for="key-name">名称</label>
+                    <input id="key-name" name="name" type="text" maxlength="80" required autocomplete="off" placeholder="例如：项目召回助手" aria-describedby="key-name-help key-create-error" />
+                    <p id="key-name-help" class="muted small field-help">1–80 字，用名称辨认调用来源，不要填写密钥或密码。</p>
+                  </div>
+                  <div class="log-filter">
+                    <label for="key-role">权限</label>
+                    <select id="key-role" name="role" required aria-describedby="key-create-error">
+                      <option value="read">只读召回</option>
+                      <option value="write">读写与 Dream</option>
+                      <option value="admin">完全管理</option>
+                    </select>
+                  </div>
+                  <div class="log-filter">
+                    <label for="key-topics">允许的主题 ID（可选）</label>
+                    <input id="key-topics" name="allowed_topics" type="text" list="key-topic-options" autocomplete="off" placeholder="留空 = 全部主题" aria-describedby="key-topics-help key-create-error" />
+                    <datalist id="key-topic-options"></datalist>
+                    <p id="key-topics-help" class="muted small field-help">留空允许全部主题；从建议中选择主题 ID，多个 ID 用逗号分隔。仅接受当前可用的主题。</p>
+                  </div>
+                  <div class="log-filter">
+                    <label for="key-expiry">有效期</label>
+                    <select id="key-expiry" name="expires_in_days" aria-describedby="key-create-error">
+                      <option value="">永不过期</option>
+                      <option value="7">7 天</option>
+                      <option value="30">30 天</option>
+                      <option value="90">90 天</option>
+                      <option value="365">365 天</option>
+                    </select>
+                  </div>
+                  <button id="btn-key-create" class="btn btn-primary" type="submit">创建密钥</button>
+                </fieldset>
+                <p id="key-create-status" class="muted small field-help" role="status" aria-live="polite"></p>
+                <p id="key-create-error" class="error-text hidden" role="alert"></p>
+              </form>
+            </section>
+
+            <section class="log-col integration-card" aria-labelledby="integration-heading">
+              <div class="log-col-head">
+                <h3 id="integration-heading">复制配置，接入你的客户端</h3>
+                <button id="btn-config-copy" class="btn btn-ghost btn-sm" type="button">复制配置</button>
+              </div>
+              <div id="integration-clients" class="segmented integration-clients" role="tablist" aria-label="接入客户端">
+                <button id="client-hermes" class="seg-btn active" data-client="hermes" type="button" role="tab" aria-selected="true" aria-controls="integration-config-panel" tabindex="0">Hermes</button>
+                <button id="client-omp" class="seg-btn" data-client="omp" type="button" role="tab" aria-selected="false" aria-controls="integration-config-panel" tabindex="-1">OMP (Pi)</button>
+                <button id="client-opencode" class="seg-btn" data-client="opencode" type="button" role="tab" aria-selected="false" aria-controls="integration-config-panel" tabindex="-1">OpenCode</button>
+                <button id="client-codex" class="seg-btn" data-client="codex" type="button" role="tab" aria-selected="false" aria-controls="integration-config-panel" tabindex="-1">Codex</button>
+                <button id="client-curl" class="seg-btn" data-client="curl" type="button" role="tab" aria-selected="false" aria-controls="integration-config-panel" tabindex="-1">curl</button>
+              </div>
+              <div id="integration-config-panel" class="integration-config-panel" role="tabpanel" aria-labelledby="client-hermes" tabindex="0">
+                <p id="integration-instructions" class="muted small logs-intro"></p>
+                <p id="integration-token-note" class="integration-token-note small" role="status" aria-live="polite"></p>
+                <pre id="integration-config" class="code-box integration-config" aria-label="客户端接入配置"></pre>
+              </div>
+            </section>
+          </div>
+
+          <section id="key-admin-list" class="log-col key-list-card hidden" aria-labelledby="key-list-heading" hidden>
+            <div class="log-col-head">
+              <h3 id="key-list-heading">已分发的 API 密钥</h3>
+              <span id="key-count" class="pill pill-gray">0 把</span>
+              <button id="btn-keys-refresh" class="btn btn-ghost btn-sm" type="button">刷新密钥</button>
+            </div>
+            <p id="keys-loading" class="muted small logs-intro" role="status" aria-live="polite"></p>
+            <div id="keys-error" class="inline-error hidden" role="alert">
+              <p id="keys-error-message"></p>
+              <button id="btn-keys-retry" class="btn btn-ghost btn-sm" type="button">重试</button>
+            </div>
+            <p id="keys-empty" class="muted small hidden">尚未创建 API 密钥。使用上方表单，为第一个 Agent 分配独立权限，再复制接入配置。</p>
+            <ul id="key-list" class="key-list" aria-label="API 密钥与权限" aria-busy="false"></ul>
+          </section>
         </div>
       </section>
     </main>

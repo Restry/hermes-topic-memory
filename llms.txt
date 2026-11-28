@@ -2,7 +2,7 @@
 
 > Cloud-hosted, topic-isolated long-term memory service for AI agents (Hermes, Pi Agent / OMP, OpenCode, Codex, Claude Code).
 > Transport: MCP Streamable HTTP (`POST /mcp`, JSON-RPC 2.0) and REST API (`/api/v1/*`).
-> Auth: `Authorization: Bearer <TOPIC_MEMORY_TOKEN>` (obtain the token from the owner; never hardcode or log it).
+> Auth: `Authorization: Bearer <TOPIC_MEMORY_TOKEN>` (use a per-agent managed key from Studio; never commit or log it).
 
 ## Endpoints
 
@@ -15,8 +15,19 @@
   - `POST /api/v1/remember` — persist a durable fact with provenance & idempotency
   - `POST /api/v1/topics/bind` — bind a `chat_id`, `repo_url`, or `workspace_path` to an existing topic
   - `POST /api/v1/dream` — consolidate a topic (`dry_run: true` recommended before applying)
-- Human Studio UI: `/` (WeChat Gateway SSO protected)
+- Human Studio UI: `/studio` (API key or environment token; WeChat SSO when configured). Its **接入与密钥** tab creates keys and generates current-origin client snippets.
 - This guide: `GET /llms.txt` (public, no auth required)
+
+## Managed Keys, Roles, and Topic Scope
+
+- `read`: `whoami`, `list_topics`, `recall`, and read-only Panel views/recall planning.
+- `write`: read access plus `remember`, `bind_topic`, `dream`; no Panel administrative mutations.
+- `admin`: full access including key management. SSO and `HERMES_TOPIC_MEMORY_PANEL_TOKEN` remain administrators.
+- Admin `GET /api/keys` lists public metadata. `POST /api/keys` accepts `name`, `role`, optional non-empty `allowed_topics`, optional positive `expires_in_days`; its `201` response reveals `secret` once. `POST /api/keys/{key_id}/revoke` is idempotent and returns the public key record.
+- Secrets are `htm_` plus 32 URL-safe random characters. Private storage keeps only SHA-256 hashes/prefixes; expired/revoked keys fail authentication. Last-use persistence is throttled to 60 seconds.
+- Omit `allowed_topics` for all topics, or supply topic IDs. Listings/automatic recall candidates are restricted before reading; IDs/aliases/context outside scope fail with `403 topic_forbidden`. Role denials use `403 forbidden`; MCP returns a tool error. Core / WhoAmI remains shared.
+- `GET /api/auth/me` includes authenticated `actor`, `role`, `key_id`. Ledger events, key changes, and denials identify the caller without tokens.
+- Keep keys in the client's secret environment. Dismissal/logout removes the creation secret from Studio's displayed configurations; it is never saved to browser storage.
 
 ## MCP Tools (Exact Schema)
 
@@ -73,16 +84,23 @@ Set environment variable `TOPIC_MEMORY_TOKEN` (never commit tokens into git).
 ```json
 {
   "mcp": {
-    "topic-memory": {
-      "type": "remote",
-      "url": "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp",
-      "headers": {
-        "Authorization": "Bearer {env:TOPIC_MEMORY_TOKEN}"
+    "servers": {
+      "topic-memory": {
+        "type": "remote",
+        "url": "https://mindmemos-brain4-20260810.chinanorth3.cloudapp.chinacloudapi.cn/mcp",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:TOPIC_MEMORY_TOKEN}"
+        }
       }
     }
   }
 }
 ```
+
+OpenCode's current `mcp.servers` shape uses native `{env:TOPIC_MEMORY_TOKEN}` expansion, not `${TOPIC_MEMORY_TOKEN}`. Codex's `bearer_token_env_var` is the variable name, not its value; static `http_headers` do not expand `${...}`. Studio uses a literal Bearer header only while the creation secret is visible.
+
+Client references: [Hermes](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference), [OMP](https://github.com/can1357/oh-my-pi/blob/49dc75e819b075b9dccdb6bce5e2100195f85a00/docs/mcp-config.md), [OpenCode](https://opencode.ai/docs/mcp-servers/), [Codex](https://developers.openai.com/codex/mcp/). Standalone Pi uses `~/.pi/agent/mcp.json`, not OMP's directory.
 
 ### Codex — `~/.codex/config.toml`
 ```toml

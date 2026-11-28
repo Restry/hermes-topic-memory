@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from hermes_topic_memory.activity_log import ActivityLedger
 from hermes_topic_memory.panel_app import PanelApplication
 from hermes_topic_memory.panel_server import create_panel_server
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
@@ -135,6 +136,59 @@ def test_wx_sso_end_to_end_and_studio_ui(tmp_path: Path) -> None:
         conn.request("GET", "/api/auth/me", headers={"Cookie": session_cookie})
         me = json.loads(conn.getresponse().read().decode("utf-8"))
         assert me["authenticated"] is True and me["mode"] == "sso" and me["user"]["nickname"] == "爸爸"
+        assert me["role"] == "admin" and me["key_id"] is None and me["actor"] == "sso:爸爸"
+
+        # The real signed session can administer managed keys without an env bearer.
+        conn.request("POST", "/api/keys", body=json.dumps({
+            "name": "sso-created-reader", "role": "read", "allowed_topics": ["veloiq"],
+        }), headers={"Cookie": session_cookie, "Content-Type": "application/json"})
+        key_response = conn.getresponse()
+        created = json.loads(key_response.read())
+        assert key_response.status == 201
+        key_id, key_secret = created["key"]["key_id"], created["secret"]
+        assert created["key"]["created_by"] == "sso:爸爸"
+        assert "key_hash" not in created["key"] and "secret" not in created["key"]
+        conn.request("GET", "/api/keys", headers={"Cookie": session_cookie})
+        listed_response = conn.getresponse()
+        listed = json.loads(listed_response.read())
+        assert listed_response.status == 200 and [item["key_id"] for item in listed["items"]] == [key_id]
+        assert key_secret not in json.dumps(listed) and "key_hash" not in json.dumps(listed)
+        conn.request("GET", "/api/auth/me", headers={"Authorization": f"Bearer {key_secret}"})
+        managed_me = json.loads(conn.getresponse().read())
+        assert managed_me["mode"] == "api_key" and managed_me["role"] == "read" and managed_me["key_id"] == key_id
+        revocations = []
+        conn.request("GET", "/api/keys", headers={"Cookie": session_cookie, "Authorization": f"Bearer {key_secret}"})
+        precedence_response = conn.getresponse()
+        precedence_denial = json.loads(precedence_response.read())
+        assert precedence_response.status == 403 and precedence_denial["error"]["code"] == "forbidden"
+        conn.request("GET", "/api/auth/me", headers={"Cookie": session_cookie, "Authorization": f"Bearer {key_secret}"})
+        combined_me = json.loads(conn.getresponse().read())
+        assert combined_me["mode"] == "api_key" and combined_me["role"] == "read"
+        for _ in range(2):
+            conn.request("POST", f"/api/keys/{key_id}/revoke", body="{}", headers={"Cookie": session_cookie, "Content-Type": "application/json"})
+            revoke_response = conn.getresponse()
+            revoked = json.loads(revoke_response.read())
+            assert revoke_response.status == 200 and revoked["key"]["status"] == "revoked"
+            assert key_secret not in json.dumps(revoked) and "key_hash" not in json.dumps(revoked)
+            revocations.append(revoked)
+        assert revocations[0] == revocations[1]
+        conn.request("GET", "/api/auth/me", headers={"Authorization": f"Bearer {key_secret}"})
+        assert json.loads(conn.getresponse().read())["authenticated"] is False
+        management = [item for item in ActivityLedger(tmp_path).list(page_size=100)["items"] if item["action"] in {"key_create", "key_revoke"}]
+        conn.request("GET", "/api/keys", headers={"Cookie": session_cookie, "Authorization": f"Bearer {key_secret}"})
+        revoked_response = conn.getresponse()
+        revoked_listing = json.loads(revoked_response.read())
+        assert revoked_response.status == 200
+        assert revoked_listing["items"][0]["key_id"] == key_id and revoked_listing["items"][0]["status"] == "revoked"
+        conn.request("GET", "/api/auth/me", headers={"Cookie": session_cookie, "Authorization": f"Bearer {key_secret}"})
+        fallback_me = json.loads(conn.getresponse().read())
+        assert fallback_me["authenticated"] is True and fallback_me["mode"] == "sso"
+        assert fallback_me["role"] == "admin" and fallback_me["key_id"] is None and fallback_me["actor"] == "sso:爸爸"
+        assert {item["action"] for item in management} == {"key_create", "key_revoke"}
+        assert all(item["actor"] == "sso:爸爸" and item["status"] == "ok" for item in management)
+        persisted = "".join(path.read_text() for path in (tmp_path / "activity-log").glob("*.jsonl"))
+        for private in (key_secret, session_cookie.split("=", 1)[1], secret, "panel-tok"):
+            assert private not in persisted
 
         conn.request("GET", "/api/dreams", headers={"Cookie": session_cookie})
         dr = conn.getresponse()

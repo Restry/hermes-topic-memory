@@ -22,6 +22,9 @@ Every command requires an explicit data root:
 ```text
 data/
   topic-registry.json
+  api-keys.json
+  .api-keys.lock
+  activity-log/<YYYY-MM>.jsonl
   topics/<topic_id>/memory.md
   topics/<topic_id>/metadata.json
   topics/<topic_id>/evidence.jsonl
@@ -102,6 +105,40 @@ The Provider exposes:
 A current query naming several valid topics is not prefetched as one arbitrary topic. Prefetch returns empty so the Agent can call `topic_memory_recall_multi`; multi-topic session scope is retained separately and never overwrites the single current-topic binding with an arbitrary member.
 
 `queue_prefetch()` and `sync_turn()` submit background work and return immediately. `prefetch()` only consumes a completed result keyed to the same session and query. `sync_turn()` honors a new unique topic mention, otherwise writes to that session's current topic. Session-end, pre-compression, configured batch, and shutdown boundaries flush evidence and run the updater. `topic_memory_update` requires exactly one of `body` or `append_text`; append mode preserves the complete current body as a byte-identical prefix and normalizes only the new Markdown boundary. Successful explicit updates return `update_mode` (`append` or `replace`), versions, `evidence_ids`, and `evidence_source` (`supplied` or `current_turn`) without returning bodies. Expected rejections use stable safe codes: `invalid_update_arguments`, `current_turn_evidence_unavailable`, `topic_ambiguous`, `topic_unresolved`, `body_unchanged`, `append_duplicate`, `evidence_not_found`, or `evidence_topic_mismatch`; unexpected failures remain redacted as `operation_failed`.
+
+## HTTP access and Studio keys
+
+MCP (`POST /mcp`), REST (`/api/v1/*`), and Studio (`/studio`) share the same authenticated service. With the Reader and `HERMES_TOPIC_MEMORY_PANEL_TOKEN` configured in the process environment:
+
+```bash
+TOPIC_MEMORY_UI_MODE=studio hermes-topic-memory --data-root /path/to/data serve \
+  --bind 127.0.0.1 --port 8080
+```
+
+The environment token remains the bootstrap administrator; WeChat SSO sessions are also administrators. Studio's **接入与密钥** tab issues a separate key per agent/user and generates copyable client configurations without adding P2 editors.
+
+| Role | MCP / REST access | Panel access |
+| --- | --- | --- |
+| `read` | `whoami`, `list_topics`, `recall` | Read-only views and recall plan/run/rerun |
+| `write` | Read access plus `remember`, `bind_topic`, `dream` | Read-only views and recall; no administrative mutations |
+| `admin` | All tools | Topic, Core, recycle-bin, and key administration |
+
+Keys use `htm_` plus 32 URL-safe random characters. Creation reveals the plaintext only once; copy it into the client's secret environment before dismissing the reveal. Studio never saves the newly revealed secret in browser storage. Snippets use the current origin and revealed key, then return to environment references after dismissal/logout. Non-admin users still get the integration generator.
+
+`data_root/api-keys.json` stores only SHA-256 digests and 12-character prefixes, protected by stable-file exclusive `flock`, atomic replacement, and `0o600` permissions. Keys support optional expiry, idempotent revocation, and last-use persistence throttled to 60 seconds. Revoked/expired keys cannot authenticate.
+
+Omit the topic allowlist for all topics, or supply non-empty topic IDs. IDs, aliases, and bound contexts are checked before effects; automatic recall sees only allowed candidates. Scoped topic lists, overview counts, histories, reports, and activity pagination cannot expose another topic. Mixed-topic history is hidden unless every selected topic is allowed. Core / WhoAmI remains shared. Scoped administrators cannot create broader-scope keys.
+
+Administrative endpoints:
+
+- `GET /api/keys` → `{"items": [...]}`: public metadata and active/revoked/expired status only.
+- `POST /api/keys` with `name`, `role`, optional non-empty `allowed_topics`, optional positive integer `expires_in_days` → `201 {"key": {...}, "secret": "htm_..."}`.
+- `POST /api/keys/{key_id}/revoke` → `200 {"key": {...}}`; repeated revocation preserves its timestamp; a missing key returns `404`.
+- `GET /api/auth/me` includes authenticated `actor`, `role`, `key_id`; the environment-token response retains `mode="token"`, managed keys use `mode="api_key"`.
+
+Role denials return `403 forbidden`; out-of-scope targets return `403 topic_forbidden` (MCP returns a tool error). Ledger events identify the authenticated actor/key, including key changes and denials, without tokens. A valid Bearer credential takes precedence over SSO; otherwise the independent existing SSO-session fallback is preserved.
+
+See [the integration guide](llms.txt) for exact client formats. Hermes/OMP expand `${TOPIC_MEMORY_TOKEN}`; OpenCode uses `{env:TOPIC_MEMORY_TOKEN}`; Codex uses `bearer_token_env_var = "TOPIC_MEMORY_TOKEN"`. Merge snippets into existing settings and keep secrets out of Git.
 
 ## Copy-only installer
 

@@ -151,7 +151,7 @@ def test_studio_tabs_have_panel_relationships_and_roving_keyboard_contract(studi
     assert tablist.attrs.get("role") == "tablist"
     assert tablist.attrs.get("aria-label")
     tabs = [node for node in tablist.descendants() if node.attrs.get("role") == "tab"]
-    assert len(tabs) == 3
+    assert len(tabs) == 4
     assert sum(tab.attrs.get("aria-selected") == "true" for tab in tabs) == 1
     for tab in tabs:
         assert tab.tag == "button" and tab.text_content().strip()
@@ -242,6 +242,7 @@ def test_activity_filters_cover_public_actions_sources_and_localized_statuses(st
         "topic_create", "topic_edit", "topic_append", "topic_rollback", "topic_archive",
         "topic_restore", "topic_trash", "topic_delete", "core_init", "core_edit",
         "core_rollback", "auth_failed", "sso_login", "sso_logout",
+        "key_create", "key_revoke",
     }
     assert all(label and label != value for value, label in actions.items() if value)
     assert set(_options(studio_dom.ids["activity-source"])) == {"", "mcp", "rest", "panel", "studio", "cli", "system"}

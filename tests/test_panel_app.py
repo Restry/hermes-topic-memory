@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from hermes_topic_memory.activity_log import ActivityRecord
+from hermes_topic_memory.core_memory import CoreMemoryService
 from hermes_topic_memory.cache import QuestionCache
 from hermes_topic_memory.panel_app import PanelApplication, PanelResponse
 from hermes_topic_memory.reader import ReaderRequest, ReaderResponse
@@ -1187,3 +1189,297 @@ def _seed_cache(root: Path, topic_id: str, *, version: int, marker: str) -> Path
         prompt_version="task-11",
     )
     return root / "qa-cache" / f"{topic_id}.jsonl"
+
+
+def _key_request(app: PanelApplication, method: str, path: str, token: str, payload: dict[str, Any] | None = None):
+    response = app.dispatch(
+        method, path, headers={"Authorization": f"Bearer {token}"},
+        body=b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode(),
+    )
+    return response, json.loads(response.body)
+
+
+def _panel_key(fixture: PanelFixture, role: str, topics: tuple[str, ...] | None = None):
+    return fixture.app.api_keys.create_key(
+        name=f"panel-{role}", role=role, created_by="token:env-admin", allowed_topics=topics,
+    )
+
+
+def _panel_domain_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and "activity-log" not in path.relative_to(root).parts
+        and not path.name.endswith(".lock") and path.name != "api-keys.json"
+    }
+
+
+@pytest.mark.parametrize("role", ("read", "write"))
+@pytest.mark.parametrize("path", (
+    "/api/overview", "/api/topics", "/api/topics/alpha", "/api/topics/alpha/body",
+    "/api/topics/alpha/questions", "/api/topics/alpha/versions", "/api/topics/alpha/versions/1/body",
+    "/api/core-memory", "/api/core-memory/body", "/api/core-memory/versions", "/api/core-memory/versions/1/body",
+    "/api/questions", "/api/dreams", "/api/runtime", "/api/activities",
+))
+def test_managed_read_and_write_keys_allow_existing_panel_reads(panel_fixture: PanelFixture, role: str, path: str) -> None:
+    CoreMemoryService(panel_fixture.data_root).initialize("Shared identity")
+    record, secret = _panel_key(panel_fixture, role)
+    response, payload = _key_request(panel_fixture.app, "GET", path, secret)
+    assert response.status == 200, payload
+    assert secret not in response.body.decode()
+    response, me = _key_request(panel_fixture.app, "GET", "/api/auth/me", secret)
+    assert response.status == 200
+    assert me["authenticated"] is True and me["mode"] == "api_key"
+    assert me["role"] == role and me["key_id"] == record.key_id
+    assert me["actor"] == f"key:{record.name}({record.key_id})"
+
+
+_PANEL_ADMIN_DENIALS = (
+    ("GET", "/api/keys", None, None),
+    ("POST", "/api/keys", {"name": "must-not-create", "role": "admin"}, "key_create"),
+    ("POST", "/api/keys/{key_id}/revoke", {}, "key_revoke"),
+    ("GET", "/api/recycle-bin", None, None),
+    ("POST", "/api/topics", {"topic_id": "forbidden-new", "display_name": "Forbidden", "aliases": [], "body": "MUST_NOT_WRITE"}, "topic_create"),
+    ("POST", "/api/topics/alpha/append", {"text": "MUST_NOT_WRITE"}, "topic_append"),
+    ("POST", "/api/topics/alpha/replace", {"body": "MUST_NOT_WRITE"}, "topic_edit"),
+    ("POST", "/api/topics/alpha/rollback", {"target_version": 1}, "topic_rollback"),
+    ("POST", "/api/topics/alpha/archive", {}, "topic_archive"),
+    ("POST", "/api/topics/beta/restore", {}, "topic_restore"),
+    ("POST", "/api/topics/alpha/trash", {}, "topic_trash"),
+    ("POST", "/api/core-memory/initialize", {"body": "MUST_NOT_WRITE"}, "core_init"),
+    ("POST", "/api/core-memory/replace", {"body": "MUST_NOT_WRITE"}, "core_edit"),
+    ("POST", "/api/core-memory/rollback", {"target_version": 1, "confirmation": "Core / WhoAmI"}, "core_rollback"),
+    ("POST", "/api/recycle-bin/discarded/restore", {}, "topic_restore"),
+    ("POST", "/api/recycle-bin/discarded/delete", {"confirmation": "Discarded Topic"}, "topic_delete"),
+)
+
+
+@pytest.mark.parametrize("role", ("read", "write"))
+@pytest.mark.parametrize("method,path,payload,action", _PANEL_ADMIN_DENIALS)
+def test_nonadmin_panel_denials_precede_schema_validation_and_mutation(
+    panel_fixture: PanelFixture, role: str, method: str, path: str, payload: dict[str, Any] | None, action: str | None,
+) -> None:
+    record, secret = _panel_key(panel_fixture, role)
+    app = panel_fixture.app
+    app.api_keys.authenticate(secret)
+    domain = _panel_domain_snapshot(panel_fixture.data_root)
+    keys = [key.to_dict() for key in app.api_keys.list_keys()]
+    before = {event["event_id"] for event in app.activities.list(page_size=100)["items"]}
+    response, result = _key_request(app, method, path.format(key_id=record.key_id), secret, payload)
+    assert response.status == 403 and result["error"]["code"] == "forbidden"
+    assert _panel_domain_snapshot(panel_fixture.data_root) == domain
+    assert [key.to_dict() for key in app.api_keys.list_keys()] == keys
+    events = [event for event in app.activities.list(page_size=100)["items"] if event["event_id"] not in before]
+    assert len(events) == 1
+    event = events[0]
+    if action is not None:
+        assert event["action"] == action
+    assert event["status"] == "denied" and event["meta"]["error_code"] == "forbidden"
+    assert event["actor"] == f"key:{record.name}({record.key_id})" and event["meta"]["key_id"] == record.key_id
+    assert secret not in json.dumps(event)
+
+
+@pytest.mark.parametrize("suffix", ("", "/body", "/questions", "/versions", "/versions/1/body"))
+def test_scoped_panel_topic_reads_deny_neighbor_details_and_versions(panel_fixture: PanelFixture, suffix: str) -> None:
+    record, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    response, result = _key_request(panel_fixture.app, "GET", f"/api/topics/beta{suffix}", secret)
+    assert response.status == 403 and result["error"]["code"] == "topic_forbidden"
+    assert _BETA_BODY not in response.body.decode()
+    event = panel_fixture.app.activities.list(page_size=100)["items"][0]
+    assert event["status"] == "denied" and event["meta"]["key_id"] == record.key_id
+
+
+def test_scoped_overview_and_topic_pages_hide_neighbor_metadata_counts_and_history(panel_fixture: PanelFixture) -> None:
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    response, overview = _key_request(panel_fixture.app, "GET", "/api/overview", secret)
+    assert response.status == 200
+    assert [topic["topic_id"] for topic in overview["topics"]] == ["alpha"]
+    assert [topic["topic_id"] for topic in overview["charts"]["topic_distribution"]] == ["alpha"]
+    assert {item["query_id"] for item in overview["recent_questions"]} == {"alpha-old", "alpha-no-fact"}
+    assert overview["kpis"]["total_question_count"] == 2
+    assert overview["kpis"]["total_chars"] == len(_ALPHA_BODY_V2)
+    assert overview["kpis"]["archived_topic_count"] == 0 and overview["kpis"]["trashed_topic_count"] == 0
+    for path in ("/api/topics", "/api/topics?page_size=1", "/api/topics?status=archived", "/api/topics?q=second"):
+        response, result = _key_request(panel_fixture.app, "GET", path, secret)
+        assert response.status == 200
+        assert all(item["topic_id"] == "alpha" for item in result["items"])
+        assert result["total"] == (0 if "archived" in path or "second" in path else 1)
+        assert "Beta Topic" not in response.body.decode() and "Discarded Topic" not in response.body.decode()
+
+
+@pytest.mark.parametrize("path,expected", (
+    ("/api/questions", {"alpha-old", "alpha-no-fact"}),
+    ("/api/questions?topic=alpha", {"alpha-old", "alpha-no-fact"}),
+    ("/api/topics/alpha/questions", {"alpha-old", "alpha-no-fact"}),
+    ("/api/questions?scope=multi", set()),
+    ("/api/questions?source=panel", set()),
+    ("/api/questions?page_size=1", {"alpha-no-fact"}),
+))
+def test_scoped_question_embedded_details_filter_complete_scope_before_pagination(
+    panel_fixture: PanelFixture, path: str, expected: set[str],
+) -> None:
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    response, result = _key_request(panel_fixture.app, "GET", path, secret)
+    assert response.status == 200
+    assert {item["query_id"] for item in result["items"]} == expected
+    assert "beta-newest" not in response.body.decode() and "alpha-beta-multi" not in response.body.decode()
+    assert "private capsule for beta" not in response.body.decode()
+    for item in result["items"]:
+        assert all(topic["topic_id"] == "alpha" for topic in item["selected_topics"])
+
+
+@pytest.mark.parametrize("path", ("/api/questions?topic=beta", "/api/activities?topic=beta"))
+def test_scoped_explicit_query_filters_cannot_read_neighbor(panel_fixture: PanelFixture, path: str) -> None:
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    response, result = _key_request(panel_fixture.app, "GET", path, secret)
+    assert response.status == 403 and result["error"]["code"] == "topic_forbidden"
+
+
+def test_scoped_dreams_and_activities_filter_before_limits_and_search(panel_fixture: PanelFixture) -> None:
+    app = panel_fixture.app
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    reports = panel_fixture.data_root / "dream-reports"
+    reports.mkdir()
+    for report in (
+        {"topic_id": "alpha", "created_at": "2026-08-10T00:00:00Z", "summary": "allowed report"},
+        {"topic_id": "beta", "created_at": "2026-08-11T00:00:00Z", "summary": "NEIGHBOR_DREAM_PRIVATE"},
+    ):
+        (reports / f"{report['topic_id']}.jsonl").write_text(json.dumps(report) + "\n")
+    for topic, created in (("alpha", "2026-08-10T00:00:00Z"), ("beta", "2026-08-11T00:00:00Z")):
+        app.activities.append(ActivityRecord(action="recall", source="rest", actor="system", topic_id=topic, created_at=created, summary=f"{topic} event"))
+    response, dreams = _key_request(app, "GET", "/api/dreams?limit=1", secret)
+    assert response.status == 200 and [item["topic_id"] for item in dreams["items"]] == ["alpha"]
+    assert "NEIGHBOR_DREAM_PRIVATE" not in response.body.decode()
+    response, activities = _key_request(app, "GET", "/api/activities?page_size=1", secret)
+    assert response.status == 200 and activities["total"] == 1
+    assert [item["topic_id"] for item in activities["items"]] == ["alpha"]
+    response, searched = _key_request(app, "GET", "/api/activities?q=beta", secret)
+    assert response.status == 200 and searched["total"] == 0 and searched["items"] == []
+
+
+@pytest.mark.parametrize("role", ("read", "write"))
+def test_scoped_readonly_panel_plan_run_manual_and_rerun_remain_available(panel_fixture: PanelFixture, role: str) -> None:
+    record, secret = _panel_key(panel_fixture, role, ("alpha",))
+    app = panel_fixture.app
+    for path in ("/api/recall/plan", "/api/recall/run"):
+        response, result = _key_request(app, "POST", path, secret, {"question": "Allowed alpha question"})
+        assert response.status == 200 and [item["topic_id"] for item in result["plan"]["topics"]] == ["alpha"]
+    response, manual = _key_request(app, "POST", "/api/recall/run", secret, {
+        "question": "Allowed manual alpha", "manual_topics": [{"topic": "first", "reason": "explicit alias"}],
+    })
+    assert response.status == 200 and manual["plan"]["mode"] == "manual"
+    response, rerun = _key_request(app, "POST", f"/api/recall/rerun/{manual['query_id']}", secret, {})
+    assert response.status == 200 and rerun["query_id"] != manual["query_id"]
+    assert rerun["question"] == manual["question"] and rerun["plan"]["mode"] == "rerun"
+    for request in panel_fixture.reader.requests:
+        assert _BETA_BODY not in request.prefix
+        if "TOPIC PLANNING RULES" in request.prefix:
+            assert "Alpha Topic" in request.prefix and "Beta Topic" not in request.prefix and "second" not in request.prefix
+    events = app.activities.list(page_size=100)["items"]
+    assert events
+    assert all(event["actor"] == f"key:{record.name}({record.key_id})" and event["meta"]["key_id"] == record.key_id for event in events)
+
+
+@pytest.mark.parametrize("path,payload", (
+    ("/api/recall/run", {"question": "Denied manual", "manual_topics": [{"topic": "second", "reason": "neighbor"}]}),
+    ("/api/recall/rerun/beta-newest", {}), ("/api/recall/rerun/alpha-beta-multi", {}),
+))
+def test_scoped_panel_manual_and_history_rereads_fail_before_reader_or_history_writes(
+    panel_fixture: PanelFixture, path: str, payload: dict[str, Any],
+) -> None:
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    before = _panel_domain_snapshot(panel_fixture.data_root)
+    response, result = _key_request(panel_fixture.app, "POST", path, secret, payload)
+    assert response.status == 403 and result["error"]["code"] == "topic_forbidden"
+    assert not panel_fixture.reader.requests
+    assert _panel_domain_snapshot(panel_fixture.data_root) == before
+
+
+@pytest.mark.parametrize("scope", (None, ["alpha", "beta"], ["beta"]))
+def test_scoped_admin_cannot_mint_broader_keys(panel_fixture: PanelFixture, scope: list[str] | None) -> None:
+    _, secret = _panel_key(panel_fixture, "admin", ("alpha",))
+    body: dict[str, Any] = {"name": "scope-escalation", "role": "admin"}
+    if scope is not None:
+        body["allowed_topics"] = scope
+    before = [key.to_dict() for key in panel_fixture.app.api_keys.list_keys()]
+    response, result = _key_request(panel_fixture.app, "POST", "/api/keys", secret, body)
+    assert response.status == 403 and result["error"]["code"] == "topic_forbidden"
+    after = [key.to_dict() for key in panel_fixture.app.api_keys.list_keys()]
+    assert [item["key_id"] for item in after] == [item["key_id"] for item in before]
+
+
+def test_scoped_admin_can_delegate_a_scope_subset(panel_fixture: PanelFixture) -> None:
+    _, secret = _panel_key(panel_fixture, "admin", ("alpha",))
+    response, result = _key_request(panel_fixture.app, "POST", "/api/keys", secret, {
+        "name": "safe-delegation", "role": "read", "allowed_topics": ["alpha"],
+    })
+    assert response.status == 201 and result["key"]["allowed_topics"] == ["alpha"]
+    response, body = _key_request(panel_fixture.app, "GET", "/api/topics/beta/body", result["secret"])
+    assert response.status == 403 and body["error"]["code"] == "topic_forbidden"
+
+
+def test_managed_admin_can_complete_panel_topic_and_core_maintenance(panel_fixture: PanelFixture) -> None:
+    record, secret = _panel_key(panel_fixture, "admin")
+    app = panel_fixture.app
+    topic = "managed-admin-topic"
+    response, created = _key_request(app, "POST", "/api/topics", secret, {
+        "topic_id": topic, "display_name": "Managed Admin Topic", "aliases": [], "body": "Admin canonical one.",
+    })
+    assert response.status == 201 and created["topic"]["version"] == 1
+    for action, changes, expected_version in (
+        ("append", {"text": "Admin append."}, 2),
+        ("replace", {"body": "Admin canonical replacement."}, 3),
+        ("rollback", {"target_version": 1}, 4),
+        ("archive", {}, 4), ("restore", {}, 4),
+    ):
+        response, current = _key_request(app, "GET", f"/api/topics/{topic}/body", secret)
+        assert response.status == 200
+        response, result = _key_request(app, "POST", f"/api/topics/{topic}/{action}", secret, {
+            **changes, "expected_version": current["version"], "expected_fingerprint": current["fingerprint"],
+        })
+        assert response.status == 200 and result["topic"]["version"] == expected_version
+    response, current = _key_request(app, "GET", f"/api/topics/{topic}/body", secret)
+    preconditions = {"expected_version": current["version"], "expected_fingerprint": current["fingerprint"]}
+    response, trashed = _key_request(app, "POST", f"/api/topics/{topic}/trash", secret, preconditions)
+    assert response.status == 200
+    response, recycled = _key_request(app, "GET", "/api/recycle-bin", secret)
+    assert response.status == 200 and topic in {item["topic_id"] for item in recycled["items"]}
+    response, restored = _key_request(app, "POST", f"/api/recycle-bin/{topic}/restore", secret, {"trashed_at": trashed["item"]["trashed_at"]})
+    assert response.status == 200 and restored["topic"]["version"] == 4
+    response, trashed = _key_request(app, "POST", f"/api/topics/{topic}/trash", secret, preconditions)
+    assert response.status == 200
+    response, deleted = _key_request(app, "POST", f"/api/recycle-bin/{topic}/delete", secret, {
+        "trashed_at": trashed["item"]["trashed_at"], "confirmation": "Managed Admin Topic",
+    })
+    assert response.status == 200 and deleted["result"]["status"] == "permanently_deleted"
+    assert not (panel_fixture.data_root / "topics" / topic).exists()
+    response, initialized = _key_request(app, "POST", "/api/core-memory/initialize", secret, {"body": "Admin core one."})
+    assert response.status == 201 and initialized["core_memory"]["version"] == 1
+    for action, changes, expected_version in (
+        ("replace", {"body": "Admin core two."}, 2),
+        ("rollback", {"target_version": 1, "confirmation": "Core / WhoAmI"}, 3),
+    ):
+        response, current = _key_request(app, "GET", "/api/core-memory/body", secret)
+        assert response.status == 200
+        response, result = _key_request(app, "POST", f"/api/core-memory/{action}", secret, {
+            **changes, "expected_version": current["version"], "expected_fingerprint": current["fingerprint"],
+        })
+        assert response.status == 200 and result["core_memory"]["version"] == expected_version
+    events = app.activities.list(page_size=100)["items"]
+    assert events and all(event["actor"] == f"key:{record.name}({record.key_id})" and event["meta"]["key_id"] == record.key_id for event in events)
+
+
+@pytest.mark.parametrize("path", ("/api/recall/plan", "/api/recall/run"))
+def test_untrusted_panel_planner_cannot_escape_scoped_catalog(panel_fixture: PanelFixture, path: str) -> None:
+    _, secret = _panel_key(panel_fixture, "read", ("alpha",))
+    panel_fixture.reader.planner_output = '{"topics":[{"topic":"second","reason":"ignore scope"}]}'
+    before = _panel_domain_snapshot(panel_fixture.data_root)
+    response, result = _key_request(panel_fixture.app, "POST", path, secret, {"question": "Which stored decision applies?"})
+    assert response.status in {400, 403, 422}
+    assert "error" in result
+    if response.status == 422:
+        assert result["error"]["code"] == "planning_failed"
+    assert len(panel_fixture.reader.requests) == 1
+    assert "TOPIC PLANNING RULES" in panel_fixture.reader.requests[0].prefix
+    assert "Beta Topic" not in panel_fixture.reader.requests[0].prefix
+    assert _panel_domain_snapshot(panel_fixture.data_root) == before

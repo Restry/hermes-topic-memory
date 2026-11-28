@@ -92,10 +92,18 @@ class TopicCatalog:
     def __init__(self, data_root: str | Path) -> None:
         self.data_root = Path(data_root).expanduser().resolve(strict=True)
 
-    def snapshot(self, *, now: datetime | None = None) -> CatalogSnapshot:
+    def snapshot(
+        self, *, now: datetime | None = None, allowed_topics: frozenset[str] | None = None
+    ) -> CatalogSnapshot:
         registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
         self._validate_topic_directories(registry)
         query_records = QueryHistoryStore(self.data_root).list()
+        if allowed_topics is not None:
+            query_records = [
+                record for record in query_records
+                if record.selected_topics
+                and all(result.topic_id in allowed_topics for result in record.selected_topics)
+            ]
         topic_question_counts: Counter[str] = Counter()
         for record in query_records:
             topic_question_counts.update(
@@ -121,7 +129,9 @@ class TopicCatalog:
         cache = QuestionCache(self.data_root)
         topics: list[TopicSummary] = []
         for config in registry.topics:
-            if config.state == "trashed":
+            if config.state == "trashed" or (
+                allowed_topics is not None and config.topic_id not in allowed_topics
+            ):
                 continue
             metadata = self._read_metadata(config.topic_id)
             if metadata.state != config.state:

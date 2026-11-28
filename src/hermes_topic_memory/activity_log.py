@@ -16,7 +16,7 @@ ActivityAction = Literal[
     "recall", "remember", "dream", "bind_topic", "list_topics", "whoami",
     "topic_create", "topic_edit", "topic_append", "topic_rollback", "topic_archive",
     "topic_restore", "topic_trash", "topic_delete", "core_init", "core_edit",
-    "core_rollback", "auth_failed", "sso_login", "sso_logout",
+    "core_rollback", "auth_failed", "sso_login", "sso_logout", "key_create", "key_revoke",
 ]
 ActivitySource = Literal["mcp", "rest", "panel", "studio", "cli", "system"]
 ActivityStatus = Literal["ok", "no_fact", "duplicate", "skipped", "error", "denied"]
@@ -28,6 +28,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SECRET = re.compile(
     r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)"
     r"|\bBearer\s+\S+"
+    r"|htm_[A-Za-z0-9_-]+"
     r"|\b(?:cookie|set-cookie)\s*[:=].*$"
     r"|\b(?:access[_-]?token|refresh[_-]?token|token|password|passwd|"
     r"authorization|api[_-]?key|secret|private[_-]?key)[\"']?\s*[:=]\s*"
@@ -45,7 +46,7 @@ _META_KEYS = frozenset({
     "before_chars", "after_chars", "topic_count", "error_count", "skipped_count",
     "no_fact_count", "consolidated_count", "evidence_count", "pruned_count",
     "merged_count", "conflicts_resolved", "dry_run", "force", "method", "path",
-    "http_status", "error_code",
+    "http_status", "error_code", "key_id",
 })
 
 
@@ -241,6 +242,7 @@ class ActivityLedger:
         self, *, action: ActivityAction | None = None, source: ActivitySource | None = None,
         topic_id: str | None = None, status: ActivityStatus | None = None,
         q: str | None = None, page: int = 1, page_size: int = 50,
+        allowed_topics: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         for value, choices, label in (
             (action, get_args(ActivityAction), "action"),
@@ -262,6 +264,16 @@ class ActivityLedger:
         records.sort(key=lambda record: (_timestamp(record.created_at), record.event_id), reverse=True)
         items = []
         for record in records:
+            if allowed_topics is not None:
+                record_topics = set(record.meta.get("topic_ids", ()))
+                if record.topic_id is not None:
+                    record_topics.add(record.topic_id)
+                if not record_topics and record.action in (
+                    "recall", "remember", "dream", "bind_topic", "list_topics",
+                ):
+                    continue
+                if not record_topics.issubset(allowed_topics):
+                    continue
             if any(value is not None and getattr(record, key) != value for key, value in (
                 ("action", action), ("source", source), ("topic_id", topic_id), ("status", status),
             )):

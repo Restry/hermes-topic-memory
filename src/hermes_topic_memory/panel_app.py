@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .activity_log import ActivityAction, ActivityLedger, ActivityRecord, ActivitySource, ActivityStatus
+from .api_keys import ApiKeyError, ApiKeyNotFoundError, ApiKeyStore
 from .cache import QuestionCache
 from .core_memory import (
     CORE_DISPLAY_NAME,
@@ -31,8 +32,9 @@ from .multi_recall import (
     ReaderCapsuleSynthesizer,
     TopicSelection,
 )
+from .principal import Principal, PermissionDeniedError, require_role, require_topic, restrict_registry
 from .query_history import QueryHistoryStore, QueryRecord
-from .router import TopicRegistry
+from .router import TopicRegistry, TopicRoutingError
 from .store import FileTopicStore, TopicNotFoundError
 from .topic_planner import PlanningError, TopicPlan, TopicPlanner
 from .topic_admin import TopicAdminError, TopicAdminService
@@ -72,6 +74,7 @@ class PanelApplication:
         "admin",
         "activities",
         "core_memory",
+        "api_keys",
         "data_root",
         "history",
         "memory_service",
@@ -110,6 +113,7 @@ class PanelApplication:
         self.admin = TopicAdminService(self.data_root)
         self.core_memory = CoreMemoryService(self.data_root)
         self.activities = ActivityLedger(self.data_root)
+        self.api_keys = ApiKeyStore(self.data_root)
         self.memory_service = MemoryService(self.data_root, reader, activity_ledger=self.activities)  # type: ignore[arg-type]
         self.mcp = McpProtocol(self.memory_service)
 
@@ -128,12 +132,18 @@ class PanelApplication:
         if raw_path == "/api/auth/me":
             if request_method != "GET":
                 return _error_response(405, "method_not_allowed", "Method not allowed.")
-            return self._auth_me(headers)
+            try:
+                return self._auth_me(headers)
+            except Exception:
+                return _error_response(500, "internal_error", "Request could not be completed.")
         if raw_path.startswith("/api/sso/"):
             return self._sso_response(request_method, target, raw_path, headers, started_ns)
 
-        actor = self._request_actor(headers)
-        if actor == "anonymous":
+        try:
+            principal = self._request_principal(headers)
+        except ApiKeyError:
+            return _error_response(500, "internal_error", "Request could not be completed.")
+        if principal is None:
             try:
                 self.activities.append(ActivityRecord(
                     action="auth_failed", source=_panel_activity_source(headers, raw_path),
@@ -148,46 +158,71 @@ class PanelApplication:
         is_mutation = _is_topic_mutation_target(method, target)
         action, topic_id = _panel_activity_action(request_method, raw_path)
         payload = None
+        denied = False
         try:
             path, params = _parse_target(target)
             if path == ("mcp",):
                 _reject_params(params, set())
                 if request_method != "POST":
                     return _error_response(405, "method_not_allowed", "Method not allowed.")
-                status, result = self.mcp.dispatch(body, actor=actor)
+                status, result = self.mcp.dispatch(body, principal=principal)
                 return PanelResponse(status, b"") if result is None else _json_response(status, result)
             if path[:2] == ("api", "v1"):
-                return self._dispatch_service(request_method, path, params, body, actor=actor)
+                return self._dispatch_service(request_method, path, params, body, principal=principal)
+            self._authorize_panel(request_method, path, params, principal)
             payload = _parse_json_body(body)
             if request_method == "GET":
-                response = self._dispatch_get(path, params)
+                response = self._dispatch_get(path, params, principal=principal)
             elif request_method == "POST":
-                response = self._dispatch_post(path, params, payload)
+                response = self._dispatch_post(path, params, payload, principal=principal)
             else:
                 response = _error_response(405, "method_not_allowed", "Method not allowed.")
+        except PermissionDeniedError as error:
+            denied = True
+            if topic_id is None:
+                candidate = path[2] if len(path) >= 3 and path[:2] in {("api", "topics"), ("api", "recycle-bin")} else params.get("topic")
+                topic_id = _safe_activity_topic(candidate)
+            response = _error_response(403, error.code, str(error))
         except _RequestError as error:
             code = "invalid_request" if is_mutation else error.code
             message = _MUTATION_MESSAGES[code] if is_mutation else error.message
             response = _error_response(400, code, message)
+        except ApiKeyNotFoundError:
+            response = _error_response(404, "not_found", "API key not found.")
         except CoreMemoryNotFoundError:
             response = _mutation_error("core_memory_not_found") if is_mutation else _error_response(404, "not_found", "Resource not found.")
         except (_ResourceNotFound, TopicNotFoundError):
             response = _mutation_error("topic_not_found") if is_mutation else _error_response(404, "not_found", "Resource not found.")
         except Exception:
             response = _mutation_error("operation_failed") if is_mutation else _error_response(500, "internal_error", "Request could not be completed.")
-        if action is not None:
+        if action is not None or denied:
             try:
                 self._record_response(
-                    action, topic_id, response, actor=actor,
-                    source=_panel_activity_source(headers), started_ns=started_ns, payload=payload,
+                    action or "auth_failed", topic_id, response, actor=principal.actor,
+                    principal=principal, source=_panel_activity_source(headers),
+                    started_ns=started_ns, payload=payload,
+                    request_meta={"method": _safe_method(request_method), "path": _safe_activity_path(raw_path)} if denied else None,
                 )
             except Exception:
                 return _mutation_error("operation_failed")
         return response
 
-    def _request_actor(self, headers: Mapping[str, str] | None) -> str:
-        if self._has_valid_bearer(headers):
-            return "token:env-admin"
+    def _request_principal(self, headers: Mapping[str, str] | None) -> Principal | None:
+        supplied = _bearer_token(headers)
+        try:
+            matches_env = secrets.compare_digest(supplied or "", self._auth_token)
+        except (TypeError, ValueError):
+            matches_env = False
+        if supplied is not None:
+            if matches_env:
+                return Principal(mode="env_token", actor="token:env-admin", role="admin")
+            record = self.api_keys.authenticate(supplied)
+            if record is not None:
+                return Principal(
+                    mode="api_key", actor=f"key:{record.name}({record.key_id})",
+                    role=record.role, key_id=record.key_id,
+                    allowed_topics=frozenset(record.allowed_topics) if record.allowed_topics else None,
+                )
         if self.wx_sso is not None:
             try:
                 session = self.wx_sso.read_session(headers)
@@ -196,16 +231,55 @@ class PanelApplication:
             if session is not None:
                 nickname = _safe_actor_component(session.nickname, 64)
                 identity = nickname or _safe_actor_component(session.openid, 12) or "user"
-                return f"sso:{identity}"
-        return "anonymous"
+                return Principal(mode="sso", actor=f"sso:{identity}", role="admin")
+        return None
+
+    def _authorize_panel(
+        self, method: str, path: tuple[str, ...], params: dict[str, str], principal: Principal
+    ) -> None:
+        if path[:2] in {("api", "keys"), ("api", "recycle-bin")}:
+            require_role(principal, "admin")
+        if method == "POST" and not (
+            path in {("api", "recall", "plan"), ("api", "recall", "run")}
+            or (len(path) == 4 and path[:3] == ("api", "recall", "rerun"))
+        ):
+            require_role(principal, "admin")
+        if len(path) >= 3 and path[:2] in {("api", "topics"), ("api", "recycle-bin")}:
+            require_topic(principal, _validated_topic_id(path[2]))
+        if "topic" in params and path[:2] in {("api", "questions"), ("api", "activities"), ("api", "topics")}:
+            require_topic(principal, _validated_topic_id(params["topic"]))
+
+    def _create_key(self, payload: dict[str, Any] | None, principal: Principal) -> PanelResponse:
+        value = _required_payload(payload, {"name", "role", "allowed_topics", "expires_in_days"})
+        if not {"name", "role"}.issubset(value):
+            raise _RequestError("invalid_request", "Key name and role are required.")
+        topics = value.get("allowed_topics")
+        if topics is not None and (
+            not isinstance(topics, list) or not topics or not all(isinstance(topic, str) for topic in topics)
+        ):
+            raise _RequestError("invalid_request", "Topic scope must be a non-empty list of topic ids.")
+        if principal.allowed_topics is not None:
+            if topics is None:
+                raise PermissionDeniedError("topic_forbidden")
+            for topic in topics:
+                require_topic(principal, topic)
+        try:
+            record, secret = self.api_keys.create_key(
+                name=value["name"], role=value["role"], created_by=principal.actor,
+                allowed_topics=topics, expires_in_days=value.get("expires_in_days"),
+            )
+        except ValueError:
+            raise _RequestError("invalid_request", "Invalid API key fields.") from None
+        return _json_response(201, {"key": record.to_dict(), "secret": secret})
 
     def _sso_response(
         self, method: str, target: str, raw_path: str,
         headers: Mapping[str, str] | None, started_ns: int,
     ) -> PanelResponse:
-        actor = self._request_actor(headers)
+        principal = None
         error_code = None
         try:
+            principal = self._request_principal(headers)
             path, params = _parse_target(target)
             response = self._dispatch_sso(method, path, params, headers)
         except WxSsoError as error:
@@ -227,11 +301,12 @@ class PanelApplication:
                     for name, value in response.headers
                     if name.casefold() == "set-cookie"
                 )
-                actor = self._request_actor({"Cookie": cookies})
+                principal = self._request_principal({"Cookie": cookies})
             try:
                 self._record_response(
-                    action, None, response, actor=actor,
-                    source=_panel_activity_source(headers), started_ns=started_ns, error_code=error_code,
+                    action, None, response, actor=principal.actor if principal else "anonymous",
+                    principal=principal, source=_panel_activity_source(headers),
+                    started_ns=started_ns, error_code=error_code,
                 )
             except Exception:
                 return _mutation_error("operation_failed")
@@ -241,6 +316,7 @@ class PanelApplication:
         self, action: ActivityAction, topic_id: str | None, response: PanelResponse, *,
         actor: str, source: ActivitySource, started_ns: int,
         payload: dict[str, Any] | None = None, error_code: str | None = None,
+        principal: Principal | None = None, request_meta: dict[str, Any] | None = None,
     ) -> None:
         value: dict[str, Any] = {}
         if response.content_type.startswith("application/json"):
@@ -255,6 +331,10 @@ class PanelApplication:
         elif value.get("status") in {"no_fact", "duplicate", "skipped", "error"}:
             status = value["status"]
         meta: dict[str, Any] = {"http_status": response.status}
+        if request_meta is not None:
+            meta.update(request_meta)
+        if principal is not None and principal.key_id is not None:
+            meta["key_id"] = principal.key_id
         if isinstance(code, str) and re.fullmatch(r"[a-z_]{1,64}", code):
             meta["error_code"] = code
         resource = value.get("topic") or value.get("core_memory") or value.get("item") or value.get("result")
@@ -280,6 +360,10 @@ class PanelApplication:
                     meta["size_chars"] = len(text)
         if action == "recall":
             results = value.get("topic_results", [])
+            if isinstance(results, list):
+                topic_ids = [_safe_activity_topic(item.get("topic_id")) for item in results if isinstance(item, dict)]
+                if topic_ids and len(topic_ids) <= 8 and all(topic_ids):
+                    meta["topic_ids"] = topic_ids
             if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict):
                 topic_id = _safe_activity_topic(results[0].get("topic_id"))
                 version = results[0].get("topic_version")
@@ -297,60 +381,25 @@ class PanelApplication:
         ))
 
 
-    def _has_valid_bearer(self, headers: Mapping[str, str] | None) -> bool:
-        authorization = ""
-        if headers is not None:
-            for name, value in headers.items():
-                if str(name).casefold() == "authorization":
-                    authorization = str(value)
-                    break
-        prefix = "Bearer "
-        has_bearer_prefix = authorization.startswith(prefix)
-        supplied = authorization[len(prefix) :] if has_bearer_prefix else ""
-        try:
-            matches = secrets.compare_digest(supplied, self._auth_token)
-        except (TypeError, ValueError):
-            return False
-        return has_bearer_prefix and matches
 
     def _auth_me(self, headers: Mapping[str, str] | None) -> PanelResponse:
-        sso_enabled = self.wx_sso is not None
-        if self.wx_sso is not None:
-            session = self.wx_sso.read_session(headers)
-            if session is not None:
-                return _json_response(
-                    200,
-                    {
-                        "authenticated": True,
-                        "mode": "sso",
-                        "sso_enabled": True,
-                        "user": {
-                            "openid": session.openid,
-                            "nickname": session.nickname,
-                            "avatar_url": session.avatar_url,
-                        },
-                        "central_logout_url": f"{self.wx_sso.config.issuer}/sso/logout",
-                    },
-                )
-        if self._has_valid_bearer(headers):
-            return _json_response(
-                200,
-                {
-                    "authenticated": True,
-                    "mode": "token",
-                    "sso_enabled": sso_enabled,
-                    "user": None,
-                },
-            )
-        return _json_response(
-            200,
-            {
-                "authenticated": False,
-                "mode": None,
-                "sso_enabled": sso_enabled,
-                "user": None,
-            },
-        )
+        principal = self._request_principal(headers)
+        value: dict[str, Any] = {
+            "authenticated": principal is not None,
+            "mode": ("token" if principal.mode == "env_token" else principal.mode) if principal else None,
+            "sso_enabled": self.wx_sso is not None,
+            "user": None,
+        }
+        if principal is not None:
+            value.update(actor=principal.actor, role=principal.role, key_id=principal.key_id)
+            if principal.mode == "sso" and self.wx_sso is not None:
+                session = self.wx_sso.read_session(headers)
+                if session is not None:
+                    value["user"] = {
+                        "openid": session.openid, "nickname": session.nickname, "avatar_url": session.avatar_url,
+                    }
+                value["central_logout_url"] = f"{self.wx_sso.config.issuer}/sso/logout"
+        return _json_response(200, value)
 
     def _dispatch_sso(
         self,
@@ -405,7 +454,7 @@ class PanelApplication:
         params: dict[str, str],
         body: bytes,
         *,
-        actor: str = "anonymous",
+        principal: Principal,
     ) -> PanelResponse:
         _reject_params(params, set())
         routes = {
@@ -425,19 +474,22 @@ class PanelApplication:
         if method == "GET" and payload is not None:
             raise _RequestError("invalid_request", "GET requests do not accept arguments.")
         try:
-            result = self.memory_service.call(route[1], payload or {}, source="rest", actor=actor)
+            result = self.memory_service.call(route[1], payload or {}, source="rest", principal=principal)
             return _json_response(200, result)
         except MemoryServiceError as error:
             return _json_response(error.status, {"error": error.to_dict()})
 
     def _dispatch_get(
-        self, path: tuple[str, ...], params: dict[str, str]
+        self, path: tuple[str, ...], params: dict[str, str], *, principal: Principal
     ) -> PanelResponse:
+        if path == ("api", "keys"):
+            _reject_params(params, set())
+            return _json_response(200, {"items": [record.to_dict() for record in self.api_keys.list_keys()]})
         if path == ("api", "overview"):
             _reject_params(params, set())
-            return _json_response(200, self._overview())
+            return _json_response(200, self._overview(principal))
         if path == ("api", "activities"):
-            return _json_response(200, self._activities(params))
+            return _json_response(200, self._activities(params, principal))
         if path == ("api", "core-memory"):
             _reject_params(params, set())
             return _json_response(200, {"core_memory": self._core_metadata()})
@@ -455,30 +507,30 @@ class PanelApplication:
             version = _positive_integer(path[3], "version")
             return _json_response(200, self._core_version_body(version))
         if path == ("api", "topics"):
-            return _json_response(200, self._topics(params))
+            return _json_response(200, self._topics(params, principal))
         if path == ("api", "questions"):
-            return _json_response(200, self._questions(params))
+            return _json_response(200, self._questions(params, principal=principal))
         if path == ("api", "dreams"):
             _reject_params(params, {"limit"})
-            return _json_response(200, {"items": self._dream_reports(params)})
+            return _json_response(200, {"items": self._dream_reports(params, principal)})
         if path == ("api", "runtime"):
             _reject_params(params, set())
             return _json_response(200, self._runtime_info())
         if path == ("api", "recycle-bin"):
             _reject_params(params, set())
-            return _json_response(200, {"items": self._recycle_items()})
+            return _json_response(200, {"items": self._recycle_items(principal)})
 
         if len(path) >= 3 and path[:2] == ("api", "topics"):
             topic_id = _validated_topic_id(path[2])
             if len(path) == 3:
                 _reject_params(params, set())
-                return _json_response(200, {"topic": self._topic_detail(topic_id)})
+                return _json_response(200, {"topic": self._topic_detail(topic_id, principal)})
             if len(path) == 4 and path[3] == "body":
                 _reject_params(params, set())
                 return _json_response(200, self._current_body(topic_id))
             if len(path) == 4 and path[3] == "questions":
                 return _json_response(
-                    200, self._questions(params, topic_id=topic_id)
+                    200, self._questions(params, topic_id=topic_id, principal=principal)
                 )
             if len(path) == 4 and path[3] == "versions":
                 return _json_response(200, self._versions(topic_id, params))
@@ -493,7 +545,7 @@ class PanelApplication:
 
         raise _ResourceNotFound
 
-    def _activities(self, params: dict[str, str]) -> dict[str, Any]:
+    def _activities(self, params: dict[str, str], principal: Principal) -> dict[str, Any]:
         _reject_params(params, {"action", "source", "topic", "status", "q", "page", "page_size"})
         page = _positive_integer(params.get("page", "1"), "page")
         page_size = min(_positive_integer(params.get("page_size", "30"), "page_size"), _MAX_PAGE_SIZE)
@@ -501,7 +553,7 @@ class PanelApplication:
             return self.activities.list(
                 action=params.get("action"), source=params.get("source"),
                 topic_id=params.get("topic"), status=params.get("status"), q=params.get("q"),
-                page=page, page_size=page_size,
+                page=page, page_size=page_size, allowed_topics=principal.allowed_topics,
             )
         except ValueError as error:
             raise _RequestError("invalid_request", "Invalid activity filters.") from error
@@ -511,8 +563,16 @@ class PanelApplication:
         path: tuple[str, ...],
         params: dict[str, str],
         payload: dict[str, Any] | None,
+        *, principal: Principal,
     ) -> PanelResponse:
         _reject_params(params, set())
+        if path == ("api", "keys"):
+            return self._create_key(payload, principal)
+        if len(path) == 4 and path[:2] == ("api", "keys") and path[3] == "revoke":
+            _required_payload(payload or {}, set())
+            if not re.fullmatch(r"key_[0-9a-f]{12}", path[2]):
+                raise _RequestError("invalid_request", "Invalid key id.")
+            return _json_response(200, {"key": self.api_keys.revoke_key(path[2]).to_dict()})
         if path == ("api", "core-memory", "initialize"):
             return self._initialize_core(payload)
         if path == ("api", "core-memory", "replace"):
@@ -520,12 +580,14 @@ class PanelApplication:
         if path == ("api", "core-memory", "rollback"):
             return self._rollback_core(payload)
         if path == ("api", "recall", "plan"):
-            return self._recall_plan(payload)
+            return self._recall_plan(payload, principal)
         if path == ("api", "recall", "run"):
-            return self._recall_run(payload)
+            return self._recall_run(payload, principal)
         if len(path) == 4 and path[:3] == ("api", "recall", "rerun"):
-            return self._recall_rerun(path[3], payload)
+            return self._recall_rerun(path[3], payload, principal)
         if path == ("api", "topics"):
+            if payload is not None and isinstance(payload.get("topic_id"), str):
+                require_topic(principal, _validated_topic_id(payload["topic_id"]))
             return self._create_topic(payload)
         if len(path) == 4 and path[:2] == ("api", "topics"):
             return self._mutate_topic(_validated_topic_id(path[2]), path[3], payload)
@@ -707,10 +769,10 @@ class PanelApplication:
         except Exception as error:
             return _safe_mutation_exception(error)
 
-    def _recall_plan(self, payload: dict[str, Any] | None) -> PanelResponse:
+    def _recall_plan(self, payload: dict[str, Any] | None, principal: Principal) -> PanelResponse:
         value = _required_payload(payload, {"question"})
         question = _raw_question(value)
-        registry, planner, _engine = self._recall_services()
+        registry, planner, _engine = self._recall_services(principal)
         started_ns = time.perf_counter_ns()
         try:
             plan = planner.plan(question)
@@ -728,13 +790,20 @@ class PanelApplication:
             },
         )
 
-    def _recall_run(self, payload: dict[str, Any] | None) -> PanelResponse:
+    def _recall_run(self, payload: dict[str, Any] | None, principal: Principal) -> PanelResponse:
         value = _required_payload(payload, {"question", "manual_topics"})
         question = _raw_question(value)
-        registry, planner, engine = self._recall_services()
+        full_registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
+        registry, planner, engine = self._recall_services(principal, registry=full_registry)
         planning_started_ns = time.perf_counter_ns()
         if "manual_topics" in value:
             selections = _manual_selections(value["manual_topics"])
+            for selection in selections:
+                try:
+                    topic_id = full_registry.resolve_name(selection.topic_id, context="manual recall topic")
+                except TopicRoutingError:
+                    raise _RequestError("invalid_recall_scope", "Manual recall scope is invalid.") from None
+                require_topic(principal, topic_id)
             try:
                 plan = planner.manual(question=question, selections=selections)
             except PlanningError as error:
@@ -757,7 +826,7 @@ class PanelApplication:
         )
 
     def _recall_rerun(
-        self, query_id: str, payload: dict[str, Any] | None
+        self, query_id: str, payload: dict[str, Any] | None, principal: Principal
     ) -> PanelResponse:
         _required_payload(payload or {}, set())
         try:
@@ -766,8 +835,10 @@ class PanelApplication:
             raise _RequestError("invalid_request", "Invalid query id.") from error
         if original is None:
             raise _ResourceNotFound
+        for result in original.selected_topics:
+            require_topic(principal, result.topic_id)
 
-        registry, planner, engine = self._recall_services()
+        registry, planner, engine = self._recall_services(principal)
         selections = tuple(
             TopicSelection(
                 result.topic_id,
@@ -789,9 +860,12 @@ class PanelApplication:
         )
 
     def _recall_services(
-        self,
+        self, principal: Principal, *, registry: TopicRegistry | None = None,
     ) -> tuple[TopicRegistry, TopicPlanner, MultiRecallEngine]:
-        registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
+        registry = restrict_registry(
+            registry if registry is not None else TopicRegistry.from_file(self.data_root / "topic-registry.json"),
+            principal,
+        )
         planner = TopicPlanner(registry=registry, model=self._reader)  # type: ignore[arg-type]
         engine = MultiRecallEngine(
             recall_engine=RecallEngine(
@@ -850,7 +924,7 @@ class PanelApplication:
             "allowed_openids_count": len(self.wx_sso.config.allowed_openids) if self.wx_sso is not None else 0,
         }
 
-    def _dream_reports(self, params: dict[str, str]) -> list[dict[str, Any]]:
+    def _dream_reports(self, params: dict[str, str], principal: Principal) -> list[dict[str, Any]]:
         limit = _positive_integer(params["limit"], "limit") if "limit" in params else 30
         limit = min(limit, 100)
         reports_dir = self.data_root / "dream-reports"
@@ -858,7 +932,9 @@ class PanelApplication:
             return []
         items: list[dict[str, Any]] = []
         for path in sorted(reports_dir.glob("*.jsonl")):
-            if path.name.startswith("."):
+            if path.name.startswith(".") or (
+                principal.allowed_topics is not None and path.stem not in principal.allowed_topics
+            ):
                 continue
             for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
@@ -868,14 +944,16 @@ class PanelApplication:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(entry, dict):
+                if isinstance(entry, dict) and (
+                    principal.allowed_topics is None or entry.get("topic_id") in principal.allowed_topics
+                ):
                     items.append(entry)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items[:limit]
 
-    def _overview(self) -> dict[str, Any]:
-        snapshot = TopicCatalog(self.data_root).snapshot()
-        recycled = self._recycle_items()
+    def _overview(self, principal: Principal) -> dict[str, Any]:
+        snapshot = TopicCatalog(self.data_root).snapshot(allowed_topics=principal.allowed_topics)
+        recycled = self._recycle_items(principal)
         topics = [topic.to_public_dict() for topic in snapshot.topics]
         distribution = sorted(
             (
@@ -913,11 +991,11 @@ class PanelApplication:
             },
             "topics": topics,
             "recent_questions": [
-                _query_summary(record) for record in self.history.list(limit=10)
+                _query_summary(record) for record in self._visible_history(principal)[:10]
             ],
         }
 
-    def _topics(self, params: dict[str, str]) -> dict[str, Any]:
+    def _topics(self, params: dict[str, str], principal: Principal) -> dict[str, Any]:
         _reject_params(
             params, {"q", "status", "sort", "order", "page", "page_size"}
         )
@@ -940,7 +1018,7 @@ class PanelApplication:
             raise _RequestError("invalid_request", "Invalid sort order.")
         page, page_size = _pagination(params)
 
-        topics = list(TopicCatalog(self.data_root).snapshot().topics)
+        topics = list(TopicCatalog(self.data_root).snapshot(allowed_topics=principal.allowed_topics).topics)
         if query:
             topics = [
                 topic
@@ -1040,10 +1118,10 @@ class PanelApplication:
             "state": current.state,
         }
 
-    def _topic_detail(self, topic_id: str) -> dict[str, Any]:
+    def _topic_detail(self, topic_id: str, principal: Principal) -> dict[str, Any]:
         memory = self.store.get_topic(topic_id)
         try:
-            summary = TopicCatalog(self.data_root).snapshot().topic(topic_id)
+            summary = TopicCatalog(self.data_root).snapshot(allowed_topics=principal.allowed_topics).topic(topic_id)
         except KeyError as error:
             raise _ResourceNotFound from error
         metadata = memory.metadata
@@ -1078,11 +1156,22 @@ class PanelApplication:
             "fingerprint": memory.metadata.content_fingerprint,
         }
 
+    def _visible_history(self, principal: Principal) -> list[QueryRecord]:
+        records = list(self.history.list())
+        if principal.allowed_topics is None:
+            return records
+        # Mixed-topic questions and synthesized answers cannot be partially exposed.
+        return [
+            record for record in records if record.selected_topics
+            and all(result.topic_id in principal.allowed_topics for result in record.selected_topics)
+        ]
+
     def _questions(
         self,
         params: dict[str, str],
         *,
         topic_id: str | None = None,
+        principal: Principal,
     ) -> dict[str, Any]:
         _reject_params(
             params,
@@ -1129,7 +1218,7 @@ class PanelApplication:
             raise _RequestError("invalid_request", "Invalid date range.")
         page, page_size = _pagination(params)
 
-        records = list(self.history.list())
+        records = self._visible_history(principal)
         filtered: list[QueryRecord] = []
         for record in records:
             relevant_results = tuple(
@@ -1202,7 +1291,7 @@ class PanelApplication:
             "current": version == current.metadata.version,
         }
 
-    def _recycle_items(self) -> list[dict[str, Any]]:
+    def _recycle_items(self, principal: Principal) -> list[dict[str, Any]]:
         recycle_root = self.data_root / "recycle-bin"
         if not recycle_root.exists():
             return []
@@ -1212,6 +1301,7 @@ class PanelApplication:
             self._recycle_item(entry.name)
             for entry in recycle_root.iterdir()
             if not entry.name.startswith(".")
+            and (principal.allowed_topics is None or entry.name in principal.allowed_topics)
         ]
         items.sort(
             key=lambda item: (item["trashed_at"], item["topic_id"]), reverse=True
@@ -1273,6 +1363,15 @@ def _sso_error_response(error: WxSsoError) -> PanelResponse:
     return PanelResponse(status=error.status, body=html_error, content_type="text/html; charset=utf-8")
 
 
+def _bearer_token(headers: Mapping[str, str] | None) -> str | None:
+    if headers is not None:
+        for name, value in headers.items():
+            if str(name).casefold() == "authorization":
+                authorization = str(value)
+                return authorization[7:] if authorization.startswith("Bearer ") else None
+    return None
+
+
 def _safe_actor_component(value: Any, maximum: int) -> str:
     if not isinstance(value, str):
         return ""
@@ -1307,6 +1406,10 @@ def _safe_method(method: str) -> str:
 def _safe_activity_path(raw_path: str) -> str:
     # Store only known route templates, never attacker-controlled path/query text.
     path = tuple(unquote(raw_path).strip("/").split("/"))
+    if path == ("api", "keys"):
+        return "/api/keys"
+    if len(path) == 4 and path[:2] == ("api", "keys") and path[3] == "revoke":
+        return "/api/keys/:key_id/revoke"
     if path == ("mcp",):
         return "/mcp"
     if len(path) == 3 and path[:2] == ("api", "v1") and path[2] in {"whoami", "topics", "recall", "remember", "dream"}:
@@ -1338,6 +1441,10 @@ def _panel_activity_action(method: str, raw_path: str) -> tuple[ActivityAction |
     if method != "POST":
         return None, None
     path = tuple(unquote(raw_path).strip("/").split("/"))
+    if path == ("api", "keys"):
+        return "key_create", None
+    if len(path) == 4 and path[:2] == ("api", "keys") and path[3] == "revoke":
+        return "key_revoke", None
     if path == ("api", "topics"):
         return "topic_create", None
     if len(path) == 3 and path[:2] == ("api", "core-memory"):

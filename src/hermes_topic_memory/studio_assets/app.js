@@ -4,6 +4,10 @@
   const state = {
     token: "",
     authMode: null,
+    role: null,
+    actor: "",
+    keyId: null,
+    activeTab: "topic",
     ssoEnabled: false,
     topics: [],
     charsMap: {},
@@ -14,6 +18,7 @@
     overviewRequestId: 0,
     topicRequestId: 0,
     dreamBusy: false,
+    rememberBusy: false,
     dreamConfirmTopicId: null,
     dreamConfirmTrigger: null,
     dreamReportsRequestId: 0,
@@ -30,6 +35,21 @@
       loading: false,
       failedReset: true,
     },
+    keys: {
+      items: [],
+      loaded: false,
+      loading: false,
+      requestId: 0,
+      controller: null,
+      mutationRequestId: 0,
+      creating: false,
+      secret: "",
+      secretKeyId: null,
+      confirmKeyId: null,
+      revokingKeyId: null,
+      revokeError: "",
+      client: "hermes",
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -42,6 +62,10 @@
     ok: "pill-green", no_fact: "pill-gray", duplicate: "pill-gray",
     skipped: "pill-amber", error: "pill-red", denied: "pill-red",
   };
+  const keyRoleLabels = optionLabels("key-role");
+  const keyRoleClasses = { read: "pill-blue", write: "pill-purple", admin: "pill-amber" };
+  const keyStatusLabels = { active: "活跃", revoked: "已吊销", expired: "已过期" };
+  const keyStatusClasses = { active: "pill-green", revoked: "pill-gray", expired: "pill-amber" };
   const dreamStatusLabels = {
     consolidated: "已换版", no_change: "无变更", dry_run: "预览未写入",
     skipped_no_new_evidence: "无新证据", aborted_concurrent_write: "并发写入已中止", error: "失败",
@@ -264,18 +288,24 @@
 
   function switchTab(name, { focus = false } = {}) {
     if (name !== "topic") clearDreamConfirmation();
+    state.activeTab = name;
+    if (name !== "keys" && !state.keys.revokingKeyId) cancelKeyRevoke({ restoreFocus: false });
     document.querySelectorAll(".tab").forEach((tab) => {
       const active = tab.getAttribute("data-tab") === name;
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-selected", String(active));
       tab.tabIndex = active ? 0 : -1;
     });
-    ["topic", "ask", "logs"].forEach((nameOfPanel) => {
+    ["topic", "ask", "logs", "keys"].forEach((nameOfPanel) => {
       const panel = $("panel-" + nameOfPanel);
       panel.classList.toggle("hidden", nameOfPanel !== name);
       panel.hidden = nameOfPanel !== name;
     });
     if (focus) $("tab-" + name).focus();
+    if (name === "keys") {
+      renderIntegration();
+      if (state.role === "admin" && !state.keys.loaded && !state.keys.loading) refreshKeys();
+    }
   }
 
   function updateViewMode(mode) {
@@ -304,10 +334,7 @@
       showGate();
       return;
     }
-    state.authMode = me.mode;
-    $("user-badge").textContent = me.mode === "sso"
-      ? ((me.user && me.user.nickname) || "微信已登录")
-      : "密钥模式";
+    applyAuth(me);
     showShell();
     try {
       if (!await refreshAll()) toast("部分数据未能加载，请查看错误提示并刷新重试", { error: true });
@@ -316,7 +343,522 @@
     }
   }
 
+  function applyAuth(me) {
+    clearKeySession();
+    state.authMode = me.mode;
+    state.role = ["read", "write", "admin"].includes(me.role) ? me.role : null;
+    state.actor = typeof me.actor === "string" ? me.actor : "";
+    state.keyId = typeof me.key_id === "string" ? me.key_id : null;
+    const identity = me.mode === "sso"
+      ? ((me.user && me.user.nickname) || "微信已登录")
+      : me.mode === "env_token" ? "环境管理密钥" : "API 密钥";
+    $("user-badge").textContent = identity + " · " + (keyRoleLabels[state.role] || "权限未知");
+    $("user-badge").title = state.actor;
+    syncKeyControls();
+    updateTopicActions();
+    renderIntegration();
+  }
+
+  function updateTopicActions() {
+    const canWrite = state.role === "write" || state.role === "admin";
+    const hasTopic = Boolean(state.selectedId);
+    $("btn-toggle-remember").disabled = !canWrite || !hasTopic || state.rememberBusy;
+    $("btn-remember-submit").disabled = !canWrite || !hasTopic || state.rememberBusy;
+    $("btn-dream-preview").disabled = !canWrite || !hasTopic || state.dreamBusy;
+    $("btn-dream-apply").disabled = !canWrite || !hasTopic || state.dreamBusy;
+    $("btn-dream-commit-inline").disabled = !canWrite || !hasTopic || state.dreamBusy;
+    $("btn-dream-confirm").disabled = !canWrite || state.dreamBusy || !state.dreamConfirmTopicId;
+    $("btn-toggle-remember").title = canWrite ? "追加一条长期记忆" : "记忆写入需要读写或管理权限";
+    $("btn-dream-preview").title = canWrite ? "预览 Dream，不修改记忆" : "Dream 需要读写或管理权限";
+    $("btn-dream-apply").title = canWrite ? "确认后应用 Dream 换版" : "Dream 需要读写或管理权限";
+    const inlinePrimary = Boolean(state.dreamConfirmTopicId) || !$("remember-drawer").classList.contains("hidden");
+    $("btn-dream-apply").classList.toggle("btn-primary", !inlinePrimary);
+    $("btn-dream-apply").classList.toggle("btn-ghost", inlinePrimary);
+  }
+
+  function syncKeyControls() {
+    const admin = state.role === "admin";
+    const keys = state.keys;
+    const hasSecret = admin && Boolean(keys.secret);
+    const busy = keys.creating || Boolean(keys.revokingKeyId);
+    for (const id of ["key-admin-create", "key-admin-list"]) {
+      $(id).classList.toggle("hidden", !admin);
+      $(id).hidden = !admin;
+    }
+    $("keys-permission-note").classList.toggle("hidden", admin);
+    $("keys-permission-note").hidden = admin;
+    $("keys-workspace").classList.toggle("integration-only", !admin);
+    $("key-secret-card").classList.toggle("hidden", !hasSecret);
+    $("key-secret-card").hidden = !hasSecret;
+    $("key-create-fields").disabled = !admin || busy || hasSecret;
+    $("btn-key-create").disabled = !admin || busy || hasSecret;
+    $("btn-key-create").classList.toggle("btn-primary", !hasSecret);
+    $("btn-key-create").classList.toggle("btn-ghost", hasSecret);
+    $("btn-key-create").textContent = keys.creating ? "正在创建…" : hasSecret ? "保存明文后继续创建" : "创建密钥";
+    $("btn-key-copy").disabled = !hasSecret;
+    $("btn-keys-refresh").disabled = keys.loading || busy;
+    $("btn-keys-retry").disabled = keys.loading || busy;
+  }
+
+  function clearKeySecret({ restoreFocus = false } = {}) {
+    state.keys.secret = "";
+    state.keys.secretKeyId = null;
+    $("key-secret-value").textContent = "";
+    $("key-secret-card").classList.add("hidden");
+    $("key-secret-card").hidden = true;
+    $("integration-config").textContent = "";
+    renderIntegration();
+    syncKeyControls();
+    if (restoreFocus && state.activeTab === "keys") {
+      if (state.role === "admin") $("key-name").focus();
+      else $("client-" + state.keys.client).focus();
+    }
+  }
+
+  function clearKeySession() {
+    const keys = state.keys;
+    keys.requestId += 1;
+    keys.mutationRequestId += 1;
+    if (keys.controller) keys.controller.abort();
+    keys.controller = null;
+    keys.items.length = 0;
+    keys.loaded = false;
+    keys.loading = false;
+    keys.creating = false;
+    keys.confirmKeyId = null;
+    keys.revokingKeyId = null;
+    keys.revokeError = "";
+    clearKeySecret();
+    clearNode($("key-list"));
+    clearNode($("key-topic-options"));
+    $("key-list").setAttribute("aria-busy", "false");
+    $("key-count").textContent = "0 把";
+    $("keys-loading").textContent = "";
+    $("keys-error").classList.add("hidden");
+    $("keys-error-message").textContent = "";
+    $("keys-empty").classList.add("hidden");
+    $("key-create-form").reset();
+    $("key-create-status").textContent = "";
+    clearKeyFormErrors();
+  }
+
+  function renderKeyTopicOptions() {
+    const options = $("key-topic-options");
+    clearNode(options);
+    if (state.role !== "admin") return;
+    for (const topic of state.topics) {
+      const option = document.createElement("option");
+      option.value = topic.topic_id;
+      option.textContent = topic.display_name || topic.topic_id;
+      options.appendChild(option);
+    }
+  }
+
+  function clearKeyFormErrors() {
+    for (const id of ["key-name", "key-role", "key-topics", "key-expiry"]) {
+      $(id).removeAttribute("aria-invalid");
+    }
+    $("key-create-error").textContent = "";
+    $("key-create-error").classList.add("hidden");
+  }
+
+  function keyFormError(id, message) {
+    $(id).setAttribute("aria-invalid", "true");
+    $("key-create-error").textContent = message;
+    $("key-create-error").classList.remove("hidden");
+    $(id).focus();
+    return null;
+  }
+
+  function readKeyForm() {
+    clearKeyFormErrors();
+    const name = $("key-name").value.trim();
+    if (!name || [...name].length > 80 || /[\u0000-\u001f\u007f-\u009f]/.test(name)) {
+      return keyFormError("key-name", "请输入 1–80 字的名称，不允许控制字符。");
+    }
+    const role = $("key-role").value;
+    if (!["read", "write", "admin"].includes(role)) return keyFormError("key-role", "请选择有效权限。");
+    const rawTopics = $("key-topics").value.trim();
+    let allowedTopics = null;
+    if (rawTopics) {
+      allowedTopics = rawTopics.split(/[,，\s]+/).filter(Boolean);
+      const availableTopics = new Set(state.topics.map((topic) => topic.topic_id));
+      if (!allowedTopics.length || allowedTopics.some((id) => id.length > 128 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) || !availableTopics.has(id))) {
+        return keyFormError("key-topics", "请选择当前可用的主题 ID，多个 ID 用逗号分隔；可刷新全部数据后重试。");
+      }
+      if (new Set(allowedTopics).size !== allowedTopics.length) return keyFormError("key-topics", "主题 ID 不应重复，请移除重复项。");
+    }
+    const expiry = $("key-expiry").value;
+    if (!["", "7", "30", "90", "365"].includes(expiry)) return keyFormError("key-expiry", "请选择有效的有效期。");
+    return { name, role, allowed_topics: allowedTopics, expires_in_days: expiry ? Number(expiry) : null };
+  }
+
+  function appendKeyMetadata(list, label, value) {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    const detail = document.createElement("dd");
+    term.textContent = label;
+    if (typeof value === "string") detail.textContent = value;
+    else detail.appendChild(value);
+    group.appendChild(term);
+    group.appendChild(detail);
+    list.appendChild(group);
+  }
+
+  function renderKeyList() {
+    const list = $("key-list");
+    const keys = state.keys;
+    clearNode(list);
+    if (state.role !== "admin") return;
+    for (const record of keys.items) {
+      const entry = document.createElement("li");
+      entry.className = "key-entry";
+      const head = document.createElement("div");
+      head.className = "key-entry-head";
+      const title = document.createElement("div");
+      title.className = "key-entry-title";
+      const name = document.createElement("h4");
+      name.textContent = record.name;
+      title.appendChild(name);
+      title.appendChild(makePill(record.prefix + "…", "pill-mono"));
+      title.appendChild(makePill(keyRoleLabels[record.role] || "未知权限", keyRoleClasses[record.role] || "pill-gray"));
+      title.appendChild(makePill(keyStatusLabels[record.status] || "未知状态", keyStatusClasses[record.status] || "pill-gray"));
+      head.appendChild(title);
+      const trigger = document.createElement("button");
+      trigger.id = "key-revoke-trigger-" + record.key_id;
+      trigger.type = "button";
+      trigger.className = "btn btn-danger-outline btn-xs";
+      trigger.textContent = record.status === "revoked" ? "已吊销" : "吊销";
+      trigger.setAttribute("aria-label", "吊销密钥 " + record.name);
+      if (keys.confirmKeyId === record.key_id) trigger.setAttribute("aria-controls", "key-revoke-confirm-" + record.key_id);
+      trigger.setAttribute("aria-expanded", String(keys.confirmKeyId === record.key_id));
+      trigger.disabled = record.status === "revoked" || keys.loading || keys.creating || Boolean(keys.revokingKeyId);
+      trigger.addEventListener("click", () => requestKeyRevoke(record.key_id));
+      head.appendChild(trigger);
+      entry.appendChild(head);
+      const scope = document.createElement("div");
+      scope.className = "key-scope";
+      scope.setAttribute("aria-label", "允许的主题");
+      if (record.allowed_topics === null) scope.appendChild(makePill("全部主题"));
+      else for (const topicId of record.allowed_topics || []) scope.appendChild(makePill("主题: " + topicId));
+      entry.appendChild(scope);
+      const metadata = document.createElement("dl");
+      metadata.className = "key-metadata";
+      appendKeyMetadata(metadata, "创建时间", makeTimestamp(record.created_at));
+      appendKeyMetadata(metadata, "最近使用", record.last_used_at ? makeTimestamp(record.last_used_at) : "尚未使用");
+      appendKeyMetadata(metadata, "到期时间", record.expires_at ? makeTimestamp(record.expires_at) : "永不过期");
+      appendKeyMetadata(metadata, "创建者", record.created_by || "未知");
+      appendKeyMetadata(metadata, "密钥 ID", record.key_id);
+      if (record.revoked_at) appendKeyMetadata(metadata, "吊销时间", makeTimestamp(record.revoked_at));
+      entry.appendChild(metadata);
+      if (keys.confirmKeyId === record.key_id) {
+        const confirm = document.createElement("div");
+        confirm.id = "key-revoke-confirm-" + record.key_id;
+        confirm.className = "key-revoke-confirm";
+        confirm.setAttribute("role", "group");
+        confirm.setAttribute("aria-label", "确认吊销密钥 " + record.name);
+        const warning = document.createElement("p");
+        warning.textContent = "确认吊销「" + record.name + "」？使用此密钥的客户端将立即失去访问权限，无法恢复。"
+          + (state.keyId === record.key_id ? " 这也是你的当前登录密钥，吊销后需要重新登录。" : "");
+        confirm.appendChild(warning);
+        const actions = document.createElement("div");
+        actions.className = "action-row";
+        const commit = document.createElement("button");
+        commit.id = "key-revoke-commit-" + record.key_id;
+        commit.type = "button";
+        commit.className = "btn btn-danger-outline btn-sm";
+        commit.textContent = keys.revokingKeyId === record.key_id ? "正在吊销…" : "确认吊销";
+        commit.disabled = Boolean(keys.revokingKeyId);
+        commit.addEventListener("click", () => revokeKey(record.key_id));
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "btn btn-ghost btn-sm";
+        cancel.textContent = "取消";
+        cancel.disabled = Boolean(keys.revokingKeyId);
+        cancel.addEventListener("click", () => cancelKeyRevoke());
+        actions.appendChild(commit);
+        actions.appendChild(cancel);
+        confirm.appendChild(actions);
+        if (keys.revokeError) {
+          const error = document.createElement("p");
+          error.className = "key-revoke-error";
+          error.setAttribute("role", "alert");
+          error.textContent = keys.revokeError;
+          confirm.appendChild(error);
+        }
+        entry.appendChild(confirm);
+      }
+      list.appendChild(entry);
+    }
+    $("key-count").textContent = keys.items.length + " 把";
+    $("keys-empty").classList.toggle("hidden", keys.items.length !== 0 || keys.loading || !keys.loaded);
+  }
+
+  async function refreshKeys() {
+    if (state.role !== "admin") return true;
+    const keys = state.keys;
+    if (keys.creating || keys.revokingKeyId) return true;
+    const requestId = ++keys.requestId;
+    if (keys.controller) keys.controller.abort();
+    const controller = new AbortController();
+    keys.controller = controller;
+    keys.loading = true;
+    keys.confirmKeyId = null;
+    keys.revokeError = "";
+    $("key-list").setAttribute("aria-busy", "true");
+    $("keys-loading").textContent = "正在加载 API 密钥…";
+    $("keys-error").classList.add("hidden");
+    syncKeyControls();
+    renderKeyList();
+    try {
+      const res = await api("/api/keys", { signal: controller.signal });
+      if (requestId !== keys.requestId || state.role !== "admin") return false;
+      if (!Array.isArray(res.items)) throw new Error("密钥列表格式异常，请重试");
+      keys.items = res.items;
+      keys.loaded = true;
+      $("keys-loading").textContent = "已加载 " + keys.items.length + " 把密钥。";
+      return true;
+    } catch (err) {
+      if (requestId !== keys.requestId || err.name === "AbortError") return false;
+      if (err.status === 401) {
+        showGate();
+        $("auth-error").textContent = "登录已失效，请重新登录。";
+        $("auth-error").classList.remove("hidden");
+        return false;
+      }
+      $("keys-error-message").textContent = err.status === 403
+        ? "当前凭证没有管理密钥的权限，请联系管理员或重新登录。"
+        : "密钥列表加载失败：" + err.message;
+      $("keys-error").classList.remove("hidden");
+      $("keys-loading").textContent = "";
+      return false;
+    } finally {
+      if (requestId === keys.requestId && state.role === "admin") {
+        keys.loading = false;
+        keys.controller = null;
+        $("key-list").setAttribute("aria-busy", "false");
+        syncKeyControls();
+        renderKeyList();
+      }
+    }
+  }
+
+  async function createKey() {
+    if (state.role !== "admin" || state.keys.creating || state.keys.revokingKeyId || state.keys.secret) return;
+    const payload = readKeyForm();
+    if (!payload) return;
+    const keys = state.keys;
+    const requestId = ++keys.mutationRequestId;
+    keys.requestId += 1;
+    if (keys.controller) keys.controller.abort();
+    keys.controller = null;
+    keys.loading = false;
+    keys.confirmKeyId = null;
+    keys.creating = true;
+    $("key-create-status").textContent = "正在创建密钥，请勿重复提交…";
+    $("key-list").setAttribute("aria-busy", "true");
+    syncKeyControls();
+    renderKeyList();
+    try {
+      const res = await api("/api/keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (requestId !== keys.mutationRequestId || state.role !== "admin") return;
+      if (!res.key || typeof res.key.key_id !== "string" || typeof res.secret !== "string" || !/^htm_[A-Za-z0-9_-]{32}$/.test(res.secret)) {
+        throw new Error("创建响应不完整，请刷新密钥列表核对结果后再操作");
+      }
+      keys.secret = res.secret;
+      keys.secretKeyId = res.key.key_id;
+      const existingIndex = keys.items.findIndex((record) => record.key_id === res.key.key_id);
+      if (existingIndex !== -1) keys.items.splice(existingIndex, 1);
+      keys.items.unshift(res.key);
+      keys.creating = false;
+      $("key-secret-value").textContent = keys.secret;
+      $("key-create-form").reset();
+      $("key-create-status").textContent = "密钥已创建。请保存一次性明文，再关闭卡片。";
+      syncKeyControls();
+      renderIntegration();
+      renderKeyList();
+      if (state.activeTab === "keys") $("btn-key-copy").focus();
+      refreshKeys();
+      refreshLogs();
+    } catch (err) {
+      if (requestId !== keys.mutationRequestId) return;
+      if (err.status === 401) {
+        showGate();
+        $("auth-error").textContent = "登录已失效，请重新登录。";
+        $("auth-error").classList.remove("hidden");
+        return;
+      }
+      $("key-create-status").textContent = "";
+      $("key-create-error").textContent = "密钥创建失败：" + err.message + "。请检查表单后重试。";
+      $("key-create-error").classList.remove("hidden");
+    } finally {
+      if (requestId === keys.mutationRequestId && state.role === "admin") {
+        keys.creating = false;
+        $("key-list").setAttribute("aria-busy", String(keys.loading));
+        syncKeyControls();
+        renderKeyList();
+      }
+    }
+  }
+
+  function requestKeyRevoke(keyId) {
+    const keys = state.keys;
+    if (state.role !== "admin" || state.activeTab !== "keys" || keys.loading || keys.creating || keys.revokingKeyId) return;
+    const record = keys.items.find((item) => item.key_id === keyId);
+    if (!record || record.status === "revoked") return;
+    keys.confirmKeyId = keyId;
+    keys.revokeError = "";
+    renderKeyList();
+    $("key-revoke-commit-" + keyId).focus();
+  }
+
+  function cancelKeyRevoke({ restoreFocus = true } = {}) {
+    const keys = state.keys;
+    const keyId = keys.confirmKeyId;
+    if (!keyId || keys.revokingKeyId) return;
+    keys.confirmKeyId = null;
+    keys.revokeError = "";
+    renderKeyList();
+    if (restoreFocus && state.activeTab === "keys") {
+      const trigger = $("key-revoke-trigger-" + keyId);
+      if (trigger) trigger.focus();
+    }
+  }
+
+  async function revokeKey(keyId) {
+    const keys = state.keys;
+    if (state.role !== "admin" || keys.confirmKeyId !== keyId || keys.creating || keys.revokingKeyId) return;
+    const record = keys.items.find((item) => item.key_id === keyId);
+    if (!record || record.status === "revoked") return;
+    const requestId = ++keys.mutationRequestId;
+    keys.requestId += 1;
+    if (keys.controller) keys.controller.abort();
+    keys.controller = null;
+    keys.loading = false;
+    keys.revokingKeyId = keyId;
+    keys.revokeError = "";
+    let completed = false;
+    $("key-list").setAttribute("aria-busy", "true");
+    syncKeyControls();
+    renderKeyList();
+    try {
+      const res = await api("/api/keys/" + encodeURIComponent(keyId) + "/revoke", { method: "POST" });
+      if (requestId !== keys.mutationRequestId || state.role !== "admin") return;
+      if (!res.key || res.key.key_id !== keyId || res.key.status !== "revoked") throw new Error("吊销响应不完整，请刷新密钥列表核对结果");
+      const index = keys.items.findIndex((item) => item.key_id === keyId);
+      if (index !== -1) keys.items[index] = res.key;
+      keys.confirmKeyId = null;
+      completed = true;
+      if (keys.secretKeyId === keyId) clearKeySecret();
+      if (state.keyId === keyId) {
+        showGate();
+        $("auth-error").textContent = "当前登录密钥已吊销，请使用其他密钥或微信重新登录。";
+        $("auth-error").classList.remove("hidden");
+        return;
+      }
+      $("keys-loading").textContent = "密钥已吊销，使用此密钥的客户端已失去访问权限。";
+      refreshLogs();
+    } catch (err) {
+      if (requestId !== keys.mutationRequestId) return;
+      if (err.status === 401) {
+        showGate();
+        $("auth-error").textContent = "登录已失效，请重新登录。";
+        $("auth-error").classList.remove("hidden");
+        return;
+      }
+      keys.revokeError = "吊销失败：" + err.message + "。可重试或取消。";
+    } finally {
+      if (requestId === keys.mutationRequestId && state.role === "admin") {
+        keys.revokingKeyId = null;
+        $("key-list").setAttribute("aria-busy", "false");
+        syncKeyControls();
+        renderKeyList();
+        if (state.activeTab === "keys") {
+          const target = completed ? $("btn-keys-refresh") : $("key-revoke-commit-" + keyId);
+          if (target) target.focus();
+        }
+      }
+    }
+  }
+
+  function buildClientConfig(client = state.keys.client) {
+    const origin = window.location.origin;
+    const url = origin + "/mcp";
+    const token = state.keys.secret || "${TOPIC_MEMORY_TOKEN}";
+    const hasSecret = Boolean(state.keys.secret);
+    switch (client) {
+      case "hermes":
+        // https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp/
+        return {
+          text: ["mcp_servers:", "  topic_memory:", "    url: " + JSON.stringify(url), "    headers:", "      Authorization: " + JSON.stringify("Bearer " + token)].join("\n"),
+          instructions: "合并到 ~/.hermes/config.yaml 的 mcp_servers，重启 Hermes。${TOPIC_MEMORY_TOKEN} 会按环境变量展开。",
+        };
+      case "omp":
+        // https://github.com/can1357/oh-my-pi/blob/main/docs/mcp-config.md
+        return {
+          text: JSON.stringify({ mcpServers: { topic_memory: { type: "http", url, headers: { Authorization: "Bearer " + token } } } }, null, 2),
+          instructions: "合并到 ~/.omp/agent/mcp.json 或项目 .omp/mcp.json；原生 HTTP，无需桥接。${TOPIC_MEMORY_TOKEN} 会按环境变量展开。独立 Pi 使用 ~/.pi/agent/mcp.json 或 .pi/mcp.json。",
+        };
+      case "opencode":
+        // https://opencode.ai/docs/mcp-servers/ — mcp.servers is also supported by released 1.19.6.
+        return {
+          text: JSON.stringify({ mcp: { servers: { topic_memory: { type: "remote", url, oauth: false, headers: { Authorization: "Bearer " + (hasSecret ? token : "{env:TOPIC_MEMORY_TOKEN}") } } } } }, null, 2),
+          instructions: "合并到 opencode.json 的 mcp.servers；关闭 OAuth，使用 Bearer 密钥。OpenCode 原生环境变量语法是 {env:TOPIC_MEMORY_TOKEN}，不是 ${TOPIC_MEMORY_TOKEN}。",
+        };
+      case "codex":
+        // https://developers.openai.com/codex/mcp — static headers are literal, env settings name raw-token variables.
+        return {
+          text: ["[mcp_servers.topic_memory]", "url = " + JSON.stringify(url), hasSecret ? "http_headers = { Authorization = " + JSON.stringify("Bearer " + token) + " }" : 'bearer_token_env_var = "TOPIC_MEMORY_TOKEN"'].join("\n"),
+          instructions: hasSecret
+            ? "合并到 ~/.codex/config.toml。本次明文通过 http_headers 传递；不要提交到版本库。长期使用可改为 bearer_token_env_var = \"TOPIC_MEMORY_TOKEN\"。"
+            : "合并到 ~/.codex/config.toml，并设置 TOPIC_MEMORY_TOKEN 环境变量为原始密钥（不要带 Bearer 前缀）。Codex 不展开静态 ${TOPIC_MEMORY_TOKEN}，此配置使用原生 bearer_token_env_var。",
+        };
+      case "curl":
+        return {
+          text: ["curl --fail-with-body --silent --show-error \\", "  " + JSON.stringify(origin + "/api/v1/topics") + " \\", "  -H " + JSON.stringify("Authorization: Bearer " + token)].join("\n"),
+          instructions: hasSecret
+            ? "在终端运行，列出这把密钥可见的主题。命令包含本次明文密钥，注意终端历史与共享屏幕。"
+            : "设置 TOPIC_MEMORY_TOKEN 环境变量后在终端运行；shell 会展开 ${TOPIC_MEMORY_TOKEN}，返回这把密钥可见的主题。",
+        };
+      default:
+        throw new Error("不支持的接入客户端");
+    }
+  }
+
+  function renderIntegration() {
+    const config = buildClientConfig();
+    $("integration-config").textContent = config.text;
+    $("integration-instructions").textContent = config.instructions;
+    $("integration-token-note").textContent = state.keys.secret
+      ? "当前配置含本次新建的明文密钥。关闭上方卡片或退出后将恢复 ${TOPIC_MEMORY_TOKEN} 占位方案；请勿提交到版本库。"
+      : "当前配置使用 ${TOPIC_MEMORY_TOKEN} 占位方案，不包含你的登录密钥。按客户端说明设置环境变量，再复制配置。";
+  }
+
+  function switchClient(client, { focus = false } = {}) {
+    if (!["hermes", "omp", "opencode", "codex", "curl"].includes(client)) return;
+    state.keys.client = client;
+    document.querySelectorAll("#integration-clients [role=tab]").forEach((tab) => {
+      const active = tab.getAttribute("data-client") === client;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+    });
+    $("integration-config-panel").setAttribute("aria-labelledby", "client-" + client);
+    renderIntegration();
+    if (focus) $("client-" + client).focus();
+  }
+
   function showGate() {
+    state.token = "";
+    state.role = null;
+    state.actor = "";
+    state.keyId = null;
+    state.authMode = null;
+    clearKeySession();
     $("app-shell").classList.add("hidden");
     $("auth-gate").classList.remove("hidden");
   }
@@ -349,6 +891,7 @@
     const kpis = ov.kpis || ov;
     const topics = topicsRes.topics || [];
     state.topics = topics;
+    renderKeyTopicOptions();
     state.charsMap = {};
     let fallbackChars = 0;
     for (const ct of ov.topics || []) {
@@ -382,14 +925,16 @@
       $("version-select").disabled = true;
       $("detail-pretty").textContent = "主题创建后，可在这里查看记忆。";
       $("detail-raw").textContent = "";
-      ["btn-toggle-remember", "btn-dream-preview", "btn-dream-apply", "btn-copy-body"].forEach((id) => { $(id).disabled = true; });
+      $("btn-copy-body").disabled = true;
+      updateTopicActions();
     }
-    const [detailReady, logsReady, reportsReady] = await Promise.all([
+    const [detailReady, logsReady, reportsReady, keysReady] = await Promise.all([
       nextTopic ? selectTopic(nextTopic.topic_id) : true,
       refreshLogs(),
       $("dream-reports-view").open ? refreshDreamReports() : true,
+      state.activeTab === "keys" && state.role === "admin" ? refreshKeys() : true,
     ]);
-    return requestId === state.overviewRequestId && runtime !== null && detailReady && logsReady && reportsReady;
+    return requestId === state.overviewRequestId && runtime !== null && detailReady && logsReady && reportsReady && keysReady;
   }
 
   function renderTopicList() {
@@ -458,9 +1003,7 @@
     }
     $("remember-drawer").classList.add("hidden");
     $("btn-toggle-remember").setAttribute("aria-expanded", "false");
-    $("btn-toggle-remember").disabled = false;
-    $("btn-dream-preview").disabled = state.dreamBusy;
-    $("btn-dream-apply").disabled = state.dreamBusy;
+    updateTopicActions();
     $("btn-copy-body").disabled = true;
     $("version-select").disabled = true;
     clearNode($("version-select"));
@@ -526,8 +1069,10 @@
   }
 
   function requestDreamApply(triggerId) {
-    if (!state.selectedId || state.dreamBusy) return;
+    if (!state.selectedId || state.dreamBusy || (state.role !== "write" && state.role !== "admin")) return;
     clearDreamConfirmation();
+    $("remember-drawer").classList.add("hidden");
+    $("btn-toggle-remember").setAttribute("aria-expanded", "false");
     const topic = state.topics.find((item) => item.topic_id === state.selectedId);
     const name = topic ? (topic.display_name || topic.topic_id) : state.selectedId;
     state.dreamConfirmTopicId = state.selectedId;
@@ -536,6 +1081,7 @@
     $("dream-apply-confirm").classList.remove("hidden");
     $("btn-dream-apply").setAttribute("aria-expanded", "true");
     $("btn-dream-commit-inline").setAttribute("aria-expanded", "true");
+    updateTopicActions();
     $("btn-dream-confirm").focus();
   }
 
@@ -547,15 +1093,14 @@
     $("dream-apply-confirm").classList.add("hidden");
     $("btn-dream-apply").setAttribute("aria-expanded", "false");
     $("btn-dream-commit-inline").setAttribute("aria-expanded", "false");
+    updateTopicActions();
     if (restoreFocus && triggerId) $(triggerId).focus();
   }
 
   async function runDream(dryRun, topicId = state.selectedId) {
-    if (!topicId || state.dreamBusy || (!dryRun && topicId !== state.selectedId)) return;
+    if (!topicId || state.dreamBusy || (state.role !== "write" && state.role !== "admin") || (!dryRun && topicId !== state.selectedId)) return;
     state.dreamBusy = true;
     clearDreamConfirmation();
-    $("btn-dream-preview").disabled = true;
-    $("btn-dream-apply").disabled = true;
     $("dream-box").classList.remove("hidden");
     $("dream-spinner").classList.remove("hidden");
     $("btn-dream-commit-inline").classList.add("hidden");
@@ -606,8 +1151,7 @@
     } finally {
       state.dreamBusy = false;
       $("dream-spinner").classList.add("hidden");
-      $("btn-dream-preview").disabled = !state.selectedId;
-      $("btn-dream-apply").disabled = !state.selectedId;
+      updateTopicActions();
     }
   }
 
@@ -857,10 +1401,10 @@
     button.disabled = true;
     state.token = ($("token-input").value || "").trim();
     try {
-      await api("/api/overview");
-      state.authMode = "token";
+      const me = await api("/api/auth/me");
+      if (!me.authenticated) throw new Error("密钥未获授权，请检查后重试");
+      applyAuth(me);
       $("token-input").value = "";
-      $("user-badge").textContent = "密钥模式";
       showShell();
     } catch (err) {
       state.token = "";
@@ -879,7 +1423,14 @@
 
   $("btn-logout").addEventListener("click", async () => {
     state.token = "";
-    if (state.authMode === "sso") {
+    const mode = state.authMode;
+    state.role = null;
+    state.actor = "";
+    state.keyId = null;
+    state.authMode = null;
+    $("token-input").value = "";
+    clearKeySession();
+    if (mode === "sso") {
       try { await api("/api/sso/logout", { method: "POST" }); } catch (_) {}
     }
     window.location.href = "/?token_login=1";
@@ -954,24 +1505,28 @@
   });
 
   $("btn-toggle-remember").addEventListener("click", () => {
+    if (state.role !== "write" && state.role !== "admin") return;
     clearDreamConfirmation();
     $("remember-drawer").classList.toggle("hidden");
     const expanded = !$("remember-drawer").classList.contains("hidden");
     $("btn-toggle-remember").setAttribute("aria-expanded", String(expanded));
+    updateTopicActions();
     if (expanded) $("remember-input").focus();
   });
   $("btn-remember-cancel").addEventListener("click", () => {
     $("remember-drawer").classList.add("hidden");
     $("remember-input").value = "";
     $("btn-toggle-remember").setAttribute("aria-expanded", "false");
+    updateTopicActions();
     $("btn-toggle-remember").focus();
   });
   $("remember-drawer").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fact = ($("remember-input").value || "").trim();
     const topicId = state.selectedId;
-    if (!fact || !topicId || $("btn-remember-submit").disabled) return;
-    $("btn-remember-submit").disabled = true;
+    if (!fact || !topicId || state.rememberBusy || (state.role !== "write" && state.role !== "admin")) return;
+    state.rememberBusy = true;
+    updateTopicActions();
     try {
       const res = await api("/api/v1/remember", {
         method: "POST",
@@ -982,13 +1537,15 @@
         $("remember-input").value = "";
         $("remember-drawer").classList.add("hidden");
         $("btn-toggle-remember").setAttribute("aria-expanded", "false");
+        updateTopicActions();
       }
       toast("已写入主题 " + topicId + " 的记忆（v" + res.topic_version + "）");
       await refreshAll();
     } catch (err) {
       toast("写入失败: " + err.message, { error: true });
     } finally {
-      $("btn-remember-submit").disabled = false;
+      state.rememberBusy = false;
+      updateTopicActions();
     }
   });
 
@@ -1028,6 +1585,53 @@
       else return;
       e.preventDefault();
       switchTab(tabs[next].getAttribute("data-tab"), { focus: true });
+    });
+  });
+
+  $("key-create-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    createKey();
+  });
+  for (const id of ["key-name", "key-role", "key-topics", "key-expiry"]) {
+    $(id).addEventListener("input", clearKeyFormErrors);
+    $(id).addEventListener("change", clearKeyFormErrors);
+  }
+  $("btn-keys-refresh").addEventListener("click", refreshKeys);
+  $("btn-keys-retry").addEventListener("click", refreshKeys);
+  $("btn-key-dismiss").addEventListener("click", () => {
+    clearKeySecret({ restoreFocus: true });
+    $("key-create-status").textContent = "明文已从页面清除，仍可创建新密钥。";
+  });
+  $("btn-key-copy").addEventListener("click", async () => {
+    if (!state.keys.secret || $("key-secret-card").hidden) return;
+    try {
+      await navigator.clipboard.writeText(state.keys.secret);
+      toast("密钥已复制，请存放在安全位置");
+    } catch (_) {
+      toast("复制密钥失败，请手动选择明文；不要在保存前关闭卡片", { error: true });
+    }
+  });
+  $("btn-config-copy").addEventListener("click", async () => {
+    const config = buildClientConfig();
+    try {
+      await navigator.clipboard.writeText(config.text);
+      toast("已复制当前客户端配置");
+    } catch (_) {
+      toast("复制配置失败，请手动选择下方配置文本", { error: true });
+    }
+  });
+  const clientTabs = Array.from(document.querySelectorAll("#integration-clients [role=tab]"));
+  clientTabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => switchClient(tab.getAttribute("data-client")));
+    tab.addEventListener("keydown", (e) => {
+      let next;
+      if (e.key === "ArrowRight") next = (index + 1) % clientTabs.length;
+      else if (e.key === "ArrowLeft") next = (index - 1 + clientTabs.length) % clientTabs.length;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = clientTabs.length - 1;
+      else return;
+      e.preventDefault();
+      switchClient(clientTabs[next].getAttribute("data-client"), { focus: true });
     });
   });
 

@@ -346,9 +346,13 @@ class DreamConsolidator:
         *,
         dry_run: bool = False,
         force: bool = False,
+        allowed_topics: frozenset[str] | None = None,
     ) -> DreamBatchReport:
         registry = TopicRegistry.from_file(self.data_root / "topic-registry.json")
-        active_topics = [topic for topic in registry.topics if topic.state == "active"]
+        active_topics = [
+            topic for topic in registry.topics
+            if topic.state == "active" and (allowed_topics is None or topic.topic_id in allowed_topics)
+        ]
         reports: list[DreamReport] = []
         for topic in active_topics:
             try:

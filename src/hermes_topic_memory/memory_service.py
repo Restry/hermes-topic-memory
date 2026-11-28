@@ -16,6 +16,7 @@ from .multi_recall import (
     ReaderCapsuleSynthesizer,
     TopicSelection,
 )
+from .principal import PermissionDeniedError, Principal, require_role, require_topic, restrict_registry
 from .query_history import QueryHistoryStore, QueryRecord, QuerySource, TopicQueryResult
 from .reader import Reader
 from .remember import RememberService
@@ -119,31 +120,47 @@ class MemoryService:
         self.dream_consolidator = DreamConsolidator(self.root, reader)
 
     def call(
-        self, name: str, arguments: Any, *, source: QuerySource, actor: str = "anonymous"
+        self, name: str, arguments: Any, *, source: QuerySource = "mcp", actor: str = "anonymous",
+        principal: Principal | None = None,
     ) -> dict[str, Any]:
         definition = next((item for item in _TOOL_DEFINITIONS if item[0] == name), None)
         if definition is None:
             raise MemoryServiceError("unknown_tool", "Unknown tool.", 404)
         started = time.perf_counter_ns()
+        if principal is not None:
+            actor = principal.actor
         try:
             _validate_arguments(arguments, definition[2], definition[3])
-            result = self._dispatch(name, arguments, source=source)
+            result = self._dispatch(name, arguments, source=source, principal=principal)
         except MemoryServiceError as error:
-            self._record_activity(name, arguments, source=source, actor=actor, started=started, error=error)
+            self._record_activity(
+                name, arguments, source=source, actor=actor, started=started, error=error,
+                principal=principal,
+            )
             raise
-        self._record_activity(name, arguments, source=source, actor=actor, started=started, result=result)
+        self._record_activity(
+            name, arguments, source=source, actor=actor, started=started, result=result,
+            principal=principal,
+        )
         return result
 
     def _record_activity(
         self, name: str, arguments: Any, *, source: QuerySource, actor: str, started: int,
         result: dict[str, Any] | None = None, error: MemoryServiceError | None = None,
+        principal: Principal | None = None,
     ) -> None:
         result = result or {}
-        status = "error" if error is not None else _activity_status(name, result)
+        status = ("denied" if error.code in {"forbidden", "topic_forbidden"} else "error") if error is not None else _activity_status(name, result)
         meta, topic_id = _activity_metadata(name, arguments, result)
+        if principal is not None:
+            if principal.key_id is not None:
+                meta["key_id"] = principal.key_id
+            if principal.allowed_topics is not None and topic_id not in principal.allowed_topics:
+                topic_id = None
         if error is not None:
             meta["error_code"] = error.code if error.code in {
-                "invalid_request", "topic_not_found", "topic_read_only", "routing_error", "operation_failed"
+                "invalid_request", "topic_not_found", "topic_read_only", "routing_error", "operation_failed",
+                "forbidden", "topic_forbidden",
             } else "operation_failed"
         transport = source if source in {"mcp", "rest", "panel", "cli"} else "system"
         try:
@@ -156,8 +173,12 @@ class MemoryService:
         except Exception:
             raise MemoryServiceError("operation_failed", "Operation could not be completed.", 500) from None
 
-    def _dispatch(self, name: str, arguments: dict[str, Any], *, source: QuerySource) -> dict[str, Any]:
+    def _dispatch(
+        self, name: str, arguments: dict[str, Any], *, source: QuerySource,
+        principal: Principal | None = None,
+    ) -> dict[str, Any]:
         try:
+            require_role(principal, "write" if name in {"remember", "bind_topic", "dream"} else "read")
             if name == "whoami":
                 memory = self.core.get_optional()
                 if memory is None:
@@ -170,10 +191,17 @@ class MemoryService:
                 return {"status": "initialized", "body": memory.body, "version": memory.metadata.version}
             if name == "list_topics":
                 return {
-                    "topics": [self._topic_dict(topic) for topic in self._registry().topics if topic.state == "active"]
+                    "topics": [
+                        self._topic_dict(topic) for topic in self._registry().topics
+                        if topic.state == "active" and (
+                            principal is None or principal.allowed_topics is None
+                            or topic.topic_id in principal.allowed_topics
+                        )
+                    ]
                 }
             if name == "bind_topic":
                 topic_id = self._registry().resolve_name(arguments["topic"])
+                require_topic(principal, topic_id)
                 topic = self.admin.bind_context(
                     topic_id,
                     chat_id=arguments.get("chat_id"),
@@ -188,6 +216,7 @@ class MemoryService:
                     repo=arguments.get("repo"),
                     workspace_path=arguments.get("workspace_path"),
                 )
+                require_topic(principal, decision.topic_id)
                 result = self.remember_service.remember(
                     decision.topic_id,
                     arguments["fact"],
@@ -202,17 +231,21 @@ class MemoryService:
                 force = bool(arguments.get("force", False))
                 if "topic" in arguments:
                     topic_id = self._registry().resolve_name(arguments["topic"])
+                    require_topic(principal, topic_id)
                     report = self.dream_consolidator.dream_topic(
                         topic_id, dry_run=dry_run, force=force
                     ).to_dict()
                 else:
                     report = self.dream_consolidator.dream_all(
-                        dry_run=dry_run, force=force
+                        dry_run=dry_run, force=force,
+                        allowed_topics=principal.allowed_topics if principal is not None else None,
                     ).to_dict()
                 return _public_dream_result(report)
-            return self._recall(arguments, source=source)
+            return self._recall(arguments, source=source, principal=principal)
         except MemoryServiceError:
             raise
+        except PermissionDeniedError as error:
+            raise MemoryServiceError(error.code, str(error), error.status) from None
         except TopicNotFoundError:
             raise MemoryServiceError("topic_not_found", "Topic not found.", 404) from None
         except TopicStateError:
@@ -244,13 +277,22 @@ class MemoryService:
             "version": self.store.get_topic(topic.topic_id).metadata.version,
         }
 
-    def _recall(self, arguments: dict[str, Any], *, source: QuerySource) -> dict[str, Any]:
+    def _recall(
+        self, arguments: dict[str, Any], *, source: QuerySource, principal: Principal | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter_ns()
         question = arguments["query"]
         registry = self._registry()
+        candidate_registry = restrict_registry(registry, principal)
         decision, multi_selections, multi_route_source = self._resolve_recall_target(
-            registry, arguments, question
+            registry, arguments, question, principal=principal, candidate_registry=candidate_registry,
         )
+        registry = candidate_registry
+        if multi_selections is not None:
+            for selection in multi_selections:
+                require_topic(principal, selection.topic_id)
+        elif decision is not None:
+            require_topic(principal, decision.topic_id)
         if multi_selections is not None:
             return self._recall_multi(
                 registry=registry,
@@ -315,10 +357,13 @@ class MemoryService:
         registry: TopicRegistry,
         arguments: dict[str, Any],
         question: str,
+        *, principal: Principal | None = None, candidate_registry: TopicRegistry,
     ) -> tuple[RouteDecision | None, tuple[TopicSelection, ...] | None, str]:
         explicit_topic = arguments.get("topic")
         if explicit_topic is not None:
-            return registry.route(explicit_topic=explicit_topic), None, "explicit"
+            decision = registry.route(explicit_topic=explicit_topic)
+            require_topic(principal, decision.topic_id)
+            return decision, None, "explicit"
 
         # Try deterministic context bindings first (chat_id -> repo -> workspace_path).
         if any(arguments.get(k) is not None for k in ("chat_id", "repo", "workspace_path")):
@@ -329,9 +374,14 @@ class MemoryService:
                     workspace_path=arguments.get("workspace_path"),
                 )
                 if bound.source in {"chat_id", "repo", "workspace_path"}:
+                    require_topic(principal, bound.topic_id)
                     return bound, None, bound.source
             except TopicRoutingError:
                 pass
+
+        registry = candidate_registry
+        if not registry.topics and principal is not None and principal.allowed_topics is not None:
+            raise PermissionDeniedError("topic_forbidden")
 
         # Next check explicit topic mentions inside the question.
         try:
@@ -507,12 +557,16 @@ def _activity_metadata(
         # A multi-topic event describes the whole invocation, not only its first topic.
         topic_id = None
     elif isinstance(reports, list):
+        if len(reports) <= 8:
+            meta["topic_ids"] = [item["topic_id"] for item in reports]
         meta["topic_count"] = len(reports)
         meta["error_count"] = sum(item.get("status") in {"error", "aborted_concurrent_write"} for item in reports)
         meta["skipped_count"] = sum(item.get("status") in {"no_change", "skipped_no_new_evidence"} for item in reports)
         meta["consolidated_count"] = sum(item.get("status") == "consolidated" for item in reports)
         topic_id = None
     elif isinstance(result.get("topics"), list):
+        if len(result["topics"]) <= 8:
+            meta["topic_ids"] = [item["topic_id"] for item in result["topics"]]
         meta["topic_count"] = len(result["topics"])
     return meta, topic_id
 
